@@ -32,6 +32,7 @@ import {
 } from '../shared/stream-event.js';
 import { ThreadSession } from './session.js';
 import { ToolDispatcher } from './tools/dispatcher.js';
+import { ApprovalResponder } from './approval-responder.js';
 import type { IToolRegistry, ToolBridge } from './tools/types.js';
 
 export interface CodexRunnerDeps {
@@ -65,6 +66,7 @@ export class CodexRunner implements ICodexRunner {
 
   private session: ThreadSession | null = null;
   private toolDispatcher: ToolDispatcher | null = null;
+  private approvalResponder: ApprovalResponder | null = null;
 
   /** run() 返回的“未结束”Promise 的 resolver；shutdown / 全部 turn 完成且无待注入时调用。 */
   private finishResolve: (() => void) | null = null;
@@ -90,11 +92,18 @@ export class CodexRunner implements ICodexRunner {
   }
 
   async run(input: CodexRunnerInput): Promise<void> {
-    const mergedConfig: ThreadSessionConfig = { ...this.config, ...input.session };
+    const mergedConfig: ThreadSessionConfig = {
+      // 自治运行时默认 never（无人工审批 UI）；调用方可显式覆盖。
+      approvalPolicy: this.config.approvalPolicy ?? input.session.approvalPolicy ?? 'never',
+      ...this.config,
+      ...input.session,
+    };
     // Stage 3：把已注册工具的 schema 注入 thread/start.dynamicTools。
     if (this.tools) {
       mergedConfig.dynamicTools = this.tools.registry.specs();
     }
+    // 审批安全网：杜绝审批请求无人应答导致的 turn 死锁。
+    this.approvalResponder = new ApprovalResponder(this.client);
     const session = new ThreadSession(this.client, mergedConfig, this.mapper);
     this.session = session;
 
@@ -170,6 +179,11 @@ export class CodexRunner implements ICodexRunner {
     } finally {
       try {
         this.toolDispatcher?.dispose();
+      } catch {
+        /* ignore */
+      }
+      try {
+        this.approvalResponder?.dispose();
       } catch {
         /* ignore */
       }

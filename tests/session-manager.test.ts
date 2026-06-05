@@ -19,7 +19,11 @@ class FakeClient implements IAppServerClient {
   readonly requests: Array<{ method: string; params: unknown }> = [];
   readonly env: Record<string, string>;
   closed = false;
+  /** 置 true 时 thread/resume 抛错（模拟陈旧 threadId 被拒）。 */
+  failResume = false;
+  lastTurnId: string | null = null;
   private notif = new Set<ServerNotificationHandler>();
+  private closeHandlers = new Set<(info: { code: number | null; signal: string | null; error?: Error }) => void>();
 
   constructor(opts: AppServerClientOptions) {
     this.env = opts.env ?? {};
@@ -31,10 +35,14 @@ class FakeClient implements IAppServerClient {
     this.requests.push({ method, params });
     if (method === 'thread/start') return { thread: { id: `th_${++threadCounter}`, sessionId: 's', path: null } } as T;
     if (method === 'thread/resume') {
+      if (this.failResume) throw new Error('resume rejected: stale thread');
       const tid = (params as { threadId: string }).threadId;
       return { thread: { id: tid, sessionId: 's', path: null } } as T;
     }
-    if (method === 'turn/start') return { turn: { id: `turn_${++threadCounter}` } } as T;
+    if (method === 'turn/start') {
+      this.lastTurnId = `turn_${++threadCounter}`;
+      return { turn: { id: this.lastTurnId } } as T;
+    }
     return {} as T;
   }
   notify(): void {}
@@ -45,14 +53,23 @@ class FakeClient implements IAppServerClient {
   onServerRequest(_h: ServerRequestHandler): () => void {
     return () => {};
   }
-  onClose(): () => void {
-    return () => {};
+  onClose(h: (info: { code: number | null; signal: string | null; error?: Error }) => void): () => void {
+    this.closeHandlers.add(h);
+    return () => this.closeHandlers.delete(h);
   }
   async close(): Promise<void> {
     this.closed = true;
   }
   methods(): string[] {
     return this.requests.map((r) => r.method);
+  }
+  /** 测试辅助：模拟 server 通知。 */
+  emit(method: string, params: unknown): void {
+    for (const h of this.notif) h(method, params);
+  }
+  /** 测试辅助：模拟 app-server 进程退出。 */
+  emitClose(): void {
+    for (const h of this.closeHandlers) h({ code: 1, signal: null });
   }
 }
 
@@ -80,16 +97,25 @@ class FakeProvisioner implements ICodexHomeProvisioner {
   }
 }
 
-function mk(store: FakeStore = new FakeStore()) {
+interface MkOpts {
+  store?: FakeStore;
+  maxConcurrent?: number;
+  configure?: (c: FakeClient) => void;
+}
+
+function mk(arg: FakeStore | MkOpts = {}) {
+  const opts: MkOpts = arg instanceof FakeStore ? { store: arg } : arg;
+  const store = opts.store ?? new FakeStore();
   const clients: FakeClient[] = [];
   const provisioner = new FakeProvisioner();
   const mgr = new SessionManager(
-    { dataDir: '/fake', idleTimeoutMs: 0 },
+    { dataDir: '/fake', idleTimeoutMs: 0, maxConcurrent: opts.maxConcurrent },
     {
       store,
       provisioner,
       clientFactory: (o) => {
         const c = new FakeClient(o);
+        opts.configure?.(c);
         clients.push(c);
         return c;
       },
@@ -184,5 +210,60 @@ describe('SessionManager', () => {
     expect(clients[1]!.methods()).toContain('thread/resume');
     expect(h2.threadId).toBe(tid);
     await mgr.shutdownAll();
+  });
+
+  // ───────────────────────── code-review 回归 ─────────────────────────
+
+  it('#1/#8 在飞 turn 的 folder 不被 LRU 驱逐（liveness 看 activeTurns 而非仅 queue.isBusy）', async () => {
+    const { mgr, clients } = mk({ maxConcurrent: 1 });
+    const a = await mgr.getOrCreate('home-a');
+    await a.send('go'); // turn/start 响应同步注册 turn → activeTurns=1（未发 turn/completed）
+
+    // maxConcurrent=1 下创建 b：a 仍在飞 turn → 不应被驱逐（软超额）。
+    await mgr.getOrCreate('home-b');
+    expect(mgr.activeFolders().sort()).toEqual(['home-a', 'home-b']);
+
+    // a 的 turn 完成 → 变空闲；再创建 c 时 a 可被驱逐。
+    clients[0]!.emit('turn/completed', { threadId: 'x', turn: { id: clients[0]!.lastTurnId, status: 'completed' } });
+    await mgr.getOrCreate('home-c');
+    expect(mgr.activeFolders()).not.toContain('home-a'); // 空闲后被驱逐
+    await mgr.shutdownAll();
+  });
+
+  it('#5 未用过的新会话不被驱逐（留给 idle timer 回收）', async () => {
+    const { mgr } = mk({ maxConcurrent: 2 });
+    await mgr.getOrCreate('home-a');
+    await mgr.getOrCreate('home-b');
+    await mgr.getOrCreate('home-c'); // 超 cap，但 a/b 都未 send 过 → 不驱逐
+    expect(mgr.activeFolders().sort()).toEqual(['home-a', 'home-b', 'home-c']);
+    await mgr.shutdownAll();
+  });
+
+  it('#4/#6 create 中途失败（resume 被拒）→ getOrCreate 抛错且 client 被关闭（不泄漏）', async () => {
+    const store = new FakeStore();
+    store.setThreadId('home-a', 'th_stale');
+    const { mgr, clients } = mk({ store, configure: (c) => (c.failResume = true) });
+    await expect(mgr.getOrCreate('home-a')).rejects.toThrow(/resume rejected/);
+    expect(clients).toHaveLength(1);
+    expect(clients[0]!.closed).toBe(true); // 半成品 client 已清理
+    expect(mgr.activeFolders()).toEqual([]);
+  });
+
+  it('#7 app-server 意外退出 → 自愈摘除 entry，下次 getOrCreate 重建', async () => {
+    const { mgr, clients } = mk();
+    await mgr.getOrCreate('home-a');
+    expect(mgr.activeFolders()).toEqual(['home-a']);
+    clients[0]!.emitClose(); // 模拟进程退出
+    expect(mgr.activeFolders()).toEqual([]); // 自愈摘除
+    await mgr.getOrCreate('home-a');
+    expect(clients).toHaveLength(2); // 重建了新 client
+    await mgr.shutdownAll();
+  });
+
+  it('shutdownAll 后 getOrCreate 抛错（不再创建）', async () => {
+    const { mgr } = mk();
+    await mgr.getOrCreate('home-a');
+    await mgr.shutdownAll();
+    await expect(mgr.getOrCreate('home-b')).rejects.toThrow(/shutting down/);
   });
 });

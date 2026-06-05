@@ -195,6 +195,11 @@ describe('IpcToolBridge — memory append / search / get', () => {
     expect(content).toBeNull();
   });
 
+  it('#9 memoryAppend 对穿越 scope 抛错（不静默丢弃，让上层报 success:false）', async () => {
+    await expect(bridge.memoryAppend(FOLDER, 'x', '../evil')).rejects.toThrow(/unsafe scope/);
+    await expect(bridge.memoryAppend(FOLDER, 'x', 'a/b')).rejects.toThrow(/unsafe scope/);
+  });
+
   it('目录不存在时 memorySearch 返回 []', async () => {
     const hits = await bridge.memorySearch('never-touched', 'anything');
     expect(hits).toEqual([]);

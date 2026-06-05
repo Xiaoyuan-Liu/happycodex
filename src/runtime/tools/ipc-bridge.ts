@@ -139,7 +139,11 @@ export class IpcToolBridge implements ToolBridge {
 
   async memoryAppend(folder: string, content: string, scope?: string): Promise<void> {
     const file = this.memoryFile(folder, scope);
-    if (file === null) return; // 防穿越的 scope 直接忽略（不写）
+    // 防穿越的 scope 必须**抛错**而非静默忽略：否则 builtin handler 会误报 success:true，
+    // 模型以为记忆已写入（code-review #9）。抛错 → registry.dispatch 捕获 → success:false。
+    if (file === null) {
+      throw new Error(`memoryAppend: unsafe scope rejected: ${JSON.stringify(scope)}`);
+    }
     await mkdir(path.dirname(file), { recursive: true });
     const block = `\n\n--- ${new Date().toISOString()} ---\n${content}\n`;
     await appendFile(file, block, 'utf8');
