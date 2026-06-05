@@ -103,6 +103,7 @@ export class ThreadSession implements IThreadSession {
       sandbox: this.config.sandbox ?? null,
       baseInstructions: this.config.baseInstructions ?? null,
       developerInstructions: this.config.developerInstructions ?? null,
+      dynamicTools: this.config.dynamicTools ?? null,
     };
     const res = await this.client.request<ThreadEnvelopeResponse>(Method.threadStart, params);
     this.adoptThread(res?.thread);

@@ -3,11 +3,11 @@
 **Codex 版 HappyClaw 运行时**——把 [HappyClaw](../happyclaw) 的 Agent 执行层从
 Claude Agent SDK 迁移到 **codex app-server**（JSON-RPC over stdio）的运行时实现。
 
-当前仓库覆盖 **Stage 0-2**：协议契约 + app-server 客户端 + 流式事件映射 + thread/turn
-注入循环 + 针对真实 codex 的 PoC 验证。基线 **codex-cli 0.137.0**。
+当前仓库覆盖 **Stage 0-3**：协议契约 + app-server 客户端 + 流式事件映射 + thread/turn
+注入循环 + 12 个工具（dynamicTools）+ 针对真实 codex 的 PoC 验证。基线 **codex-cli 0.137.0**。
 
 > 完整迁移规划见 [`../happyclaw/docs/CODEX-PORT-PLAN.md`](../happyclaw/docs/CODEX-PORT-PLAN.md)。
-> 本 README 只覆盖 happycodex 仓库内的 Stage 0-2 范围。
+> 本 README 覆盖 happycodex 仓库内的 Stage 0-3 范围（Stage 4 多租户隔离待做）。
 
 ---
 
@@ -71,11 +71,17 @@ HappyClaw 用 `agent-runner` 在容器/宿主机进程里调用 Claude Agent SDK
 | `src/appserver/client.ts` | `AppServerClient`：spawn 进程、JSON-RPC 分帧/关联、背压重试、握手、通知/请求分发 |
 | `src/runtime/stream-mapper.ts` | `StreamMapper`：单条 app-server 通知 → 0..N 个 StreamEvent（无副作用，可单测） |
 | `src/runtime/session.ts` | `ThreadSession`：thread/turn 生命周期；`sendUserMessage` 自动判定 turn/start vs turn/steer |
-| `src/runtime/codex-runner.ts` | `CodexRunner`：agent-runner 等价物，OUTPUT_MARKER 包裹写 stdout |
+| `src/runtime/codex-runner.ts` | `CodexRunner`：agent-runner 等价物，OUTPUT_MARKER 包裹写 stdout；可挂工具层 |
+| `src/runtime/tools/types.ts` | **冻结**：工具层契约（ToolBridge / ToolDefinition / IToolRegistry / IToolDispatcher） |
+| `src/runtime/tools/registry.ts` | `ToolRegistry`：聚合工具、产出 dynamicTools schema、按名分发（never throws） |
+| `src/runtime/tools/builtin.ts` | `createBuiltinTools()`：HappyClaw 12 个工具的 dynamicTools 定义（schema + handler） |
+| `src/runtime/tools/ipc-bridge.ts` | `IpcToolBridge`：工具副作用落成 HappyClaw 风格 IPC 文件 + 记忆文件操作 |
+| `src/runtime/tools/dispatcher.ts` | `ToolDispatcher`：`item/tool/call` server 请求 → registry.dispatch → respond |
 | `src/shared/stream-event.ts` | **冻结**：StreamEvent 类型 + OUTPUT_MARKER 常量（对外流式协议单一真相源） |
 | `src/poc/poc-stream.ts` | PoC R1：token 流式增量 |
 | `src/poc/poc-steer.ts` | PoC R2：运行中注入（turn/steer） |
 | `src/poc/poc-resume.ts` | PoC：跨进程 thread/resume 续接 |
+| `src/poc/poc-tools.ts` | PoC R3：12 个工具走 dynamicTools，端到端往返 + 副作用落地 |
 | `protocol/ts/`、`protocol/schema/` | codex 0.137.0 `generate-ts` / `generate-json-schema` 全量参考产物（不入编译） |
 
 ---
@@ -104,6 +110,7 @@ npm run test             # 或：make test
 npm run poc:stream       # 或：make poc-stream  —— R1 token 流式
 npm run poc:steer        # 或：make poc-steer   —— R2 运行中注入 turn/steer
 npm run poc:resume       # 或：make poc-resume  —— 跨进程 thread/resume 续接
+npm run poc:tools        # 或：make poc-tools   —— R3 dynamicTools 工具端到端
 ```
 
 PoC 会话统一用 `{ approvalPolicy: 'never', sandbox: 'read-only' }`：不触发审批回环阻塞、
@@ -111,24 +118,26 @@ PoC 会话统一用 `{ approvalPolicy: 'never', sandbox: 'read-only' }`：不触
 
 ---
 
-## Stage 0-2 范围 & 已知未做
+## Stage 0-3 范围 & 已知未做
 
-### 本仓库已覆盖（Stage 0-2）
+### 本仓库已覆盖（Stage 0-3）
 
-- 协议契约冻结（`contracts.ts` / `protocol.ts` / `stream-event.ts`）。
+- 协议契约冻结（`contracts.ts` / `protocol.ts` / `stream-event.ts` / `tools/types.ts`）。
 - `AppServerClient`：JSON-RPC over stdio、`-32001` 背压指数退避重试、握手、通知/请求分发。
 - `StreamMapper`：app-server 通知 → StreamEvent 纯映射。
 - `ThreadSession`：thread/turn 生命周期 + 运行中注入（turn/start vs turn/steer 自动判定）。
-- `CodexRunner`：OUTPUT_MARKER 流式管道（对齐 HappyClaw agent-runner）。
-- 三个 PoC 针对真实 codex app-server 验证 R1/R2/resume。
+- `CodexRunner`：OUTPUT_MARKER 流式管道（对齐 HappyClaw agent-runner）+ 可挂工具层。
+- **Stage 3 工具层**：12 个 HappyClaw 工具走 `dynamicTools`（`thread/start.dynamicTools` 注册 +
+  `item/tool/call` 客户端代理执行）。`ToolRegistry` / `createBuiltinTools` / `IpcToolBridge` /
+  `ToolDispatcher`，副作用落成 HappyClaw 风格 IPC 文件。
+- 四个 PoC 针对真实 codex app-server 验证 R1/R2/resume/tools。
 
-### 已知未做（明确不在 Stage 0-2）
+### 已知未做（明确不在 Stage 0-3）
 
-- **12 个 MCP 工具（dynamicTools）= Stage 3**：HappyClaw 的 `send_message` / `schedule_task` /
-  `memory_*` 等 12 个 MCP 工具，在 codex 侧对应 `thread/start.dynamicTools`（客户端代理执行）。
-  本阶段 `protocol.ts` 已预留 `dynamicTools` 字段但**未接线**。
 - **多租户 `CODEX_HOME` = Stage 4**：per-user 隔离（每个用户独立 `CODEX_HOME` 指向 per-user
   目录）`AppServerClientOptions.env` 已预留口子，但多租户调度/隔离逻辑未实现。
+- **工具 Bridge 接主进程 = Stage 4**：`IpcToolBridge` 目前把动作类工具写成 IPC 文件、记忆类直接
+  文件操作；与 HappyClaw 主进程的真实任务/记忆系统对接（含 `listTasks` 真实状态）留待 Stage 4。
 - **provider failover 作废（P0）**：HappyClaw 的 provider 限额切换/上下文恢复机制在 codex
   架构下**作废**——codex app-server 自管 provider，不在 happycodex 运行时重做。
 - 容器化 / Docker 卷挂载、IM 通道、Web 前端：均属 HappyClaw 主仓既有能力，本仓库只替换执行引擎。

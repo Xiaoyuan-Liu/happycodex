@@ -20,6 +20,9 @@ import {
 } from '../src/shared/stream-event.js';
 import { ThreadSession, deriveTurnSubtype } from '../src/runtime/session.js';
 import { CodexRunner, wrapStreamEvent } from '../src/runtime/codex-runner.js';
+import { ToolRegistry } from '../src/runtime/tools/registry.js';
+import { toolTextResult, type DynamicToolSpec } from '../src/appserver/protocol.js';
+import { FakeToolBridge } from './helpers/fake-tool-bridge.js';
 
 // ───────────────────────── FakeAppServerClient ─────────────────────────
 
@@ -454,6 +457,41 @@ describe('CodexRunner.inject', () => {
     releaseSteer();
     await runPromise;
     expect(resolved).toBe(true); // 注入完成 + 无在飞 turn → 结束
+  });
+});
+
+describe('CodexRunner + tools（Stage 3 wiring）', () => {
+  it('提供 tools 时，thread/start 注入 registry.specs() 的 dynamicTools', async () => {
+    const client = new FakeAppServerClient();
+    client.responses['thread/start'] = { thread: { id: 'th_t', sessionId: 's', path: null } };
+    client.responses['turn/start'] = { turn: { id: 'turn_1' } };
+
+    const registry = new ToolRegistry();
+    const spec: DynamicToolSpec = {
+      name: 'ping',
+      description: 'ping tool',
+      inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+    };
+    registry.register({ spec, handler: async () => toolTextResult('pong') });
+    const bridge = new FakeToolBridge();
+
+    const runner = new CodexRunner({
+      client,
+      config: {},
+      sink: () => {},
+      mapper: new FakeMapper(),
+      tools: { registry, bridge },
+    });
+
+    const runPromise = runner.run({ prompt: 'p', groupFolder: 'home-x', session: {} });
+    // 等到 turn/start 发出（turn_1 已由响应同步注册），再发完成，避免被当陈旧完成忽略。
+    await vi.waitFor(() => expect(client.methods()).toContain('turn/start'));
+
+    const startParams = client.requests.find((r) => r.method === 'thread/start')!.params as Record<string, unknown>;
+    expect(startParams.dynamicTools).toEqual([spec]);
+
+    client.emit('turn/completed', { threadId: 'th_t', turn: { id: 'turn_1', status: 'completed' } });
+    await runPromise;
   });
 });
 

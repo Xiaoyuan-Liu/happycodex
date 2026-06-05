@@ -3,7 +3,7 @@
  * 以便并行实现时互不耦合。修改这里 = 改公共 API，需同步所有实现方。
  */
 
-import type { InitializeResponse, RequestId } from './appserver/protocol.js';
+import type { DynamicToolSpec, InitializeResponse, RequestId } from './appserver/protocol.js';
 import type { StreamEvent } from './shared/stream-event.js';
 
 // ───────────────────────── AppServerClient ─────────────────────────
@@ -86,6 +86,8 @@ export interface ThreadSessionConfig {
   developerInstructions?: string;
   /** 既有 thread id（恢复续接）；提供则走 thread/resume，否则 thread/start。 */
   resumeThreadId?: string;
+  /** Stage 3：注册给 codex 的 dynamicTools schema（在 thread/start 透传）。 */
+  dynamicTools?: DynamicToolSpec[];
 }
 
 export interface ThreadSessionState {

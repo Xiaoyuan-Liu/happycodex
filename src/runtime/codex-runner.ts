@@ -31,6 +31,8 @@ import {
   type StreamEvent,
 } from '../shared/stream-event.js';
 import { ThreadSession } from './session.js';
+import { ToolDispatcher } from './tools/dispatcher.js';
+import type { IToolRegistry, ToolBridge } from './tools/types.js';
 
 export interface CodexRunnerDeps {
   client: IAppServerClient;
@@ -38,6 +40,11 @@ export interface CodexRunnerDeps {
   /** 每个 StreamEvent 包裹成一行后的输出宿 sink。默认写 process.stdout。 */
   sink?: (line: string) => void;
   mapper?: IStreamMapper;
+  /**
+   * Stage 3：dynamicTools 工具层。提供则 run() 会把 registry.specs() 注入 thread/start，
+   * 并挂一个 ToolDispatcher 处理 item/tool/call（用 bridge 执行）。
+   */
+  tools?: { registry: IToolRegistry; bridge: ToolBridge };
 }
 
 /** 把单个 StreamEvent 包裹成 OUTPUT_MARKER 协议的一行（与 HappyClaw container-runner 解析端一致）。 */
@@ -54,8 +61,10 @@ export class CodexRunner implements ICodexRunner {
   private readonly config: ThreadSessionConfig;
   private readonly sink: (line: string) => void;
   private readonly mapper: IStreamMapper | undefined;
+  private readonly tools: { registry: IToolRegistry; bridge: ToolBridge } | undefined;
 
   private session: ThreadSession | null = null;
+  private toolDispatcher: ToolDispatcher | null = null;
 
   /** run() 返回的“未结束”Promise 的 resolver；shutdown / 全部 turn 完成且无待注入时调用。 */
   private finishResolve: (() => void) | null = null;
@@ -77,12 +86,26 @@ export class CodexRunner implements ICodexRunner {
     this.config = deps.config;
     this.sink = deps.sink ?? defaultSink;
     this.mapper = deps.mapper;
+    this.tools = deps.tools;
   }
 
   async run(input: CodexRunnerInput): Promise<void> {
     const mergedConfig: ThreadSessionConfig = { ...this.config, ...input.session };
+    // Stage 3：把已注册工具的 schema 注入 thread/start.dynamicTools。
+    if (this.tools) {
+      mergedConfig.dynamicTools = this.tools.registry.specs();
+    }
     const session = new ThreadSession(this.client, mergedConfig, this.mapper);
     this.session = session;
+
+    // 工具调用回环：item/tool/call → registry.dispatch（用 bridge 执行）。
+    if (this.tools) {
+      this.toolDispatcher = new ToolDispatcher(this.client, this.tools.registry, {
+        groupFolder: input.groupFolder,
+        bridge: this.tools.bridge,
+        getThreadId: () => session.state.threadId,
+      });
+    }
 
     session.onStreamEvent((ev) => {
       this.sink(wrapStreamEvent(ev));
@@ -145,6 +168,11 @@ export class CodexRunner implements ICodexRunner {
         await this.session.interrupt().catch(() => {});
       }
     } finally {
+      try {
+        this.toolDispatcher?.dispose();
+      } catch {
+        /* ignore */
+      }
       try {
         this.session?.dispose();
       } catch {

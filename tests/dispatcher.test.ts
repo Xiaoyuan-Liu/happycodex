@@ -1,0 +1,310 @@
+/**
+ * tests/dispatcher.test.ts —— ToolDispatcher：item/tool/call 订阅 → registry.dispatch → respond。
+ *
+ * FakeClient（implements IAppServerClient）只让 onServerRequest 记录 handler，并暴露
+ * emitServerRequest(method, params) 同步驱动 handler、捕获 respond 的返回值；其余方法 no-op。
+ * FakeRegistry（implements IToolRegistry）按名分发到内存里注册的 handler，复刻 dispatch 不抛的契约。
+ */
+
+import { describe, it, expect } from 'vitest';
+import type {
+  IAppServerClient,
+  IncomingServerRequest,
+  ServerNotificationHandler,
+  ServerRequestHandler,
+} from '../src/contracts.js';
+import type { InitializeResponse } from '../src/appserver/protocol.js';
+import {
+  ServerReq,
+  toolTextResult,
+  type DynamicToolCallParams,
+  type DynamicToolCallResponse,
+  type DynamicToolSpec,
+} from '../src/appserver/protocol.js';
+import type {
+  IToolRegistry,
+  ToolContext,
+  ToolDefinition,
+} from '../src/runtime/tools/types.js';
+import { ToolDispatcher } from '../src/runtime/tools/dispatcher.js';
+import { FakeToolBridge } from './helpers/fake-tool-bridge.js';
+
+// ───────────────────────── FakeClient ─────────────────────────
+
+class FakeClient implements IAppServerClient {
+  private serverRequestHandlers = new Set<ServerRequestHandler>();
+  /** 记录 dispose 时是否调用取消订阅。 */
+  unsubscribeCount = 0;
+
+  async start(): Promise<InitializeResponse> {
+    return {
+      userAgent: 'fake',
+      codexHome: '/tmp/codex',
+      platformFamily: 'unix',
+      platformOs: 'darwin',
+    };
+  }
+  async request<T = unknown>(): Promise<T> {
+    return {} as T;
+  }
+  notify(): void {}
+  onNotification(_handler: ServerNotificationHandler): () => void {
+    return () => {};
+  }
+  onServerRequest(handler: ServerRequestHandler): () => void {
+    this.serverRequestHandlers.add(handler);
+    return () => {
+      this.serverRequestHandlers.delete(handler);
+      this.unsubscribeCount += 1;
+    };
+  }
+  onClose(): () => void {
+    return () => {};
+  }
+  async close(): Promise<void> {}
+
+  /**
+   * 模拟 server→client 请求：驱动所有已注册 handler，捕获最后一次 respond 的返回值。
+   * 返回 { responded, result }：responded=false 表示没有 handler 调用 respond（即被忽略）。
+   */
+  async emitServerRequest(
+    method: string,
+    params: unknown,
+  ): Promise<{ responded: boolean; result?: unknown }> {
+    const req: IncomingServerRequest = { id: 1, method, params };
+    let responded = false;
+    let result: unknown;
+    const respond = (r: unknown): void => {
+      responded = true;
+      result = r;
+    };
+    for (const handler of this.serverRequestHandlers) {
+      handler(req, respond);
+    }
+    // dispatcher 的 handler 是 async 的（void this.handle(...)）；
+    // 用一个微任务刷新点等待 dispatch promise 链 settle。
+    await Promise.resolve();
+    await Promise.resolve();
+    return { responded, result };
+  }
+}
+
+// ───────────────────────── FakeRegistry ─────────────────────────
+
+/** 复刻 IToolRegistry.dispatch 契约：未知工具 / handler 抛错都回 success:false，永不抛。 */
+class FakeRegistry implements IToolRegistry {
+  private readonly defs = new Map<string, ToolDefinition>();
+  /** 记录每次 dispatch 的 (tool, args, ctx)，供断言透传。 */
+  readonly dispatched: Array<{ tool: string; args: unknown; ctx: ToolContext }> = [];
+
+  register(def: ToolDefinition): void {
+    this.defs.set(def.spec.name, def);
+  }
+  specs(): DynamicToolSpec[] {
+    return [...this.defs.values()].map((d) => d.spec);
+  }
+  has(tool: string): boolean {
+    return this.defs.has(tool);
+  }
+  async dispatch(
+    tool: string,
+    args: unknown,
+    ctx: ToolContext,
+  ): Promise<DynamicToolCallResponse> {
+    this.dispatched.push({ tool, args, ctx });
+    const def = this.defs.get(tool);
+    if (!def) {
+      return toolTextResult(`unknown tool: ${tool}`, false);
+    }
+    try {
+      return await def.handler(args, ctx);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return toolTextResult(`tool error: ${message}`, false);
+    }
+  }
+}
+
+// ───────────────────────── helpers ─────────────────────────
+
+function makeTool(name: string, handler: ToolDefinition['handler']): ToolDefinition {
+  return {
+    spec: {
+      name,
+      description: `test tool ${name}`,
+      inputSchema: { type: 'object', properties: {}, additionalProperties: true },
+    },
+    handler,
+  };
+}
+
+function callParams(overrides: Partial<DynamicToolCallParams>): DynamicToolCallParams {
+  return {
+    threadId: 'th_default',
+    turnId: 'turn_1',
+    callId: 'call_1',
+    namespace: null,
+    tool: 'echo',
+    arguments: {},
+    ...overrides,
+  };
+}
+
+function makeDispatcher(opts?: {
+  registry?: FakeRegistry;
+  client?: FakeClient;
+  groupFolder?: string;
+  getThreadId?: () => string | null;
+}): {
+  client: FakeClient;
+  registry: FakeRegistry;
+  bridge: FakeToolBridge;
+  dispatcher: ToolDispatcher;
+} {
+  const client = opts?.client ?? new FakeClient();
+  const registry = opts?.registry ?? new FakeRegistry();
+  const bridge = new FakeToolBridge();
+  const dispatcher = new ToolDispatcher(client, registry, {
+    groupFolder: opts?.groupFolder ?? 'main',
+    bridge,
+    getThreadId: opts?.getThreadId ?? (() => 'th_default'),
+  });
+  return { client, registry, bridge, dispatcher };
+}
+
+// ───────────────────────── tests ─────────────────────────
+
+describe('ToolDispatcher', () => {
+  it('已注册工具：item/tool/call → respond 收到 handler 结果，registry 被调用', async () => {
+    const registry = new FakeRegistry();
+    registry.register(
+      makeTool('echo', async (args) =>
+        toolTextResult(`echoed:${JSON.stringify(args)}`, true),
+      ),
+    );
+    const { client } = makeDispatcher({ registry });
+
+    const { responded, result } = await client.emitServerRequest(
+      ServerReq.dynamicToolCall,
+      callParams({ tool: 'echo', arguments: { x: 1 } }),
+    );
+
+    expect(responded).toBe(true);
+    expect(result).toEqual({
+      contentItems: [{ type: 'inputText', text: 'echoed:{"x":1}' }],
+      success: true,
+    });
+    // registry 确实被 dispatch（工具名 + 原样 args 透传）。
+    expect(registry.dispatched).toHaveLength(1);
+    expect(registry.dispatched[0]?.tool).toBe('echo');
+    expect(registry.dispatched[0]?.args).toEqual({ x: 1 });
+  });
+
+  it('未知工具：respond success:false', async () => {
+    const { client, registry } = makeDispatcher();
+
+    const { responded, result } = await client.emitServerRequest(
+      ServerReq.dynamicToolCall,
+      callParams({ tool: 'nope' }),
+    );
+
+    expect(responded).toBe(true);
+    expect(result).toMatchObject({ success: false });
+    expect((result as DynamicToolCallResponse).contentItems[0]).toMatchObject({
+      type: 'inputText',
+    });
+    // 即便未知工具，dispatcher 仍把它交给 registry 决策（不在自身预判）。
+    expect(registry.dispatched[0]?.tool).toBe('nope');
+  });
+
+  it('非 item/tool/call 的 method（审批请求）：不 respond、不 dispatch', async () => {
+    const { client, registry } = makeDispatcher();
+
+    const { responded } = await client.emitServerRequest(
+      ServerReq.commandExecutionRequestApproval,
+      { whatever: true },
+    );
+
+    expect(responded).toBe(false);
+    expect(registry.dispatched).toHaveLength(0);
+  });
+
+  it('threadId 透传：getThreadId 的返回值注入到 ToolContext.threadId', async () => {
+    const registry = new FakeRegistry();
+    let seenThreadId: string | null = 'UNSET';
+    let seenFolder = '';
+    registry.register(
+      makeTool('ctx_probe', async (_args, ctx) => {
+        seenThreadId = ctx.threadId;
+        seenFolder = ctx.groupFolder;
+        return toolTextResult('ok', true);
+      }),
+    );
+    const { client } = makeDispatcher({
+      registry,
+      groupFolder: 'home-42',
+      getThreadId: () => 'th_x',
+    });
+
+    await client.emitServerRequest(
+      ServerReq.dynamicToolCall,
+      callParams({ tool: 'ctx_probe' }),
+    );
+
+    expect(seenThreadId).toBe('th_x');
+    expect(seenFolder).toBe('home-42');
+  });
+
+  it('threadId 尚未就绪：getThreadId 返回 null 也照常透传', async () => {
+    const registry = new FakeRegistry();
+    let seenThreadId: string | null = 'UNSET';
+    registry.register(
+      makeTool('ctx_probe', async (_args, ctx) => {
+        seenThreadId = ctx.threadId;
+        return toolTextResult('ok', true);
+      }),
+    );
+    const { client } = makeDispatcher({ registry, getThreadId: () => null });
+
+    await client.emitServerRequest(
+      ServerReq.dynamicToolCall,
+      callParams({ tool: 'ctx_probe' }),
+    );
+
+    expect(seenThreadId).toBeNull();
+  });
+
+  it('handler 抛错：registry 兜底为 success:false（dispatcher 不崩）', async () => {
+    const registry = new FakeRegistry();
+    registry.register(
+      makeTool('boom', async () => {
+        throw new Error('kaboom');
+      }),
+    );
+    const { client } = makeDispatcher({ registry });
+
+    const { responded, result } = await client.emitServerRequest(
+      ServerReq.dynamicToolCall,
+      callParams({ tool: 'boom' }),
+    );
+
+    expect(responded).toBe(true);
+    expect(result).toMatchObject({ success: false });
+  });
+
+  it('dispose() 取消订阅：之后的 item/tool/call 不再触发 handler', async () => {
+    const { client, registry, dispatcher } = makeDispatcher();
+    registry.register(makeTool('echo', async () => toolTextResult('ok', true)));
+
+    dispatcher.dispose();
+    expect(client.unsubscribeCount).toBe(1);
+
+    const { responded } = await client.emitServerRequest(
+      ServerReq.dynamicToolCall,
+      callParams({ tool: 'echo' }),
+    );
+
+    expect(responded).toBe(false);
+    expect(registry.dispatched).toHaveLength(0);
+  });
+});

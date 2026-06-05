@@ -86,11 +86,13 @@ export const ServerNotif = {
   commandExecutionOutputDelta: 'item/commandExecution/outputDelta',
 } as const;
 
-/** server→client 请求名常量（审批回环；turn 会阻塞直到客户端回复）。 */
+/** server→client 请求名常量（审批回环 + dynamicTools 调用；turn 会阻塞直到客户端回复）。 */
 export const ServerReq = {
   commandExecutionRequestApproval: 'item/commandExecution/requestApproval',
   fileChangeRequestApproval: 'item/fileChange/requestApproval',
   permissionsRequestApproval: 'item/permissions/requestApproval',
+  /** dynamicTools：模型调用客户端注册的自定义工具时，server 发来的请求。 */
+  dynamicToolCall: 'item/tool/call',
 } as const;
 
 // ───────────────────────── 握手 ─────────────────────────
@@ -144,8 +146,46 @@ export interface ThreadStartParams {
   developerInstructions?: string | null;
   ephemeral?: boolean | null;
   /** 实验：客户端代理执行的自定义工具 schema（对应 HappyClaw 的 12 个 MCP 工具，R3 路 A）。 */
-  dynamicTools?: unknown[] | null;
+  dynamicTools?: DynamicToolSpec[] | null;
   config?: Record<string, unknown> | null;
+}
+
+// ───────────────────────── dynamicTools（R3 路 A，experimental）─────────────────────────
+
+/** 在 thread/start.dynamicTools 注册的工具 schema。 */
+export interface DynamicToolSpec {
+  namespace?: string;
+  name: string;
+  description: string;
+  /** 入参 JSON Schema（对象）。 */
+  inputSchema: unknown;
+  deferLoading?: boolean;
+}
+
+/** server→client 请求 item/tool/call 的 params：模型调用某 dynamic tool。 */
+export interface DynamicToolCallParams {
+  threadId: string;
+  turnId: string;
+  callId: string;
+  namespace: string | null;
+  tool: string;
+  arguments: unknown;
+}
+
+/** dynamic tool 输出内容项（回填给模型）。 */
+export type DynamicToolContentItem =
+  | { type: 'inputText'; text: string }
+  | { type: 'inputImage'; imageUrl: string };
+
+/** item/tool/call 的响应：回填执行结果。 */
+export interface DynamicToolCallResponse {
+  contentItems: DynamicToolContentItem[];
+  success: boolean;
+}
+
+/** 便捷构造一条纯文本工具结果。 */
+export function toolTextResult(text: string, success = true): DynamicToolCallResponse {
+  return { contentItems: [{ type: 'inputText', text }], success };
 }
 
 /** Thread 子集（完整见 protocol/ts/v2/Thread.ts）。 */
