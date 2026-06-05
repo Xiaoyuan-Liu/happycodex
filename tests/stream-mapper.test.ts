@@ -1,0 +1,321 @@
+/**
+ * StreamMapper 单测 —— 纯逻辑，对每种 method 喂构造 params，断言输出 StreamEvent 形状。
+ */
+
+import { describe, expect, it } from 'vitest';
+import { ServerNotif } from '../src/appserver/protocol.js';
+import {
+  StreamMapper,
+  extractToolName,
+  extractToolOk,
+  mapTurnStatus,
+  stringifyStatus,
+} from '../src/runtime/stream-mapper.js';
+import type { StreamEvent } from '../src/shared/stream-event.js';
+
+const mapper = new StreamMapper();
+const map = (method: string, params: unknown): StreamEvent[] => mapper.map(method, params);
+
+describe('StreamMapper — text / thinking / progress deltas', () => {
+  it('item/agentMessage/delta → text_delta', () => {
+    const out = map(ServerNotif.agentMessageDelta, {
+      threadId: 'th_1',
+      turnId: 'tn_1',
+      itemId: 'it_1',
+      delta: 'hello',
+    });
+    expect(out).toEqual([
+      {
+        type: 'text_delta',
+        text: 'hello',
+        itemId: 'it_1',
+        turnId: 'tn_1',
+        threadId: 'th_1',
+      },
+    ]);
+  });
+
+  it('item/reasoning/textDelta → thinking_delta', () => {
+    const out = map(ServerNotif.reasoningTextDelta, {
+      threadId: 'th_1',
+      turnId: 'tn_1',
+      itemId: 'it_2',
+      delta: 'thinking…',
+      contentIndex: 0,
+    });
+    expect(out).toEqual([
+      {
+        type: 'thinking_delta',
+        text: 'thinking…',
+        itemId: 'it_2',
+        turnId: 'tn_1',
+        threadId: 'th_1',
+      },
+    ]);
+  });
+
+  it('item/reasoning/summaryTextDelta → thinking_delta (同样映射)', () => {
+    const out = map(ServerNotif.reasoningSummaryTextDelta, {
+      threadId: 'th_1',
+      turnId: 'tn_1',
+      itemId: 'it_3',
+      delta: 'summary',
+      summaryIndex: 0,
+    });
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({ type: 'thinking_delta', text: 'summary', itemId: 'it_3' });
+  });
+
+  it('两种 reasoning delta 都映射为 thinking_delta', () => {
+    const a = map(ServerNotif.reasoningTextDelta, { itemId: 'x', delta: 'a' });
+    const b = map(ServerNotif.reasoningSummaryTextDelta, { itemId: 'x', delta: 'b' });
+    expect(a[0]?.type).toBe('thinking_delta');
+    expect(b[0]?.type).toBe('thinking_delta');
+  });
+
+  it('item/commandExecution/outputDelta → tool_progress', () => {
+    const out = map(ServerNotif.commandExecutionOutputDelta, {
+      threadId: 'th_1',
+      turnId: 'tn_1',
+      itemId: 'it_4',
+      delta: 'stdout line\n',
+    });
+    expect(out).toEqual([{ type: 'tool_progress', text: 'stdout line\n', itemId: 'it_4' }]);
+  });
+
+  it('缺失 delta 时 text 回退为空串', () => {
+    const out = map(ServerNotif.agentMessageDelta, { itemId: 'x' });
+    expect(out[0]).toMatchObject({ type: 'text_delta', text: '' });
+  });
+});
+
+describe('StreamMapper — item/started', () => {
+  it('commandExecution → tool_use_start，toolName 为命令（截断）', () => {
+    const out = map(ServerNotif.itemStarted, {
+      threadId: 'th',
+      turnId: 'tn',
+      startedAtMs: 1,
+      item: { type: 'commandExecution', id: 'c1', command: 'ls -la', status: 'inProgress' },
+    });
+    expect(out).toEqual([
+      {
+        type: 'tool_use_start',
+        toolName: 'ls -la',
+        itemId: 'c1',
+        toolInputSummary: 'ls -la',
+      },
+    ]);
+  });
+
+  it('mcpToolCall → tool_use_start，toolName 为 server.tool', () => {
+    const out = map(ServerNotif.itemStarted, {
+      item: { type: 'mcpToolCall', id: 'm1', server: 'github', tool: 'create_pr', status: 'inProgress' },
+    });
+    expect(out[0]).toMatchObject({
+      type: 'tool_use_start',
+      toolName: 'github.create_pr',
+      itemId: 'm1',
+    });
+  });
+
+  it('dynamicToolCall → tool_use_start，toolName 为 tool', () => {
+    const out = map(ServerNotif.itemStarted, {
+      item: { type: 'dynamicToolCall', id: 'd1', tool: 'send_message', status: 'inProgress' },
+    });
+    expect(out[0]).toMatchObject({ type: 'tool_use_start', toolName: 'send_message', itemId: 'd1' });
+  });
+
+  it('fileChange → tool_use_start，toolName 为 apply_patch', () => {
+    const out = map(ServerNotif.itemStarted, {
+      item: { type: 'fileChange', id: 'f1', status: 'inProgress' },
+    });
+    expect(out[0]).toMatchObject({ type: 'tool_use_start', toolName: 'apply_patch', itemId: 'f1' });
+  });
+
+  it('webSearch → tool_use_start，toolName 为 web_search', () => {
+    const out = map(ServerNotif.itemStarted, {
+      item: { type: 'webSearch', id: 'w1', query: 'codex app-server' },
+    });
+    expect(out[0]).toMatchObject({ type: 'tool_use_start', toolName: 'web_search', itemId: 'w1' });
+    expect(out[0]?.toolInputSummary).toBe('codex app-server');
+  });
+
+  it('agentMessage item/started → [] (增量已覆盖)', () => {
+    const out = map(ServerNotif.itemStarted, {
+      item: { type: 'agentMessage', id: 'a1', text: 'hi' },
+    });
+    expect(out).toEqual([]);
+  });
+
+  it('reasoning / plan / userMessage item/started → []', () => {
+    expect(map(ServerNotif.itemStarted, { item: { type: 'reasoning', id: 'r1', summary: [], content: [] } })).toEqual([]);
+    expect(map(ServerNotif.itemStarted, { item: { type: 'plan', id: 'p1', text: 'x' } })).toEqual([]);
+    expect(map(ServerNotif.itemStarted, { item: { type: 'userMessage', id: 'u1', content: [] } })).toEqual([]);
+  });
+
+  it('长命令的 toolInputSummary 被截断到 ~80 字符', () => {
+    const longCmd = 'echo ' + 'A'.repeat(200);
+    const out = map(ServerNotif.itemStarted, {
+      item: { type: 'commandExecution', id: 'c2', command: longCmd, status: 'inProgress' },
+    });
+    expect(out[0]?.toolInputSummary?.length).toBeLessThanOrEqual(80);
+    expect(out[0]?.toolInputSummary?.endsWith('…')).toBe(true);
+  });
+});
+
+describe('StreamMapper — item/completed', () => {
+  it('commandExecution exitCode=0 → tool_use_end ok=true', () => {
+    const out = map(ServerNotif.itemCompleted, {
+      item: { type: 'commandExecution', id: 'c1', command: 'ls', status: 'completed', exitCode: 0 },
+    });
+    expect(out).toEqual([{ type: 'tool_use_end', toolName: 'ls', itemId: 'c1', ok: true }]);
+  });
+
+  it('commandExecution exitCode!=0 → ok=false', () => {
+    const out = map(ServerNotif.itemCompleted, {
+      item: { type: 'commandExecution', id: 'c2', command: 'false', status: 'failed', exitCode: 1 },
+    });
+    expect(out[0]).toMatchObject({ type: 'tool_use_end', ok: false });
+  });
+
+  it('commandExecution 无 exitCode 时按 status 判定', () => {
+    const ok = map(ServerNotif.itemCompleted, {
+      item: { type: 'commandExecution', id: 'c3', command: 'x', status: 'completed', exitCode: null },
+    });
+    expect(ok[0]).toMatchObject({ ok: true });
+    const bad = map(ServerNotif.itemCompleted, {
+      item: { type: 'commandExecution', id: 'c4', command: 'x', status: 'failed', exitCode: null },
+    });
+    expect(bad[0]).toMatchObject({ ok: false });
+  });
+
+  it('mcpToolCall status=completed → ok=true', () => {
+    const out = map(ServerNotif.itemCompleted, {
+      item: { type: 'mcpToolCall', id: 'm1', server: 's', tool: 't', status: 'completed' },
+    });
+    expect(out[0]).toMatchObject({ type: 'tool_use_end', toolName: 's.t', ok: true });
+  });
+
+  it('mcpToolCall status=failed → ok=false', () => {
+    const out = map(ServerNotif.itemCompleted, {
+      item: { type: 'mcpToolCall', id: 'm2', server: 's', tool: 't', status: 'failed' },
+    });
+    expect(out[0]).toMatchObject({ ok: false });
+  });
+
+  it('agentMessage / reasoning / plan item/completed → []', () => {
+    expect(map(ServerNotif.itemCompleted, { item: { type: 'agentMessage', id: 'a', text: 'x' } })).toEqual([]);
+    expect(map(ServerNotif.itemCompleted, { item: { type: 'reasoning', id: 'r', summary: [], content: [] } })).toEqual([]);
+    expect(map(ServerNotif.itemCompleted, { item: { type: 'plan', id: 'p', text: 'x' } })).toEqual([]);
+  });
+});
+
+describe('StreamMapper — thread / turn lifecycle', () => {
+  it('thread/started → init', () => {
+    const out = map(ServerNotif.threadStarted, {
+      thread: { id: 'th_42', sessionId: 's', path: null, source: 'app-server', ephemeral: false, cwd: '/w', cliVersion: '0.137.0' },
+    });
+    expect(out).toEqual([{ type: 'init', threadId: 'th_42' }]);
+  });
+
+  it('turn/started → task_start', () => {
+    const out = map(ServerNotif.turnStarted, {
+      threadId: 'th',
+      turn: { id: 'tn_7', status: 'inProgress' },
+    });
+    expect(out).toEqual([{ type: 'task_start', turnId: 'tn_7' }]);
+  });
+
+  it('turn/completed status=completed → result completed', () => {
+    const out = map(ServerNotif.turnCompleted, {
+      threadId: 'th',
+      turn: { id: 'tn_1', status: 'completed' },
+    });
+    expect(out).toEqual([{ type: 'result', subtype: 'completed', turnId: 'tn_1' }]);
+  });
+
+  it('turn/completed status=interrupted → result interrupted', () => {
+    const out = map(ServerNotif.turnCompleted, { turn: { id: 'tn_2', status: 'interrupted' } });
+    expect(out[0]).toMatchObject({ type: 'result', subtype: 'interrupted' });
+  });
+
+  it('turn/completed status=failed → result failed', () => {
+    const out = map(ServerNotif.turnCompleted, { turn: { id: 'tn_3', status: 'failed' } });
+    expect(out[0]).toMatchObject({ subtype: 'failed' });
+  });
+
+  it('turn/completed status 未知/inProgress → result completed (fallback)', () => {
+    expect(map(ServerNotif.turnCompleted, { turn: { id: 't', status: 'inProgress' } })[0]).toMatchObject({ subtype: 'completed' });
+    expect(map(ServerNotif.turnCompleted, { turn: { id: 't', status: 'weird' } })[0]).toMatchObject({ subtype: 'completed' });
+    expect(map(ServerNotif.turnCompleted, { turn: { id: 't' } })[0]).toMatchObject({ subtype: 'completed' });
+  });
+});
+
+describe('StreamMapper — status / usage', () => {
+  it('thread/status/changed → status，tagged object 取 .type', () => {
+    const out = map(ServerNotif.threadStatusChanged, {
+      threadId: 'th',
+      status: { type: 'active', activeFlags: ['turn'] },
+    });
+    expect(out).toEqual([{ type: 'status', status: 'active' }]);
+  });
+
+  it('thread/status/changed status=idle', () => {
+    const out = map(ServerNotif.threadStatusChanged, { threadId: 'th', status: { type: 'idle' } });
+    expect(out[0]).toMatchObject({ type: 'status', status: 'idle' });
+  });
+
+  it('thread/tokenUsage/updated → usage，透传 params', () => {
+    const params = { threadId: 'th', turnId: 'tn', tokenUsage: { total: { input: 10 } } };
+    const out = map(ServerNotif.threadTokenUsageUpdated, params);
+    expect(out).toHaveLength(1);
+    expect(out[0]?.type).toBe('usage');
+    expect(out[0]?.usage).toEqual(params);
+  });
+});
+
+describe('StreamMapper — 未知 / 缺省', () => {
+  it('未知 method → []', () => {
+    expect(map('item/somethingNew/delta', { foo: 'bar' })).toEqual([]);
+    expect(map('thread/closed', { threadId: 'th' })).toEqual([]);
+  });
+
+  it('params 为 undefined 也不抛', () => {
+    expect(map('totally/unknown', undefined)).toEqual([]);
+    expect(map(ServerNotif.threadStatusChanged, undefined)[0]).toMatchObject({ type: 'status', status: '' });
+  });
+});
+
+describe('helper 函数', () => {
+  it('extractToolName 各分支', () => {
+    expect(extractToolName({ type: 'commandExecution', id: 'x', command: 'pwd', status: 'completed', aggregatedOutput: null, exitCode: 0 })).toBe('pwd');
+    expect(extractToolName({ type: 'mcpToolCall', id: 'x', server: 'a', tool: 'b', status: 'completed' })).toBe('a.b');
+    expect(extractToolName({ type: 'dynamicToolCall', id: 'x', tool: 'c', status: 'completed' })).toBe('c');
+    expect(extractToolName({ type: 'fileChange', id: 'x' } as never)).toBe('apply_patch');
+    expect(extractToolName({ type: 'webSearch', id: 'x', query: 'q' })).toBe('web_search');
+  });
+
+  it('extractToolOk 各分支', () => {
+    expect(extractToolOk({ type: 'commandExecution', id: 'x', command: 'a', status: 'completed', aggregatedOutput: null, exitCode: 0 })).toBe(true);
+    expect(extractToolOk({ type: 'commandExecution', id: 'x', command: 'a', status: 'failed', aggregatedOutput: null, exitCode: 2 })).toBe(false);
+    expect(extractToolOk({ type: 'mcpToolCall', id: 'x', server: 's', tool: 't', status: 'completed' })).toBe(true);
+    expect(extractToolOk({ type: 'mcpToolCall', id: 'x', server: 's', tool: 't', status: 'failed' })).toBe(false);
+    expect(extractToolOk({ type: 'dynamicToolCall', id: 'x', tool: 't', status: 'success' } as never)).toBe(true);
+  });
+
+  it('mapTurnStatus', () => {
+    expect(mapTurnStatus('completed')).toBe('completed');
+    expect(mapTurnStatus('interrupted')).toBe('interrupted');
+    expect(mapTurnStatus('failed')).toBe('failed');
+    expect(mapTurnStatus('inProgress')).toBe('completed');
+    expect(mapTurnStatus(undefined)).toBe('completed');
+  });
+
+  it('stringifyStatus', () => {
+    expect(stringifyStatus('idle')).toBe('idle');
+    expect(stringifyStatus({ type: 'active' })).toBe('active');
+    expect(stringifyStatus(null)).toBe('');
+    expect(stringifyStatus(undefined)).toBe('');
+    expect(stringifyStatus(42)).toBe('42');
+  });
+});

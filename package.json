@@ -1,0 +1,25 @@
+{
+  "name": "happycodex",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Codex 版 HappyClaw — 基于 codex app-server 的多用户 Agent 运行时（Stage 0–2: PoC + 流式映射 + 注入循环）",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "poc:stream": "tsx src/poc/poc-stream.ts",
+    "poc:steer": "tsx src/poc/poc-steer.ts",
+    "poc:resume": "tsx src/poc/poc-resume.ts",
+    "protocol:regen": "codex app-server generate-ts --experimental --out protocol/ts && codex app-server generate-json-schema --experimental --out protocol/schema"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.19",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}
