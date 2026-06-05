@@ -5,3 +5,4 @@ dist/
 .codex-home-*/
 /tmp/
 coverage/
+log/

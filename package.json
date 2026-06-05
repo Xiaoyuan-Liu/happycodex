@@ -15,6 +15,7 @@
     "poc:steer": "tsx src/poc/poc-steer.ts",
     "poc:resume": "tsx src/poc/poc-resume.ts",
     "poc:tools": "tsx src/poc/poc-tools.ts",
+    "poc:multitenant": "tsx src/poc/poc-multitenant.ts",
     "protocol:regen": "codex app-server generate-ts --experimental --out protocol/ts && codex app-server generate-json-schema --experimental --out protocol/schema"
   },
   "devDependencies": {
