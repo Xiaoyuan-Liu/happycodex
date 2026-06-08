@@ -250,7 +250,8 @@ export function createBuiltinTools(): ToolDefinition[] {
       spec: {
         name: 'list_task',
         description:
-          '列出当前会话的所有定时任务（管理员主容器可见全部任务）。返回任务的 id、名称与状态。',
+          '列出当前会话的所有定时任务（管理员主容器可见全部任务）。返回任务的 id、名称与状态。' +
+          '注：状态为 best-effort 排队快照（基于本进程已写出的调度动作聚合），权威状态以主进程为准。',
         inputSchema: {
           type: 'object',
           properties: {},

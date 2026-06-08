@@ -16,8 +16,10 @@
  *   client/订阅，不泄漏 app-server 子进程。#4/#6
  * - client.onClose 自愈：app-server 意外退出 → 自动从 entries 摘除，下次 getOrCreate 重建。#7
  * - shuttingDown 闸 + 等待在飞 create：shutdownAll 不漏掉正在创建的会话。#3
- * - 驱逐只挑"用过且当前空闲"的会话（未用过的新句柄由 idle timer 回收，不被驱逐抢关）；
- *   容量计 entries+creating，防并发突发超额 spawn。#5/#10
+ * - 驱逐优先挑"用过且当前空闲"的 LRU；无则回退到任意非 busy 的 LRU（含未用过），强制 cap，
+ *   不再永久豁免未用过会话（避免 idleTimeoutMs<=0/突发预热下 app-server 无界）。in-flight 绝不驱逐。
+ *   纯轮询（getOrCreate 命中但从不 send）不再 touch 续命，交还 idle timer 回收；
+ *   容量计 entries+creating，防并发突发超额 spawn。#4/#5/#10
  */
 
 import os from 'node:os';
@@ -40,6 +42,7 @@ import { ApprovalResponder } from '../approval-responder.js';
 import { SessionStore } from './session-store.js';
 import { FsCodexHomeProvisioner } from './codex-home.js';
 import { SerialQueue } from './serial-queue.js';
+import { HOOKS_JSON_FILE, trustManagedHooks } from './hooks-config.js';
 import { ToolRegistry } from '../tools/registry.js';
 import { createBuiltinTools } from '../tools/builtin.js';
 import { IpcToolBridge } from '../tools/ipc-bridge.js';
@@ -86,6 +89,7 @@ export class SessionManager implements ISessionManager {
   private readonly idleTimeoutMs: number;
   private readonly sessionConfig: ThreadSessionConfig;
   private readonly enableTools: boolean;
+  private readonly enableHooks: boolean;
 
   private readonly store: ISessionStore;
   private readonly provisioner: ICodexHomeProvisioner;
@@ -105,11 +109,17 @@ export class SessionManager implements ISessionManager {
     this.idleTimeoutMs = opts.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
     this.sessionConfig = opts.sessionConfig ?? {};
     this.enableTools = opts.enableTools ?? false;
+    this.enableHooks = opts.enableHooks ?? false;
 
     const sharedCodexHome = opts.sharedCodexHome ?? defaultSharedCodexHome();
     this.store = deps.store ?? new SessionStore(path.join(this.dataDir, 'sessions', 'index.json'));
     this.provisioner =
-      deps.provisioner ?? new FsCodexHomeProvisioner({ dataDir: this.dataDir, sharedCodexHome });
+      deps.provisioner ??
+      new FsCodexHomeProvisioner({
+        dataDir: this.dataDir,
+        sharedCodexHome,
+        enableHooks: this.enableHooks,
+      });
     this.queue = deps.queue ?? new SerialQueue();
     this.clientFactory = deps.clientFactory ?? ((o) => new AppServerClient(o));
   }
@@ -118,7 +128,10 @@ export class SessionManager implements ISessionManager {
     if (this.shuttingDown) throw new Error('SessionManager is shutting down');
     const existing = this.entries.get(folder);
     if (existing) {
-      this.touch(existing);
+      // 仅"真正用过"（至少 send 过一次）的会话在再次取用时续命（刷新 LRU + 重置 idle）。
+      // 纯轮询（从未 send）的 getOrCreate 命中不延长寿命，交还 idle timer 回收，避免
+      // usedOnce=false 免驱逐 + touch 重置 idle 双重保护造成的"永生"软超额。#5
+      if (existing.usedOnce) this.touch(existing);
       return existing.handle;
     }
     const inflight = this.creating.get(folder);
@@ -166,6 +179,14 @@ export class SessionManager implements ISessionManager {
       const codexHome = await this.provisioner.provision(folder);
       client = this.clientFactory({ codexBin: this.codexBin, env: { CODEX_HOME: codexHome } });
       await client.start();
+
+      // B3：首启信任注入 —— hooks/list 读 codex 自算的 currentHash → 写 config.toml 的
+      // trusted_hash → 重启 app-server 使 trustStatus 翻 'trusted'，hook 方可执行。
+      // 仅首次（trusted_hash 缺失）才重启；之后幂等命中、零重启。
+      if (this.enableHooks) {
+        client = await this.trustHooksAndMaybeRestart(client, codexHome);
+      }
+
       // 审批安全网（始终装，防死锁）。
       approvalResponder = new ApprovalResponder(client);
 
@@ -222,6 +243,32 @@ export class SessionManager implements ISessionManager {
       if (client) await client.close().catch(() => {});
       throw err;
     }
+  }
+
+  /**
+   * B3 信任注入：调 hooks/list 读 currentHash → 写 trusted_hash。
+   * 若写入了新条目（首次信任），当前 client 已用旧 config 启动、感知不到信任态，
+   * 故关掉它、用同一 codexHome 重启一个新 client（读到 trusted_hash → hook 可执行）。
+   * 返回应继续使用的 client（重启则为新实例，否则原实例）。
+   * 容错：hooks/list 失败不阻塞会话创建（hook 不触发但会话仍可用）。
+   */
+  private async trustHooksAndMaybeRestart(
+    client: IAppServerClient,
+    codexHome: string,
+  ): Promise<IAppServerClient> {
+    const hooksJsonPath = path.join(codexHome, HOOKS_JSON_FILE);
+    let newlyTrusted = 0;
+    try {
+      newlyTrusted = await trustManagedHooks(client, codexHome, hooksJsonPath);
+    } catch {
+      return client; // hooks/list 不可用 → 跳过信任，会话照常（hook 不触发）。
+    }
+    if (newlyTrusted === 0) return client; // 已信任过 → 零重启。
+    // 首次信任：重启 app-server 让 trusted_hash 生效。
+    await client.close().catch(() => {});
+    const fresh = this.clientFactory({ codexBin: this.codexBin, env: { CODEX_HOME: codexHome } });
+    await fresh.start();
+    return fresh;
   }
 
   private registerEntry(
@@ -343,18 +390,29 @@ export class SessionManager implements ISessionManager {
     entry.idleTimer.unref?.();
   }
 
-  /** 超容量时驱逐一个"用过且当前空闲"的会话（未用过的新句柄/在飞会话不抢关）。 */
+  /**
+   * 超容量时驱逐一个空闲会话以强制 maxConcurrent 硬上限。
+   *
+   * 选取顺序：优先回收"用过且空闲"的 LRU；若无，则回退到任意"非 busy"的 LRU（含未用过会话），
+   * 而非永久豁免未用过会话——后者把回收安全网完全外包给 idle timer，在 idleTimeoutMs<=0
+   * （永不自动关）或突发预热场景下会让 cap 失效、app-server 无界增长。#4
+   *
+   * 唯一允许软超额的情形：所有 entry 都 in-flight（activeTurns>0 / 队列在途），此时无可安全回收者，
+   * 只能等其结束——这是无法避免且安全的。in-flight 会话绝不被驱逐。
+   */
   private async evictIfNeeded(): Promise<void> {
     // 计入在飞 create，避免并发突发各自跳过驱逐而超额 spawn。
     const load = this.entries.size + this.creating.size;
     if (load < this.maxConcurrent) return;
-    let victim: Entry | null = null;
+    let preferred: Entry | null = null; // 用过且空闲：首选
+    let fallback: Entry | null = null; // 任意非 busy（含未用过）：硬上限兜底
     for (const e of this.entries.values()) {
-      if (!e.usedOnce) continue; // 未用过 → 留给 idle timer 回收，不驱逐
-      if (this.isFolderBusy(e.folder)) continue; // 在飞 turn / 在途 send → 不动
-      if (!victim || e.lastActiveSeq < victim.lastActiveSeq) victim = e;
+      if (this.isFolderBusy(e.folder)) continue; // 在飞 turn / 在途 send → 绝不动
+      if (!fallback || e.lastActiveSeq < fallback.lastActiveSeq) fallback = e;
+      if (e.usedOnce && (!preferred || e.lastActiveSeq < preferred.lastActiveSeq)) preferred = e;
     }
+    const victim = preferred ?? fallback; // 优先回收用过的；否则回收 LRU 未用过的，保证不超 cap
     if (victim) await this.shutdown(victim.folder);
-    // 无可驱逐者（全在飞/全未用过）→ 允许临时软超额，由 idle timer 后续回收。
+    // victim 仍为 null 仅当所有 entry 都 in-flight → 软超额，等其结束。
   }
 }

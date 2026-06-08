@@ -11,6 +11,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 import { FsCodexHomeProvisioner } from '../src/runtime/multitenant/codex-home.js';
+import { PREDEFINED_AGENTS, renderAgentToml } from '../src/runtime/multitenant/agent-defs.js';
 
 const FOLDER = 'home-test';
 const AUTH_CONTENT = '{"tokens":{"access":"shared-account-token"}}';
@@ -140,6 +141,145 @@ describe('FsCodexHomeProvisioner — 错误路径', () => {
     const prov = new FsCodexHomeProvisioner({ dataDir, sharedCodexHome });
 
     await expect(prov.provision('/etc')).rejects.toThrow();
+  });
+});
+
+describe('FsCodexHomeProvisioner — B2 预定义子代理 TOML', () => {
+  it('provision 写出 agents/<name>.toml（含 name/description/developer_instructions）', async () => {
+    await writeFile(path.join(sharedCodexHome, 'auth.json'), AUTH_CONTENT, 'utf8');
+    const prov = new FsCodexHomeProvisioner({ dataDir, sharedCodexHome });
+
+    const codexHome = await prov.provision(FOLDER);
+
+    for (const def of PREDEFINED_AGENTS) {
+      const tomlPath = path.join(codexHome, 'agents', `${def.name}.toml`);
+      expect(await exists(tomlPath)).toBe(true);
+      const content = await readFile(tomlPath, 'utf8');
+      expect(content).toContain(`name = "${def.name}"`);
+      expect(content).toContain('developer_instructions = """');
+      expect(content).toContain(def.description);
+    }
+  });
+
+  it('幂等：再次 provision 不覆盖已被本地修改的 agent TOML', async () => {
+    await writeFile(path.join(sharedCodexHome, 'auth.json'), AUTH_CONTENT, 'utf8');
+    const prov = new FsCodexHomeProvisioner({ dataDir, sharedCodexHome });
+
+    const codexHome = await prov.provision(FOLDER);
+    const target = path.join(codexHome, 'agents', `${PREDEFINED_AGENTS[0]!.name}.toml`);
+
+    const local = 'name = "code-reviewer"\ndescription = "local override"\n';
+    await writeFile(target, local, 'utf8');
+
+    await prov.provision(FOLDER); // 再次 provision
+
+    const after = await readFile(target, 'utf8');
+    expect(after).toBe(local); // 未被覆盖
+  });
+});
+
+describe('renderAgentToml', () => {
+  it('渲染 name/description/三引号 developer_instructions', () => {
+    const toml = renderAgentToml({
+      name: 'x',
+      description: 'desc',
+      developerInstructions: 'line1\nline2',
+    });
+    expect(toml).toContain('name = "x"');
+    expect(toml).toContain('description = "desc"');
+    expect(toml).toContain('developer_instructions = """\nline1\nline2\n"""');
+  });
+
+  it('转义 name/description 中的双引号与反斜杠', () => {
+    const toml = renderAgentToml({
+      name: 'a"b',
+      description: 'c\\d',
+      developerInstructions: 'x',
+    });
+    expect(toml).toContain('name = "a\\"b"');
+    expect(toml).toContain('description = "c\\\\d"');
+  });
+
+  it('防御：developer_instructions 内的连续三引号被降级，不破坏字面闭合', () => {
+    const toml = renderAgentToml({
+      name: 'n',
+      description: 'd',
+      developerInstructions: 'before """ after',
+    });
+    expect(toml).not.toContain('before """ after');
+    expect(toml).toContain('before ""\\" after');
+  });
+});
+
+describe('FsCodexHomeProvisioner — B3 hooks 配置注入', () => {
+  it('enableHooks=false（默认）→ 不写 hooks.json、不动 config.toml 的 [features]', async () => {
+    await writeFile(path.join(sharedCodexHome, 'auth.json'), AUTH_CONTENT, 'utf8');
+    const prov = new FsCodexHomeProvisioner({ dataDir, sharedCodexHome });
+
+    const codexHome = await prov.provision(FOLDER);
+
+    expect(await exists(path.join(codexHome, 'hooks.json'))).toBe(false);
+  });
+
+  it('enableHooks=true → 写 hooks.json（SessionStart + Stop）+ config.toml [features] hooks=true', async () => {
+    await writeFile(path.join(sharedCodexHome, 'auth.json'), AUTH_CONTENT, 'utf8');
+    const prov = new FsCodexHomeProvisioner({ dataDir, sharedCodexHome, enableHooks: true });
+
+    const codexHome = await prov.provision(FOLDER);
+
+    const hooksTxt = await readFile(path.join(codexHome, 'hooks.json'), 'utf8');
+    const parsed = JSON.parse(hooksTxt);
+    expect(Object.keys(parsed.hooks)).toEqual(['SessionStart', 'Stop']);
+    expect(parsed.hooks.SessionStart[0].hooks[0].type).toBe('command');
+
+    const cfg = await readFile(path.join(codexHome, 'config.toml'), 'utf8');
+    expect(cfg).toContain('[features]');
+    expect(cfg).toMatch(/^hooks = true$/m);
+  });
+
+  it('enableHooks=true 且 shared config.toml 已有内容 → 合并 [features]，不破坏既有键', async () => {
+    await writeFile(path.join(sharedCodexHome, 'auth.json'), AUTH_CONTENT, 'utf8');
+    await writeFile(path.join(sharedCodexHome, 'config.toml'), 'model = "o3"\n', 'utf8');
+    const prov = new FsCodexHomeProvisioner({ dataDir, sharedCodexHome, enableHooks: true });
+
+    const codexHome = await prov.provision(FOLDER);
+
+    const cfg = await readFile(path.join(codexHome, 'config.toml'), 'utf8');
+    expect(cfg).toContain('model = "o3"'); // 既有键保留
+    expect(cfg).toMatch(/^hooks = true$/m);
+  });
+
+  it('hookCommands 可注入自定义命令', async () => {
+    await writeFile(path.join(sharedCodexHome, 'auth.json'), AUTH_CONTENT, 'utf8');
+    const prov = new FsCodexHomeProvisioner({
+      dataDir,
+      sharedCodexHome,
+      enableHooks: true,
+      hookCommands: { sessionStartCommand: 'echo CUSTOM_SS', stopCommand: 'echo CUSTOM_STOP', timeoutSec: 7 },
+    });
+
+    const codexHome = await prov.provision(FOLDER);
+
+    const parsed = JSON.parse(await readFile(path.join(codexHome, 'hooks.json'), 'utf8'));
+    expect(parsed.hooks.SessionStart[0].hooks[0].command).toBe('echo CUSTOM_SS');
+    expect(parsed.hooks.Stop[0].hooks[0].command).toBe('echo CUSTOM_STOP');
+    expect(parsed.hooks.SessionStart[0].hooks[0].timeout).toBe(7);
+  });
+
+  it('幂等：再次 provision 不覆盖已被本地修改的 hooks.json，且不重复写 [features]', async () => {
+    await writeFile(path.join(sharedCodexHome, 'auth.json'), AUTH_CONTENT, 'utf8');
+    const prov = new FsCodexHomeProvisioner({ dataDir, sharedCodexHome, enableHooks: true });
+
+    const codexHome = await prov.provision(FOLDER);
+    const hooksPath = path.join(codexHome, 'hooks.json');
+    const local = '{"hooks":{"SessionStart":[],"Stop":[]}}';
+    await writeFile(hooksPath, local, 'utf8');
+
+    await prov.provision(FOLDER); // 再次
+
+    expect(await readFile(hooksPath, 'utf8')).toBe(local); // 未覆盖
+    const cfg = await readFile(path.join(codexHome, 'config.toml'), 'utf8');
+    expect(cfg.match(/hooks = true/g)).toHaveLength(1); // 不重复
   });
 });
 

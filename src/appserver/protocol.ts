@@ -84,6 +84,12 @@ export const ServerNotif = {
   reasoningTextDelta: 'item/reasoning/textDelta',
   reasoningSummaryTextDelta: 'item/reasoning/summaryTextDelta',
   commandExecutionOutputDelta: 'item/commandExecution/outputDelta',
+  /** B1：上下文压缩完成（DEPRECATED，见 ContextCompactedNotification 注释）。 */
+  threadCompacted: 'thread/compacted',
+  /** B3：Hook 开始执行。 */
+  hookStarted: 'hook/started',
+  /** B3：Hook 执行完成。 */
+  hookCompleted: 'hook/completed',
 } as const;
 
 /** server→client 请求名常量（审批回环 + dynamicTools 调用；turn 会阻塞直到客户端回复）。 */
@@ -188,6 +194,34 @@ export function toolTextResult(text: string, success = true): DynamicToolCallRes
   return { contentItems: [{ type: 'inputText', text }], success };
 }
 
+/** 子代理来源（对齐 protocol/ts/SubAgentSource.ts）。
+ *  `thread_spawn` 携带父线程 / 深度 / agent 元数据；`review`/`compact` 为内置子代理流程。 */
+export type SubAgentSource =
+  | 'review'
+  | 'compact'
+  | 'memory_consolidation'
+  | {
+      thread_spawn: {
+        parent_thread_id: string;
+        depth: number;
+        agent_path: string | null;
+        agent_nickname: string | null;
+        agent_role: string | null;
+      };
+    }
+  | { other: string };
+
+/** 线程来源（对齐 protocol/ts/v2/SessionSource.ts）。
+ *  app-server 自身建的线程为 'appServer'；子代理走 { subAgent: SubAgentSource }。 */
+export type SessionSource =
+  | 'cli'
+  | 'vscode'
+  | 'exec'
+  | 'appServer'
+  | 'unknown'
+  | { custom: string }
+  | { subAgent: SubAgentSource };
+
 /** Thread 子集（完整见 protocol/ts/v2/Thread.ts）。 */
 export interface Thread {
   id: string;
@@ -195,11 +229,19 @@ export interface Thread {
   sessionId: string;
   /** [UNSTABLE] rollout 文件磁盘路径。 */
   path: string | null;
-  /** 线程来源：cli / vscode / exec / app-server 等。 */
-  source: string;
+  /** 线程来源（可判别 union；对齐 SessionSource）。 */
+  source: SessionSource;
   ephemeral: boolean;
   cwd: string;
   cliVersion: string;
+  /** 子代理的父线程 id（仅子代理 thread 有值）。 */
+  parentThreadId?: string | null;
+  /** fork 时的源线程 id（仅 fork 出来的线程有值）。 */
+  forkedFromId?: string | null;
+  /** 子代理随机昵称（仅 AgentControl 派生子代理有值）。 */
+  agentNickname?: string | null;
+  /** 子代理角色 agent_role（仅 AgentControl 派生子代理有值）。 */
+  agentRole?: string | null;
 }
 
 export interface ThreadStartResponse {
@@ -245,9 +287,32 @@ export interface TurnInterruptParams {
 }
 
 export interface ThreadResumeParams {
-  threadId?: string;
-  /** [UNSTABLE] 直接按 rollout 路径恢复。 */
+  /** 必填（对齐真实 codex 0.137.0；生成产物 ThreadResumeParams.threadId 为 string，非可选）。 */
+  threadId: string;
+  /** [UNSTABLE] 直接按 rollout 路径恢复；非运行线程 path 优先于 threadId。 */
   path?: string;
+}
+
+/** thread/fork 参数子集（B2 子代理 fork 包装；完整见 protocol/ts/v2/ThreadForkParams.ts）。
+ *  方法名常量见 Method.threadFork。PoC 实测：返回新 thread.id + forkedFromId，上下文继承，
+ *  fork 的 sessionId 与 base 不同。 */
+export interface ThreadForkParams {
+  /** 源线程 id（非空 path 时被忽略；优先用 threadId）。 */
+  threadId: string;
+  /** [UNSTABLE] 指定 rollout 路径来 fork（空串视为缺省）。 */
+  path?: string | null;
+  cwd?: string | null;
+  model?: string | null;
+  baseInstructions?: string | null;
+  developerInstructions?: string | null;
+  config?: Record<string, unknown> | null;
+}
+
+/** thread/fork 响应子集（只取我们关心的 thread；完整见 protocol/ts/v2/ThreadForkResponse.ts）。 */
+export interface ThreadForkResponse {
+  thread: Thread;
+  model: string;
+  modelProvider: string;
 }
 
 // ───────────────────────── 通知 payload ─────────────────────────
@@ -299,6 +364,34 @@ export interface CommandExecutionOutputDeltaNotification {
   delta: string;
 }
 
+// ───────────────────────── B2：CollabAgentTool（子代理协同信号源）─────────────────────────
+//
+// PoC 实测：子代理不经 thread/started.source 暴露。模型调内置 CollabAgentTool 派生，运行时信号是
+// ThreadItem 的 collabAgentToolCall。B2 的 scope='subagent' 注入据 sender/receiver threadId 判定，
+// 不是 thread/started.source。
+
+/** 内置协同工具名（对齐 protocol/ts/v2/CollabAgentTool.ts）。 */
+export type CollabAgentTool = 'spawnAgent' | 'sendInput' | 'resumeAgent' | 'wait' | 'closeAgent';
+
+/** collabAgentToolCall item 的状态（对齐 protocol/ts/v2/CollabAgentToolCallStatus.ts）。 */
+export type CollabAgentToolCallStatus = 'inProgress' | 'completed' | 'failed';
+
+/** 目标子代理生命周期状态（对齐 protocol/ts/v2/CollabAgentStatus.ts）。 */
+export type CollabAgentStatus =
+  | 'pendingInit'
+  | 'running'
+  | 'interrupted'
+  | 'completed'
+  | 'errored'
+  | 'shutdown'
+  | 'notFound';
+
+/** 单个目标子代理的最近已知状态（对齐 protocol/ts/v2/CollabAgentState.ts）。 */
+export interface CollabAgentState {
+  status: CollabAgentStatus;
+  message: string | null;
+}
+
 /** ThreadItem 子集（item/started、item/completed 携带）。完整见 protocol/ts/v2/ThreadItem.ts。 */
 export type ThreadItem =
   | { type: 'userMessage'; id: string; content: UserInput[] }
@@ -327,6 +420,21 @@ export type ThreadItem =
       status: string;
     }
   | { type: 'webSearch'; id: string; query: string }
+  /** B2：子代理协同 item —— scope='subagent' 注入的运行时信号源（对齐 protocol/ts/v2/ThreadItem.ts）。
+   *  senderThreadId=发起方（父）；receiverThreadIds=接收方（spawn 时为新建子代理）。
+   *  generated 产物里 prompt/agentsStates 总是存在（可为 null/空对象）；此处放宽为可选以便消费侧防御性读取。 */
+  | {
+      type: 'collabAgentToolCall';
+      id: string;
+      tool: CollabAgentTool;
+      status: CollabAgentToolCallStatus;
+      senderThreadId: string;
+      receiverThreadIds: string[];
+      prompt?: string | null;
+      agentsStates?: { [childThreadId: string]: CollabAgentState | undefined };
+    }
+  /** B1：上下文压缩 item（推荐监听此 item 而非 DEPRECATED 的 thread/compacted 通知）。 */
+  | { type: 'contextCompaction'; id: string }
   | { type: string; id: string; [k: string]: unknown };
 
 export interface ItemStartedNotification {
@@ -346,4 +454,68 @@ export interface ItemCompletedNotification {
 export interface ThreadTokenUsageUpdatedNotification {
   threadId: string;
   [k: string]: unknown;
+}
+
+// ───────────────────────── B1：上下文压缩（context compaction）─────────────────────────
+
+/** thread/compacted 通知 payload（对齐 protocol/ts/v2/ContextCompactedNotification.ts）。
+ *  ⚠️ DEPRECATED：codex 同时发一个 contextCompaction item（见 ThreadItem），推荐监听 item 而非本通知。 */
+export interface ContextCompactedNotification {
+  threadId: string;
+  turnId: string;
+}
+
+/** thread/compact/start 参数（手动触发上下文压缩；对齐 protocol/ts/v2/ThreadCompactStartParams.ts）。
+ *  方法名常量见 Method.threadCompactStart。 */
+export interface ThreadCompactStartParams {
+  threadId: string;
+}
+
+/** thread/compact/start 响应 —— 空对象（对齐 protocol/ts/v2/ThreadCompactStartResponse.ts）。 */
+export type ThreadCompactStartResponse = Record<string, never>;
+
+// ───────────────────────── B3：Hooks（子集；MVP 暂不消费，一次性定义）─────────────────────────
+
+/** Hook 事件名（对齐 protocol/ts/v2/HookEventName.ts 的 10 个成员）。 */
+export type HookEventName =
+  | 'preToolUse'
+  | 'permissionRequest'
+  | 'postToolUse'
+  | 'preCompact'
+  | 'postCompact'
+  | 'sessionStart'
+  | 'userPromptSubmit'
+  | 'subagentStart'
+  | 'subagentStop'
+  | 'stop';
+
+/** Hook 运行状态（对齐 protocol/ts/v2/HookRunStatus.ts）。 */
+export type HookRunStatus = 'running' | 'completed' | 'failed' | 'blocked' | 'stopped';
+
+/** Hook 作用域（对齐 protocol/ts/v2/HookScope.ts）。 */
+export type HookScope = 'thread' | 'turn';
+
+/** HookRunSummary 子集（完整见 protocol/ts/v2/HookRunSummary.ts）。
+ *  只收录 happycodex 需要的字段；完整产物含 handlerType/executionMode/source/entries 等。 */
+export interface HookRunSummary {
+  eventName: HookEventName;
+  status: HookRunStatus;
+  statusMessage?: string | null;
+  scope?: HookScope;
+  /** 运行时长（毫秒）。完整产物为 bigint，此处放宽为 number（JSON 反序列化后形态）。 */
+  durationMs?: number | null;
+}
+
+/** hook/started 通知 payload（对齐 protocol/ts/v2/HookStartedNotification.ts）。 */
+export interface HookStartedNotification {
+  threadId: string;
+  turnId: string | null;
+  run: HookRunSummary;
+}
+
+/** hook/completed 通知 payload（对齐 protocol/ts/v2/HookCompletedNotification.ts）。 */
+export interface HookCompletedNotification {
+  threadId: string;
+  turnId: string | null;
+  run: HookRunSummary;
 }

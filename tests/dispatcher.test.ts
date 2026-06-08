@@ -6,7 +6,7 @@
  * FakeRegistry（implements IToolRegistry）按名分发到内存里注册的 handler，复刻 dispatch 不抛的契约。
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import type {
   IAppServerClient,
   IncomingServerRequest,
@@ -87,6 +87,22 @@ class FakeClient implements IAppServerClient {
     await Promise.resolve();
     return { responded, result };
   }
+
+  /**
+   * 用外部 respond 回调驱动 server 请求（不内部捕获、不等 dispatch settle）。
+   * 用于 handler 永不 settle 的超时测试：respond 由看门狗在推进时钟后调用。
+   */
+  async emitServerRequestRaw(
+    method: string,
+    params: unknown,
+    respond: (result: unknown) => void,
+  ): Promise<void> {
+    const req: IncomingServerRequest = { id: 1, method, params };
+    for (const handler of this.serverRequestHandlers) {
+      handler(req, respond);
+    }
+    await Promise.resolve(); // 让 handle() 走到 await registry.dispatch 与 setTimeout 注册点。
+  }
 }
 
 // ───────────────────────── FakeRegistry ─────────────────────────
@@ -155,6 +171,7 @@ function makeDispatcher(opts?: {
   client?: FakeClient;
   groupFolder?: string;
   getThreadId?: () => string | null;
+  dispatchTimeoutMs?: number;
 }): {
   client: FakeClient;
   registry: FakeRegistry;
@@ -168,6 +185,7 @@ function makeDispatcher(opts?: {
     groupFolder: opts?.groupFolder ?? 'main',
     bridge,
     getThreadId: opts?.getThreadId ?? (() => 'th_default'),
+    ...(opts?.dispatchTimeoutMs !== undefined ? { dispatchTimeoutMs: opts.dispatchTimeoutMs } : {}),
   });
   return { client, registry, bridge, dispatcher };
 }
@@ -290,6 +308,73 @@ describe('ToolDispatcher', () => {
 
     expect(responded).toBe(true);
     expect(result).toMatchObject({ success: false });
+  });
+
+  it('#9 handler 永不 settle → 超时后 respond 必达且 success:false（解开 turn 死锁）', async () => {
+    vi.useFakeTimers();
+    try {
+      // handler 返回永不 settle 的 Promise（模拟阻塞 fd / FIFO readFile）。
+      const client = new FakeClient();
+      const registry = new FakeRegistry();
+      registry.register(makeTool('hang', () => new Promise<never>(() => {})));
+      new ToolDispatcher(client, registry, {
+        groupFolder: 'g',
+        bridge: new FakeToolBridge(),
+        getThreadId: () => 'th',
+        dispatchTimeoutMs: 1000,
+      });
+
+      let responded = false;
+      let result: unknown;
+      const respond = (r: unknown): void => {
+        responded = true;
+        result = r;
+      };
+      // 直接触发 client 已注册的 handler。
+      await client.emitServerRequestRaw(
+        ServerReq.dynamicToolCall,
+        callParams({ tool: 'hang' }),
+        respond,
+      );
+
+      expect(responded).toBe(false); // 超时前未结算
+      await vi.advanceTimersByTimeAsync(1000); // 跨过看门狗
+      expect(responded).toBe(true);
+      expect(result).toMatchObject({ success: false });
+      expect((result as DynamicToolCallResponse).contentItems[0]).toMatchObject({ type: 'inputText' });
+      const text = (result as DynamicToolCallResponse).contentItems[0] as { text: string };
+      expect(text.text).toMatch(/timeout/);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('#9 dispatchTimeoutMs<=0 关闭看门狗：永挂 handler 不会被超时收口', async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new FakeClient();
+      const registry = new FakeRegistry();
+      registry.register(makeTool('hang', () => new Promise<never>(() => {})));
+      new ToolDispatcher(client, registry, {
+        groupFolder: 'g',
+        bridge: new FakeToolBridge(),
+        getThreadId: () => 'th',
+        dispatchTimeoutMs: 0,
+      });
+
+      let responded = false;
+      await client.emitServerRequestRaw(
+        ServerReq.dynamicToolCall,
+        callParams({ tool: 'hang' }),
+        () => {
+          responded = true;
+        },
+      );
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(responded).toBe(false); // 关闭超时 → 永挂（语义保留）
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('dispose() 取消订阅：之后的 item/tool/call 不再触发 handler', async () => {

@@ -159,6 +159,8 @@ const RETRY_BASE_MS = 50;
 const RETRY_MAX_ATTEMPTS = 5;
 const RETRY_MAX_DELAY_MS = 2000;
 const CLOSE_GRACE_MS = 3000;
+/** per-request 看门狗默认值；调用方仍可显式传 0 彻底关闭超时。 */
+const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
 
 export class AppServerClient implements IAppServerClient {
   private readonly options: AppServerClientOptions;
@@ -244,6 +246,10 @@ export class AppServerClient implements IAppServerClient {
       return;
     }
 
+    // 在途请求立即失败，关停延迟与 OS 进程回收解耦：
+    // 否则正等响应的 pending（如 turn/interrupt）会被 SIGTERM→SIGKILL 的 grace 阻塞最多 CLOSE_GRACE_MS。
+    this.rejectAllPending(new Error('AppServerClient closing'));
+
     await new Promise<void>((resolve) => {
       let settled = false;
       const finish = (): void => {
@@ -312,7 +318,7 @@ export class AppServerClient implements IAppServerClient {
       const id = this.nextId++;
 
       let timer: ReturnType<typeof setTimeout> | null = null;
-      const timeoutMs = this.options.requestTimeoutMs ?? 0;
+      const timeoutMs = this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
       if (timeoutMs > 0) {
         timer = setTimeout(() => {
           this.pending.delete(id);

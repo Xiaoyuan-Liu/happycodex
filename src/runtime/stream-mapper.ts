@@ -12,6 +12,11 @@ import {
   ServerNotif,
   type AgentMessageDeltaNotification,
   type CommandExecutionOutputDeltaNotification,
+  type ContextCompactedNotification,
+  type HookCompletedNotification,
+  type HookEventName,
+  type HookRunStatus,
+  type HookStartedNotification,
   type ItemCompletedNotification,
   type ItemStartedNotification,
   type ReasoningSummaryTextDeltaNotification,
@@ -77,6 +82,7 @@ export class StreamMapper implements IStreamMapper {
             type: 'tool_progress',
             text: n.delta ?? '',
             itemId: n.itemId,
+            threadId: n.threadId,
           },
         ];
       }
@@ -91,6 +97,7 @@ export class StreamMapper implements IStreamMapper {
             toolName: extractToolName(item),
             itemId: item.id,
             toolInputSummary: extractToolInputSummary(item),
+            threadId: n.threadId,
           },
         ];
       }
@@ -98,13 +105,27 @@ export class StreamMapper implements IStreamMapper {
       case ServerNotif.itemCompleted: {
         const n = p as unknown as ItemCompletedNotification;
         const item = n.item;
-        if (!item || !isToolItem(item)) return [];
+        if (!item) return [];
+        // (b) contextCompaction item —— codex 推荐的压缩完成信号（优于 DEPRECATED 的 thread/compacted）。
+        //     与 (a) 等价：产 status:'compacted'，按 (threadId,turnId) 语义。两来源去重留给第二棒 session 层。
+        if (item.type === 'contextCompaction') {
+          return [
+            {
+              type: 'status',
+              status: 'compacted',
+              threadId: n.threadId,
+              turnId: n.turnId,
+            },
+          ];
+        }
+        if (!isToolItem(item)) return [];
         return [
           {
             type: 'tool_use_end',
             toolName: extractToolName(item),
             itemId: item.id,
             ok: extractToolOk(item),
+            threadId: n.threadId,
           },
         ];
       }
@@ -155,6 +176,37 @@ export class StreamMapper implements IStreamMapper {
           {
             type: 'usage',
             usage: p,
+          },
+        ];
+      }
+
+      // (a) thread/compacted —— 上下文压缩完成边界（非文本）。compact_partial 文本 flush 不在 mapper 做
+      //     （不变量 (i)：文本累积在有状态 session 层 takeAccumulatedText）。
+      //     DEPRECATED：与 (b) contextCompaction item 等价，去重逻辑留给第二棒 session 层。
+      case ServerNotif.threadCompacted: {
+        const n = p as unknown as ContextCompactedNotification;
+        return [
+          {
+            type: 'status',
+            status: 'compacted',
+            threadId: n.threadId,
+            turnId: n.turnId,
+          },
+        ];
+      }
+
+      // (c) hook/started、hook/completed —— hook 通知量大，仅在与压缩相关（preCompact/postCompact）
+      //     或异常终态（blocked/failed）时产出 status，其余产 []（过滤噪声）。
+      case ServerNotif.hookStarted:
+      case ServerNotif.hookCompleted: {
+        const n = p as unknown as HookStartedNotification | HookCompletedNotification;
+        const eventName = extractHookEventName(n.run);
+        const status = extractHookStatus(n.run);
+        if (!isNotableHook(eventName, status)) return [];
+        return [
+          {
+            type: 'status',
+            status: `hook:${eventName}:${status}`,
           },
         ];
       }
@@ -246,6 +298,33 @@ export function stringifyStatus(status: unknown): string {
     if (typeof t === 'string') return t;
   }
   return String(status);
+}
+
+/** Hook 事件名提取（容错：run 缺失 / 非字符串时回退空串）。 */
+export function extractHookEventName(run: unknown): string {
+  return readString(run, 'eventName');
+}
+
+/** Hook 运行状态提取（容错：run 缺失 / 非字符串时回退空串）。 */
+export function extractHookStatus(run: unknown): string {
+  return readString(run, 'status');
+}
+
+/** hook 是否值得产出 status：会话生命周期（sessionStart/stop，B3 MVP 端到端）、
+ *  与压缩相关（preCompact/postCompact）或异常终态（blocked/failed）。
+ *  其余（preToolUse/postToolUse 等高频 hook）过滤为噪声。 */
+const NOTABLE_HOOK_EVENTS = new Set<HookEventName>([
+  'sessionStart',
+  'stop',
+  'preCompact',
+  'postCompact',
+]);
+const NOTABLE_HOOK_STATUSES = new Set<HookRunStatus>(['blocked', 'failed']);
+function isNotableHook(eventName: string, status: string): boolean {
+  return (
+    NOTABLE_HOOK_EVENTS.has(eventName as HookEventName) ||
+    NOTABLE_HOOK_STATUSES.has(status as HookRunStatus)
+  );
 }
 
 function readString(obj: unknown, key: string): string {

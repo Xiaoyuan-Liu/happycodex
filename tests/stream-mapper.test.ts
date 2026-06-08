@@ -6,6 +6,8 @@ import { describe, expect, it } from 'vitest';
 import { ServerNotif } from '../src/appserver/protocol.js';
 import {
   StreamMapper,
+  extractHookEventName,
+  extractHookStatus,
   extractToolName,
   extractToolOk,
   mapTurnStatus,
@@ -80,7 +82,9 @@ describe('StreamMapper — text / thinking / progress deltas', () => {
       itemId: 'it_4',
       delta: 'stdout line\n',
     });
-    expect(out).toEqual([{ type: 'tool_progress', text: 'stdout line\n', itemId: 'it_4' }]);
+    expect(out).toEqual([
+      { type: 'tool_progress', text: 'stdout line\n', itemId: 'it_4', threadId: 'th_1' },
+    ]);
   });
 
   it('缺失 delta 时 text 回退为空串', () => {
@@ -103,6 +107,7 @@ describe('StreamMapper — item/started', () => {
         toolName: 'ls -la',
         itemId: 'c1',
         toolInputSummary: 'ls -la',
+        threadId: 'th',
       },
     ]);
   });
@@ -274,6 +279,152 @@ describe('StreamMapper — status / usage', () => {
   });
 });
 
+describe('StreamMapper — tool 事件透传 threadId（B2 scope 归属前提）', () => {
+  it('tool_use_start 透传 item/started 的 threadId（mcpToolCall）', () => {
+    const out = map(ServerNotif.itemStarted, {
+      threadId: 'th_99',
+      turnId: 'tn',
+      startedAtMs: 1,
+      item: { type: 'mcpToolCall', id: 'm1', server: 'github', tool: 'create_pr', status: 'inProgress' },
+    });
+    expect(out[0]).toMatchObject({ type: 'tool_use_start', itemId: 'm1', threadId: 'th_99' });
+  });
+
+  it('tool_use_end 透传 item/completed 的 threadId', () => {
+    const out = map(ServerNotif.itemCompleted, {
+      threadId: 'th_99',
+      turnId: 'tn',
+      completedAtMs: 2,
+      item: { type: 'commandExecution', id: 'c1', command: 'ls', status: 'completed', exitCode: 0 },
+    });
+    expect(out).toEqual([
+      { type: 'tool_use_end', toolName: 'ls', itemId: 'c1', ok: true, threadId: 'th_99' },
+    ]);
+  });
+
+  it('tool_progress 透传 outputDelta 的 threadId', () => {
+    const out = map(ServerNotif.commandExecutionOutputDelta, {
+      threadId: 'th_99',
+      turnId: 'tn',
+      itemId: 'it_4',
+      delta: 'x',
+    });
+    expect(out[0]).toMatchObject({ type: 'tool_progress', itemId: 'it_4', threadId: 'th_99' });
+  });
+});
+
+describe('StreamMapper — 上下文压缩（B1 边界，非文本）', () => {
+  it('(a) thread/compacted → status:compacted，携带 threadId/turnId', () => {
+    const out = map(ServerNotif.threadCompacted, { threadId: 'th_1', turnId: 'tn_1' });
+    expect(out).toEqual([{ type: 'status', status: 'compacted', threadId: 'th_1', turnId: 'tn_1' }]);
+  });
+
+  it('(b) contextCompaction item（item/completed）→ status:compacted，与 (a) 等价', () => {
+    const out = map(ServerNotif.itemCompleted, {
+      threadId: 'th_2',
+      turnId: 'tn_2',
+      completedAtMs: 1,
+      item: { type: 'contextCompaction', id: 'cc1' },
+    });
+    expect(out).toEqual([{ type: 'status', status: 'compacted', threadId: 'th_2', turnId: 'tn_2' }]);
+  });
+
+  it('(b) contextCompaction 不被 tool-item 过滤吞掉（即使 isToolItem=false）', () => {
+    const out = map(ServerNotif.itemCompleted, {
+      threadId: 'th_3',
+      item: { type: 'contextCompaction', id: 'cc2' },
+    });
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({ type: 'status', status: 'compacted' });
+  });
+
+  it('compact_partial 的文本 flush 不在 mapper 产出（不变量 i：留给有状态 session 层）', () => {
+    // mapper 对压缩 item 只产边界 status，不产任何 text/compact_partial 事件。
+    const out = map(ServerNotif.itemCompleted, {
+      threadId: 'th',
+      item: { type: 'contextCompaction', id: 'cc3' },
+    });
+    expect(out.some((e) => e.type === 'compact_partial' || e.type === 'text_delta')).toBe(false);
+  });
+});
+
+describe('StreamMapper — Hooks（B3 过滤噪声）', () => {
+  it('hook/started preCompact → status:hook:preCompact:running', () => {
+    const out = map(ServerNotif.hookStarted, {
+      threadId: 'th',
+      turnId: 'tn',
+      run: { eventName: 'preCompact', status: 'running' },
+    });
+    expect(out).toEqual([{ type: 'status', status: 'hook:preCompact:running' }]);
+  });
+
+  it('hook/completed postCompact → status:hook:postCompact:completed', () => {
+    const out = map(ServerNotif.hookCompleted, {
+      threadId: 'th',
+      turnId: 'tn',
+      run: { eventName: 'postCompact', status: 'completed' },
+    });
+    expect(out).toEqual([{ type: 'status', status: 'hook:postCompact:completed' }]);
+  });
+
+  it('hook 异常终态 blocked / failed 总是产出（即使非压缩事件）', () => {
+    const blocked = map(ServerNotif.hookCompleted, {
+      threadId: 'th',
+      turnId: 'tn',
+      run: { eventName: 'preToolUse', status: 'blocked' },
+    });
+    expect(blocked).toEqual([{ type: 'status', status: 'hook:preToolUse:blocked' }]);
+
+    const failed = map(ServerNotif.hookCompleted, {
+      threadId: 'th',
+      turnId: null,
+      run: { eventName: 'postToolUse', status: 'failed' },
+    });
+    expect(failed).toEqual([{ type: 'status', status: 'hook:postToolUse:failed' }]);
+  });
+
+  it('B3 MVP：会话生命周期 hook sessionStart / stop 端到端产出 status', () => {
+    expect(
+      map(ServerNotif.hookStarted, {
+        threadId: 'th',
+        turnId: null,
+        run: { eventName: 'sessionStart', status: 'running' },
+      }),
+    ).toEqual([{ type: 'status', status: 'hook:sessionStart:running' }]);
+    expect(
+      map(ServerNotif.hookCompleted, {
+        threadId: 'th',
+        turnId: null,
+        run: { eventName: 'sessionStart', status: 'completed' },
+      }),
+    ).toEqual([{ type: 'status', status: 'hook:sessionStart:completed' }]);
+    expect(
+      map(ServerNotif.hookCompleted, {
+        threadId: 'th',
+        turnId: null,
+        run: { eventName: 'stop', status: 'completed' },
+      }),
+    ).toEqual([{ type: 'status', status: 'hook:stop:completed' }]);
+  });
+
+  it('hook 噪声事件（非压缩/非生命周期 + 正常终态）→ [] 被过滤', () => {
+    expect(
+      map(ServerNotif.hookStarted, { threadId: 'th', turnId: 'tn', run: { eventName: 'preToolUse', status: 'running' } }),
+    ).toEqual([]);
+    expect(
+      map(ServerNotif.hookCompleted, { threadId: 'th', turnId: 'tn', run: { eventName: 'postToolUse', status: 'completed' } }),
+    ).toEqual([]);
+    expect(
+      map(ServerNotif.hookCompleted, { threadId: 'th', turnId: null, run: { eventName: 'userPromptSubmit', status: 'completed' } }),
+    ).toEqual([]);
+  });
+
+  it('hook run 缺失字段不抛、被安全过滤为 []', () => {
+    expect(map(ServerNotif.hookStarted, { threadId: 'th', turnId: 'tn' })).toEqual([]);
+    expect(map(ServerNotif.hookCompleted, { threadId: 'th', turnId: 'tn', run: {} })).toEqual([]);
+  });
+});
+
 describe('StreamMapper — 未知 / 缺省', () => {
   it('未知 method → []', () => {
     expect(map('item/somethingNew/delta', { foo: 'bar' })).toEqual([]);
@@ -317,5 +468,14 @@ describe('helper 函数', () => {
     expect(stringifyStatus(null)).toBe('');
     expect(stringifyStatus(undefined)).toBe('');
     expect(stringifyStatus(42)).toBe('42');
+  });
+
+  it('extractHookEventName / extractHookStatus 容错', () => {
+    expect(extractHookEventName({ eventName: 'preCompact', status: 'running' })).toBe('preCompact');
+    expect(extractHookStatus({ eventName: 'preCompact', status: 'blocked' })).toBe('blocked');
+    expect(extractHookEventName(undefined)).toBe('');
+    expect(extractHookStatus(undefined)).toBe('');
+    expect(extractHookEventName({})).toBe('');
+    expect(extractHookStatus({ status: 42 })).toBe('');
   });
 });

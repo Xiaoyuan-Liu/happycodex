@@ -11,11 +11,17 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
+    "start": "node dist/agent-runner.js",
+    "dev": "tsx src/agent-runner.ts",
+    "poc:entry": "tsx src/poc/poc-entry.ts",
     "poc:stream": "tsx src/poc/poc-stream.ts",
     "poc:steer": "tsx src/poc/poc-steer.ts",
     "poc:resume": "tsx src/poc/poc-resume.ts",
     "poc:tools": "tsx src/poc/poc-tools.ts",
     "poc:multitenant": "tsx src/poc/poc-multitenant.ts",
+    "poc:subagent": "tsx src/poc/poc-subagent.ts",
+    "poc:compact": "tsx src/poc/poc-compact.ts",
+    "poc:hooks": "tsx src/poc/poc-hooks.ts",
     "protocol:regen": "codex app-server generate-ts --experimental --out protocol/ts && codex app-server generate-json-schema --experimental --out protocol/schema"
   },
   "devDependencies": {

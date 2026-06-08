@@ -17,7 +17,7 @@ export interface AppServerClientOptions {
   env?: Record<string, string>;
   /** 工作目录（spawn cwd）。 */
   cwd?: string;
-  /** 单条请求超时（毫秒），默认 0 = 不超时。 */
+  /** 单条请求看门狗超时（毫秒），默认 60000ms；显式传 0 关闭超时（永不超时）。 */
   requestTimeoutMs?: number;
   /** 结构化日志回调（可选）。 */
   logger?: (level: 'debug' | 'info' | 'warn' | 'error', msg: string, meta?: unknown) => void;
@@ -88,6 +88,16 @@ export interface ThreadSessionConfig {
   resumeThreadId?: string;
   /** Stage 3：注册给 codex 的 dynamicTools schema（在 thread/start 透传）。 */
   dynamicTools?: DynamicToolSpec[];
+  /**
+   * B2：网页搜索模式。透传进 thread/start.config.web_search（codex WebSearchMode）。
+   * web-researcher 子代理依赖 'live'；缺省不设（用 codex 自身默认）。
+   */
+  webSearch?: 'disabled' | 'cached' | 'live';
+  /**
+   * B2：透传进 thread/start.config 的额外配置（snake_case 键，对齐 codex Config）。
+   * 与 webSearch 合并：webSearch 优先写 config.web_search。
+   */
+  config?: Record<string, unknown>;
 }
 
 export interface ThreadSessionState {
@@ -95,7 +105,13 @@ export interface ThreadSessionState {
   sessionId: string | null;
   /** 当前 active turn id（用于 turn/steer 的 expectedTurnId）；无活跃 turn 时为 null。 */
   activeTurnId: string | null;
+  /** [UNSTABLE] rollout 文件磁盘路径（thread.path 兜底，可能 null）。B1 归档/trim 用。 */
   rolloutPath: string | null;
+  /**
+   * B1：本会话是否为子代理 thread（thread.parentThreadId != null）。子代理 compact 副作用应跳过，
+   * 避免归档/trim 主 transcript 的无关副本（对齐 HappyClaw PreCompact 跳过 sub-agent 的逻辑）。
+   */
+  isSubAgent: boolean;
 }
 
 /**
@@ -111,11 +127,23 @@ export interface IThreadSession {
   /** 发送一条用户消息（自动判定 turn/start vs turn/steer）。 */
   sendUserMessage(text: string): Promise<void>;
   interrupt(): Promise<void>;
+  /** B1：主动触发上下文压缩（thread/compact/start）。响应为空对象、忽略。 */
+  compact(): Promise<void>;
+  /** B1：取出并清空本轮累积的可见正文（compact_partial flush 用）。 */
+  takeAccumulatedText(): string;
   onStreamEvent(handler: (ev: StreamEvent) => void): () => void;
   /** 一轮开始回调。turnId 来自 turn/start 响应（同步）或 turn/started 通知，按 id 去重只触发一次。 */
   onTurnStarted(handler: (info: { turnId: string }) => void): () => void;
   /** 本轮结束（turn/completed）回调。仅对在飞行中的 turn 触发一次（忽略陈旧/重复完成）。 */
   onTurnCompleted(handler: (info: { turnId: string; subtype: string }) => void): () => void;
+  /** B1：上下文压缩完成回调（key off contextCompaction item；同一 item id 去重只触发一次）。
+   *  reason 区分主动 compact()（manual）与内核自动压缩（auto）。 */
+  onCompacted(handler: (reason: 'manual' | 'auto') => void): () => void;
+  /**
+   * B2：分叉本会话 thread（thread/fork），上下文继承。返回新 thread.id + forkedFromId。
+   * 注意：fork 出的 sessionId 与 base 不同（PoC 实测）。作为可选 review/分叉路径，不改本会话状态。
+   */
+  fork(): Promise<{ threadId: string; forkedFromId: string | null; sessionId: string | null }>;
 }
 
 /** CodexRunner 的初始输入（对齐 HappyClaw ContainerInput 的精简版）。 */

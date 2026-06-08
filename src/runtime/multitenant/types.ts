@@ -66,6 +66,12 @@ export interface SessionManagerOptions {
   sessionConfig?: ThreadSessionConfig;
   /** 是否给每个 folder 挂 Stage 3 工具层（IpcToolBridge + 12 工具）。默认 false。 */
   enableTools?: boolean;
+  /**
+   * B3：是否给每个 folder 注入 SessionStart + Stop hook（hooks.json + [features] hooks=true
+   * + 首启信任注入 trusted_hash）。默认 false。开启后 hook 触发 → hook/started|completed 通知
+   * → mapper → StreamEvent。
+   */
+  enableHooks?: boolean;
 }
 
 /** 多租户会话编排器。 */

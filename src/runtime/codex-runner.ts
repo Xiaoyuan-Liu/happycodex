@@ -33,6 +33,7 @@ import {
 import { ThreadSession } from './session.js';
 import { ToolDispatcher } from './tools/dispatcher.js';
 import { ApprovalResponder } from './approval-responder.js';
+import { archiveRollout, trimRollout } from './rollout-archive.js';
 import type { IToolRegistry, ToolBridge } from './tools/types.js';
 
 export interface CodexRunnerDeps {
@@ -46,6 +47,11 @@ export interface CodexRunnerDeps {
    * 并挂一个 ToolDispatcher 处理 item/tool/call（用 bridge 执行）。
    */
   tools?: { registry: IToolRegistry; bridge: ToolBridge };
+  /**
+   * B1：上下文压缩归档基目录（如 data/memory）。提供则 onCompacted 时把 rollout 归档到
+   * {archiveBaseDir}/{folder}/conversations/ 并 trim；缺省则只 flush compact_partial、不落盘归档。
+   */
+  archiveBaseDir?: string;
 }
 
 /** 把单个 StreamEvent 包裹成 OUTPUT_MARKER 协议的一行（与 HappyClaw container-runner 解析端一致）。 */
@@ -63,6 +69,7 @@ export class CodexRunner implements ICodexRunner {
   private readonly sink: (line: string) => void;
   private readonly mapper: IStreamMapper | undefined;
   private readonly tools: { registry: IToolRegistry; bridge: ToolBridge } | undefined;
+  private readonly archiveBaseDir: string | undefined;
 
   private session: ThreadSession | null = null;
   private toolDispatcher: ToolDispatcher | null = null;
@@ -71,6 +78,8 @@ export class CodexRunner implements ICodexRunner {
   /** run() 返回的“未结束”Promise 的 resolver；shutdown / 全部 turn 完成且无待注入时调用。 */
   private finishResolve: (() => void) | null = null;
   private finished = false;
+  /** client.onClose 退订函数；崩溃/正常完成/显式 shutdown 三条收尾路径统一摘除，防泄漏。 */
+  private offClose: (() => void) | null = null;
 
   /** 注入串行化锁：保证同一时间只 await 一条 sendUserMessage。 */
   private injectChain: Promise<void> = Promise.resolve();
@@ -89,6 +98,7 @@ export class CodexRunner implements ICodexRunner {
     this.sink = deps.sink ?? defaultSink;
     this.mapper = deps.mapper;
     this.tools = deps.tools;
+    this.archiveBaseDir = deps.archiveBaseDir;
   }
 
   async run(input: CodexRunnerInput): Promise<void> {
@@ -128,6 +138,30 @@ export class CodexRunner implements ICodexRunner {
     session.onTurnCompleted(({ turnId }) => {
       this.inFlightTurns.delete(turnId);
       this.maybeFinish();
+    });
+
+    // B1：上下文压缩完成（contextCompaction item）→ flush compact_partial + 归档 + trim。
+    // 子代理 thread 跳过（避免归档/trim 主 transcript 的无关副本，对齐 HappyClaw PreCompact）。
+    session.onCompacted((reason) => {
+      this.onCompacted(session, input.groupFolder, reason);
+    });
+
+    // app-server 崩溃自愈：进程意外退出时 turn/completed 永不到达，inFlightTurns 永不清空，
+    // maybeFinish 永远 return → run() 的 await finishPromise 永久挂起。订阅 onClose 把异常退出
+    // 转成幂等 resolveFinish + 一条 failed result 事件（StreamEvent 无 'error' 类型，复用
+    // result+subtype:'failed' 表达异常收尾，调用方据此区分非正常完成）。#12
+    this.offClose = this.client.onClose((info) => {
+      if (this.finished) return;
+      this.shuttingDown = true; // 阻断后续 inject / maybeFinish 误判
+      this.sink(
+        wrapStreamEvent({
+          type: 'result',
+          subtype: 'failed',
+          status: `app-server closed (code=${String(info.code)} signal=${String(info.signal)})`,
+          ...(this.session?.state.threadId ? { threadId: this.session.state.threadId } : {}),
+        }),
+      );
+      this.resolveFinish();
     });
 
     const finishPromise = new Promise<void>((resolve) => {
@@ -172,6 +206,11 @@ export class CodexRunner implements ICodexRunner {
   }
 
   private async doShutdown(): Promise<void> {
+    // 先摘 onClose：显式 shutdown 是正常收尾，避免 client.close() 触发的 onClose 误吐 failed 事件。
+    if (this.offClose) {
+      this.offClose();
+      this.offClose = null;
+    }
     try {
       if (this.session) {
         await this.session.interrupt().catch(() => {});
@@ -197,6 +236,38 @@ export class CodexRunner implements ICodexRunner {
     }
   }
 
+  /**
+   * B1 压缩副作用编排：
+   *   - 子代理 thread → 直接跳过（不归档/trim 主 transcript 的无关副本）。
+   *   - 否则 (a) flush：把压缩前 session 缓冲的可见正文一次性吐成 compact_partial（缓冲为空也发标记）；
+   *           (b) archiveRollout（归档）；(c) trimRollout（归档之后再删边界前历史）。
+   * archive/trim 仅在配置了 archiveBaseDir 时执行；其文件操作自身 try/catch 不抛。
+   */
+  private onCompacted(session: ThreadSession, folder: string, reason: 'manual' | 'auto'): void {
+    if (session.state.isSubAgent) return;
+
+    // (a) flush compact_partial。
+    const text = session.takeAccumulatedText();
+    const threadId = session.state.threadId;
+    this.sink(
+      wrapStreamEvent({
+        type: 'compact_partial',
+        sourceKind: 'compact_partial',
+        compactReason: reason,
+        scope: 'main',
+        ...(text.trim() ? { text } : {}),
+        ...(threadId ? { threadId } : {}),
+      }),
+    );
+
+    // (b)+(c) 归档后 trim（需 archiveBaseDir；rollout-archive 内部对 null path / 越界 / I/O 失败兜底）。
+    if (this.archiveBaseDir) {
+      const rolloutPath = session.state.rolloutPath;
+      archiveRollout(rolloutPath, folder, this.archiveBaseDir);
+      trimRollout(rolloutPath);
+    }
+  }
+
   /** 全部 turn 完成且无排队注入 → run() 视为完成。shutdown 走 resolveFinish 直接收尾。 */
   private maybeFinish(): void {
     if (this.shuttingDown) return;
@@ -209,6 +280,10 @@ export class CodexRunner implements ICodexRunner {
   private resolveFinish(): void {
     if (this.finished) return;
     this.finished = true;
+    if (this.offClose) {
+      this.offClose();
+      this.offClose = null;
+    }
     const resolve = this.finishResolve;
     this.finishResolve = null;
     if (resolve) resolve();

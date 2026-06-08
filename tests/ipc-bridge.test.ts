@@ -5,7 +5,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdtemp, rm, readdir, readFile, mkdir, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, readdir, readFile, mkdir, writeFile, symlink } from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
@@ -97,6 +97,59 @@ describe('IpcToolBridge — scheduleTask / list / lifecycle', () => {
     const tasks = await bridge.listTasks(FOLDER);
     expect(tasks).toHaveLength(1);
     expect(tasks[0]).toMatchObject({ id: taskId, name: 'nightly', status: 'queued' });
+  });
+
+  it('#10 schedule 后 cancel → listTasks 报 cancelled（绝不再 queued）', async () => {
+    const { taskId } = await bridge.scheduleTask(FOLDER, input);
+    await bridge.cancelTask(FOLDER, taskId);
+    const tasks = await bridge.listTasks(FOLDER);
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0]).toMatchObject({ id: taskId, name: 'nightly', status: 'cancelled' });
+  });
+
+  it('#10 schedule 后 pause → listTasks 报 paused', async () => {
+    const { taskId } = await bridge.scheduleTask(FOLDER, input);
+    await bridge.pauseTask(FOLDER, taskId);
+    const tasks = await bridge.listTasks(FOLDER);
+    expect(tasks[0]).toMatchObject({ id: taskId, status: 'paused' });
+  });
+
+  it('#10 最后动作（按 ts）胜出：pause→resume 序列报 queued（用显式 ts 注入定序，避免同毫秒抖动）', async () => {
+    // 直接写带显式 ts 的动作文件，确定性地验证"最后动作胜出"聚合，而非依赖真实 Date.now() 的毫秒差。
+    const dir = path.join(ipcDir, FOLDER, 'tasks');
+    await mkdir(dir, { recursive: true });
+    const writeAction = async (action: string, ts: number, task?: unknown): Promise<void> => {
+      await writeFile(
+        path.join(dir, `${action}-${ts}.json`),
+        JSON.stringify({ type: 'schedule', action, taskId: 'task_x', ts, task }),
+        'utf8',
+      );
+    };
+    await writeAction('create', 100, { name: 'job' });
+    await writeAction('pause', 200);
+    await writeAction('resume', 300); // 最新 ts → resume 胜出 → queued
+
+    const tasks = await bridge.listTasks(FOLDER);
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0]).toMatchObject({ id: 'task_x', name: 'job', status: 'queued' });
+  });
+
+  it('#10 同毫秒平局时 cancel 绝不被 create 盖回 queued', async () => {
+    const dir = path.join(ipcDir, FOLDER, 'tasks');
+    await mkdir(dir, { recursive: true });
+    // create 与 cancel 同 ts（极端同毫秒写入）：动作终态优先级保证判 cancelled。
+    await writeFile(
+      path.join(dir, 'a-create.json'),
+      JSON.stringify({ type: 'schedule', action: 'create', taskId: 'task_y', ts: 500, task: { name: 'j' } }),
+      'utf8',
+    );
+    await writeFile(
+      path.join(dir, 'b-cancel.json'),
+      JSON.stringify({ type: 'schedule', action: 'cancel', taskId: 'task_y', ts: 500 }),
+      'utf8',
+    );
+    const tasks = await bridge.listTasks(FOLDER);
+    expect(tasks[0]).toMatchObject({ id: 'task_y', status: 'cancelled' });
   });
 
   it('pause/resume/cancelTask 各写一条 schedule 请求', async () => {
@@ -200,6 +253,15 @@ describe('IpcToolBridge — memory append / search / get', () => {
     await expect(bridge.memoryAppend(FOLDER, 'x', 'a/b')).rejects.toThrow(/unsafe scope/);
   });
 
+  it('#11 memoryAppend 对含 NUL/控制字符的 scope 抛 unsafe scope（而非 fs TypeError）', async () => {
+    const nul = 'a' + String.fromCharCode(0) + 'b';
+    await expect(bridge.memoryAppend(FOLDER, 'x', nul)).rejects.toThrow(/unsafe scope/);
+    const lf = 'a' + String.fromCharCode(10) + 'b';
+    await expect(bridge.memoryAppend(FOLDER, 'x', lf)).rejects.toThrow(/unsafe scope/);
+    // 合法 scope（点、下划线、连字符、日期）不受影响。
+    await expect(bridge.memoryAppend(FOLDER, 'ok', 'my_scope-2026.01')).resolves.toBeUndefined();
+  });
+
   it('目录不存在时 memorySearch 返回 []', async () => {
     const hits = await bridge.memorySearch('never-touched', 'anything');
     expect(hits).toEqual([]);
@@ -213,5 +275,66 @@ describe('IpcToolBridge — memory append / search / get', () => {
     const hits = await bridge.memorySearch(FOLDER, 'match');
     expect(hits.every((h) => h.path.endsWith('.md'))).toBe(true);
     expect(hits.some((h) => h.path === 'real.md')).toBe(true);
+  });
+});
+
+describe('IpcToolBridge — #7 folder 越界自洽校验（不依赖调用方先验）', () => {
+  it('恶意 folder（.. / 绝对路径）逃出 memory 根 → 读类返回空/null', async () => {
+    // 在 memoryDir 上层放一个目标文件，证明越界 folder 无法读出它。
+    await writeFile(path.join(root, 'secret.md'), 'leaked memory', 'utf8');
+    for (const evil of ['..', '../..', '../../', path.resolve(root)]) {
+      expect(await bridge.memorySearch(evil, 'leaked')).toEqual([]);
+      expect(await bridge.memoryGet(evil, 'secret.md')).toBeNull();
+      expect(await bridge.listTasks(evil)).toEqual([]);
+    }
+  });
+
+  it('恶意 folder 逃出 ipc 根 → 写类抛错（unsafe folder rejected）', async () => {
+    await expect(bridge.sendMessage('..', 'x')).rejects.toThrow(/unsafe folder/);
+    await expect(bridge.scheduleTask('../../etc', { name: 'n', prompt: 'p', schedule: { kind: 'interval', seconds: 1 } })).rejects.toThrow(/unsafe folder/);
+    await expect(bridge.pauseTask('..', 'task_1')).rejects.toThrow(/unsafe folder/);
+  });
+
+  it('恶意 folder 逃出 memory 根 → memoryAppend 抛 unsafe scope', async () => {
+    await expect(bridge.memoryAppend('..', 'leak', 'notes')).rejects.toThrow(/unsafe scope/);
+  });
+});
+
+describe('IpcToolBridge — #8 符号链接穿越防护（物理 containment）', () => {
+  it('folder 内指向 memory 根之外的 symlink → memoryGet 返回 null、memorySearch 不命中', async () => {
+    // 在 memoryDir 上层放外部目标。
+    await writeFile(path.join(root, 'outside-secret.md'), 'symlink-leaked-content', 'utf8');
+    const dir = path.join(memoryDir, FOLDER);
+    await mkdir(dir, { recursive: true });
+    const linkPath = path.join(dir, 'link.md');
+    try {
+      await symlink(path.join(root, 'outside-secret.md'), linkPath);
+    } catch {
+      // 不支持 symlink 的平台（罕见）→ 跳过。
+      return;
+    }
+
+    // 词法校验通过（link.md 在 base 内），但 realpath 解析后落在 base 外 → 拒。
+    expect(await bridge.memoryGet(FOLDER, 'link.md')).toBeNull();
+
+    // memorySearch 用 lstat 识别 symlink 并跳过，不读出其目标内容。
+    const hits = await bridge.memorySearch(FOLDER, 'symlink-leaked-content');
+    expect(hits.some((h) => h.path === 'link.md')).toBe(false);
+    expect(hits).toEqual([]);
+  });
+
+  it('folder 内指向 base 内部的普通 symlink 也被 lstat 跳过（保守，不读链接）', async () => {
+    const dir = path.join(memoryDir, FOLDER);
+    await mkdir(dir, { recursive: true });
+    await writeFile(path.join(dir, 'target.md'), 'inside content', 'utf8');
+    try {
+      await symlink(path.join(dir, 'target.md'), path.join(dir, 'alias.md'));
+    } catch {
+      return;
+    }
+    const hits = await bridge.memorySearch(FOLDER, 'inside content');
+    // 真实文件 target.md 命中；symlink alias.md 被跳过。
+    expect(hits.some((h) => h.path === 'target.md')).toBe(true);
+    expect(hits.some((h) => h.path === 'alias.md')).toBe(false);
   });
 });
