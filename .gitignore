@@ -6,3 +6,6 @@ dist/
 /tmp/
 coverage/
 log/
+
+# happyclaw 上游源码快照（gitignored、可刷新；见 docs/UPSTREAM-SYNC.md）
+/upstream-happyclaw/
