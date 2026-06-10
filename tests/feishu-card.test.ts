@@ -1050,7 +1050,9 @@ describe('buildStreamingAgentCard rich skeleton (Phase F)', () => {
 // ─── feishu.ts:buildInteractiveCard backward-compat ─────────────
 
 describe('feishu.ts wrapper uses new builder', () => {
-  test('buildInteractiveCard delegates to buildAgentReplyCard without default header', async () => {
+  // 首次动态 import 重量级 src/feishu.js（拉起整个渠道依赖图）；全量并行跑时
+  // transform+求值可超过默认 5s 单测超时（单独跑 ~2s），放宽到 30s。
+  test('buildInteractiveCard delegates to buildAgentReplyCard without default header', { timeout: 30_000 }, async () => {
     const { buildInteractiveCard } = (await import('../src/feishu.js')) as unknown as {
       buildInteractiveCard?: (t: string) => object;
     };

@@ -51,6 +51,14 @@ IM/定时任务/skills 体系/插件/billing-完整版不在 MVP。
 | **A4 调度+工具+skills** | 定时任务全链路；12→17 工具；skills 生效 | port task-scheduler；补 send_image/send_file/discord_*×3 + pollIpcResult；prompts/skills 按 AGENTS.md+CODEX_HOME 物化方案落地 | M |
 | **A5 收尾：多渠道+插件+billing 完整** | 钉钉/Discord/QQ；插件链路；billing 评估 costUSD | port 其余渠道（卡片 API 签名兼容，映射层零改）；插件 adapt（host 侧展开 + CODEX_HOME 物化）；billing 完整版评估 | L-M |
 
+## MVP 验收记录（2026-06-10 达成 ✅）
+
+E2E 脚本 `scripts/e2e-mvp.mjs`（可重跑）8 项口径全 PASS：build 产物 / 隔离启动 /
+Web API 注册登录建群 / 首条消息全管线（入库→调度→codex→WS 流式→回复）/ 多轮上下文 /
+工具冒烟（schedule_task+memory_append 副作用落地）/ **重启 resume**（threadId 跨重启不变
+且召回重启前内容）/ **Docker 容器模式**（容器内 codex 真执行）。
+观察项：容器内 shell 被 approval policy 拦截（待复查 container 侧 approval/sandbox 配置）。
+
 ## 最大风险
 
 1. **stream-event 契约**承重墙（已定向：对齐上游）——A0 改名须全测试回归，之后三方消费端近零改。
