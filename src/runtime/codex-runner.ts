@@ -8,8 +8,8 @@
  * - run(input)：new ThreadSession → 订阅 onTurnStarted/onTurnCompleted/onStreamEvent → start()
  *   → 发送初始 prompt → await 一个“未结束”Promise，直到**所有在飞 turn 完成且无待注入消息**时
  *   resolve（或 shutdown 触发）。
- * - inject(text)：把后续用户消息排队，串行 await session.sendUserMessage（有 active turn → steer，
- *   否则 → 新 turn）。同一时间只处理一条注入。
+ * - inject(text, images?)：把后续用户消息（可带图片附件）排队，串行 await session.sendUserMessage
+ *   （有 active turn → steer，否则 → 新 turn）。同一时间只处理一条注入。
  * - shutdown()：session.interrupt().catch(()=>{}) → client.close() → resolve run()。
  *
  * 完成门控（修正历史竞态）：以**在飞 turn 集合**（由 session 的 onTurnStarted/onTurnCompleted 驱动，
@@ -21,6 +21,7 @@
 import type {
   IAppServerClient,
   ICodexRunner,
+  InjectedImage,
   IStreamMapper,
   CodexRunnerInput,
   ThreadSessionConfig,
@@ -169,12 +170,12 @@ export class CodexRunner implements ICodexRunner {
     });
 
     await session.start();
-    await session.sendUserMessage(input.prompt);
+    await session.sendUserMessage(input.prompt, input.images);
 
     await finishPromise;
   }
 
-  inject(text: string): void {
+  inject(text: string, images?: InjectedImage[]): void {
     if (this.shuttingDown) return;
     const session = this.session;
     if (!session) {
@@ -188,7 +189,7 @@ export class CodexRunner implements ICodexRunner {
         if (this.shuttingDown) return;
         // sendUserMessage 在请求 resolve 时同步注册新 turn（onTurnStarted），
         // 因此该 await 返回前，注入打开的 turn 已进入 inFlightTurns，maybeFinish 不会误判。
-        return session.sendUserMessage(text);
+        return session.sendUserMessage(text, images);
       })
       .catch(() => {
         // 注入失败不影响后续条目，已通过 stream 事件/日志体现，这里吞掉避免 unhandled rejection。

@@ -1,14 +1,18 @@
 /**
- * HappyClaw 12 个内置工具的 dynamicTools 定义。
+ * HappyClaw 17 个内置工具的 dynamicTools 定义（A4：12 → 17，补齐上游完整面）。
  *
  * 每个 ToolDefinition = spec（注册给 codex 的 JSON Schema）+ handler（解析 args → 调 ToolBridge → 回填）。
  * 工具名、描述、入参字段语义尽量对齐 HappyClaw 的 in-process MCP 工具
  * （见 container/agent-runner/src/mcp-tools.ts 的 createMcpTools）。
  *
+ * A4 新增 5 个：send_image / send_file / discord_get_history / discord_get_channel_info /
+ * discord_get_server_info（schema 与 IPC 字段逐字对齐上游；落盘字段命中主进程消费端 case）。
+ *
  * handler 约定：
  *   - args 是 unknown，逐字段做运行时校验；缺必填 → toolTextResult('missing required field ...', false)。
  *   - 用 ctx.groupFolder 作为 bridge 的 folder 参数。
- *   - 不抛错：解析/校验失败一律用 success:false 的结果表达（异常兜底仍在 dispatcher，但这里自我兜住）。
+ *   - 不抛错：解析/校验失败一律用 success:false 的结果表达（bridge 抛出的运行时错误由
+ *     registry.dispatch 兜底为 success:false，错误文案即 bridge 的诚实失败信息）。
  */
 
 import { toolTextResult } from '../../appserver/protocol.js';
@@ -52,6 +56,94 @@ const sendMessage: ToolHandler = async (args, ctx) => {
   if (message === null) return missing('message');
   await ctx.bridge.sendMessage(ctx.groupFolder, message);
   return toolTextResult('消息已发送');
+};
+
+const sendImage: ToolHandler = async (args, ctx) => {
+  const filePath = reqString(args, 'file_path');
+  if (filePath === null) return missing('file_path');
+  const caption = optString(args, 'caption');
+  const r = await ctx.bridge.sendImage(ctx.groupFolder, filePath, caption);
+  // 文案对齐上游：Image sent: {fileName} ({mimeType}, {KB}KB)
+  return toolTextResult(
+    `Image sent: ${r.fileName} (${r.mimeType}, ${(r.sizeBytes / 1024).toFixed(1)}KB)`,
+  );
+};
+
+const sendFile: ToolHandler = async (args, ctx) => {
+  const filePath = reqString(args, 'filePath');
+  if (filePath === null) return missing('filePath');
+  const fileName = reqString(args, 'fileName');
+  if (fileName === null) return missing('fileName');
+  await ctx.bridge.sendFile(ctx.groupFolder, filePath, fileName);
+  return toolTextResult(`Sending file "${fileName}"...`);
+};
+
+/** Discord snowflake 形状（对齐上游 schema 的 ^\d{17,20}$）。 */
+const DISCORD_SNOWFLAKE_RE = /^\d{17,20}$/;
+
+const discordGetHistory: ToolHandler = async (args, ctx) => {
+  let limit: number | undefined;
+  let before: string | undefined;
+  if (isRecord(args)) {
+    if (args.limit !== undefined) {
+      const v = args.limit;
+      if (typeof v !== 'number' || !Number.isInteger(v) || v < 1 || v > 100) {
+        return toolTextResult(
+          'invalid field "limit": expected an integer between 1 and 100',
+          false,
+        );
+      }
+      limit = v;
+    }
+    if (args.before !== undefined) {
+      const v = args.before;
+      if (typeof v !== 'string' || !DISCORD_SNOWFLAKE_RE.test(v)) {
+        return toolTextResult(
+          'invalid field "before": must be a Discord snowflake (17-20 digits)',
+          false,
+        );
+      }
+      before = v;
+    }
+  }
+  const messages = await ctx.bridge.discordGetHistory(ctx.groupFolder, {
+    ...(limit !== undefined ? { limit } : {}),
+    ...(before !== undefined ? { before } : {}),
+  });
+  if (messages.length === 0) {
+    return toolTextResult('No messages found in this channel.');
+  }
+  // 逐字段对齐上游格式化（tag / replyFlag / editFlag / attachments 行）。
+  const formatted = messages
+    .map((m) => {
+      const tag = m.authorBot ? ' [bot]' : '';
+      const editFlag = m.edited ? ' (edited)' : '';
+      const replyFlag = m.replyToId ? ` ↪${m.replyToId}` : '';
+      const attachStr =
+        Array.isArray(m.attachments) && m.attachments.length > 0
+          ? `\n  📎 ${m.attachments.map((a) => a.name).join(', ')}`
+          : '';
+      return `[${m.timestamp}] ${m.authorName}${tag}${replyFlag}${editFlag} (id=${m.id})\n  ${m.content || '(empty)'}${attachStr}`;
+    })
+    .join('\n\n');
+  return toolTextResult(
+    `Discord history (${messages.length} messages, oldest first):\n\n${formatted}`,
+  );
+};
+
+const discordGetChannelInfo: ToolHandler = async (_args, ctx) => {
+  const channel = await ctx.bridge.discordGetChannelInfo(ctx.groupFolder);
+  return toolTextResult(`Discord channel info:\n${JSON.stringify(channel, null, 2)}`);
+};
+
+const discordGetServerInfo: ToolHandler = async (_args, ctx) => {
+  const guild = await ctx.bridge.discordGetServerInfo(ctx.groupFolder);
+  if (guild === null) {
+    return toolTextResult(
+      'This is a DM channel — no server (guild) information available.',
+    );
+  }
+  return toolTextResult(`Discord server info:\n${JSON.stringify(guild, null, 2)}`);
 };
 
 const scheduleTask: ToolHandler = async (args, ctx) => {
@@ -135,15 +227,32 @@ const registerGroup: ToolHandler = async (args, ctx) => {
 const installSkill: ToolHandler = async (args, ctx) => {
   const name = reqString(args, 'name');
   if (name === null) return missing('name');
-  await ctx.bridge.installSkill(ctx.groupFolder, name);
-  return toolTextResult(`Skill "${name}" 已安装`);
+  // 包名形状校验对齐上游：owner/repo[@skill] 或 https?:// URL；非法直接失败、不触达 bridge。
+  const pkg = name.trim();
+  if (!/^[\w\-]+\/[\w\-.]+(?:[@#][\w\-.\/]+)?$/.test(pkg) && !/^https?:\/\//.test(pkg)) {
+    return toolTextResult(
+      `Invalid package format: "${pkg}". Expected format: owner/repo or owner/repo@skill`,
+      false,
+    );
+  }
+  const { installed } = await ctx.bridge.installSkill(ctx.groupFolder, pkg);
+  const installedNote = installed && installed.length > 0 ? `：${installed.join(', ')}` : '';
+  return toolTextResult(`Skill "${pkg}" 已安装${installedNote}（将在下次新会话生效）`);
 };
 
 const uninstallSkill: ToolHandler = async (args, ctx) => {
   const name = reqString(args, 'name');
   if (name === null) return missing('name');
-  await ctx.bridge.uninstallSkill(ctx.groupFolder, name);
-  return toolTextResult(`Skill "${name}" 已卸载`);
+  // skill ID 形状校验对齐上游：目录名（字母数字 + 连字符/下划线）。
+  const skillId = name.trim();
+  if (!/^[\w\-]+$/.test(skillId)) {
+    return toolTextResult(
+      `Invalid skill ID: "${skillId}". Must be alphanumeric with hyphens/underscores.`,
+      false,
+    );
+  }
+  await ctx.bridge.uninstallSkill(ctx.groupFolder, skillId);
+  return toolTextResult(`Skill "${skillId}" 已卸载`);
 };
 
 const memoryAppend: ToolHandler = async (args, ctx) => {
@@ -171,7 +280,7 @@ const memoryGet: ToolHandler = async (args, ctx) => {
 // ───────────────────────── 工具定义（spec + handler） ─────────────────────────
 
 /**
- * 构造 HappyClaw 的 12 个内置工具定义。
+ * 构造 HappyClaw 的 17 个内置工具定义（A4：补齐上游完整面）。
  * 返回顺序与 HappyClaw createMcpTools 中的工具语义对齐，名字保持同名。
  */
 export function createBuiltinTools(): ToolDefinition[] {
@@ -195,6 +304,54 @@ export function createBuiltinTools(): ToolDefinition[] {
         },
       },
       handler: sendMessage,
+    },
+    {
+      spec: {
+        name: 'send_image',
+        description:
+          '把工作区内的图片文件经 IM 发送给当前用户/群组。支持 PNG/JPEG/GIF/WebP，' +
+          '大小上限 10MB；可选附带说明文字（caption）。',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            file_path: {
+              type: 'string',
+              description: '图片文件路径（相对工作区根目录，或工作区内的绝对路径）',
+            },
+            caption: {
+              type: 'string',
+              description: '随图片一起发送的说明文字（可选）',
+            },
+          },
+          required: ['file_path'],
+          additionalProperties: false,
+        },
+      },
+      handler: sendImage,
+    },
+    {
+      spec: {
+        name: 'send_file',
+        description:
+          '把工作区内的文件经 IM（飞书/Telegram/钉钉/QQ/Discord）发送到当前聊天。' +
+          '路径相对于工作区/群组目录。支持 PDF、DOC、XLS、PPT、MP4、ZIP、SO 等，大小上限 30MB。',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            filePath: {
+              type: 'string',
+              description: '相对工作区/群组目录的文件路径（如 "output/report.pdf"）',
+            },
+            fileName: {
+              type: 'string',
+              description: '展示用文件名（如 "report.pdf"）',
+            },
+          },
+          required: ['filePath', 'fileName'],
+          additionalProperties: false,
+        },
+      },
+      handler: sendFile,
     },
     {
       spec: {
@@ -251,7 +408,7 @@ export function createBuiltinTools(): ToolDefinition[] {
         name: 'list_task',
         description:
           '列出当前会话的所有定时任务（管理员主容器可见全部任务）。返回任务的 id、名称与状态。' +
-          '注：状态为 best-effort 排队快照（基于本进程已写出的调度动作聚合），权威状态以主进程为准。',
+          '数据来自主进程权威任务表（请求-响应回执）；主进程未运行时降级为本进程排队快照。',
         inputSchema: {
           type: 'object',
           properties: {},
@@ -338,6 +495,64 @@ export function createBuiltinTools(): ToolDefinition[] {
         },
       },
       handler: registerGroup,
+    },
+    {
+      spec: {
+        name: 'discord_get_history',
+        description:
+          '拉取当前 Discord 频道或 DM 的最近消息（仅当前聊天是 Discord 频道时可用）。' +
+          '每次最多返回 100 条（默认 50），按从旧到新排序；用 before 传消息 ID 可向更早分页。',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            limit: {
+              type: 'integer',
+              minimum: 1,
+              maximum: 100,
+              description: '拉取条数（1-100，默认 50）',
+            },
+            before: {
+              type: 'string',
+              pattern: '^\\d{17,20}$',
+              description:
+                '消息 ID（snowflake）——只返回早于该消息的内容。用上一批最旧消息的 id 分页。',
+            },
+          },
+          required: [],
+          additionalProperties: false,
+        },
+      },
+      handler: discordGetHistory,
+    },
+    {
+      spec: {
+        name: 'discord_get_channel_info',
+        description:
+          '获取当前 Discord 频道元数据：名称、类型（guild_text/dm 等）、话题、NSFW 标记、' +
+          '父分类 ID 与 guild ID。仅当前聊天是 Discord 频道时可用。',
+        inputSchema: {
+          type: 'object',
+          properties: {},
+          required: [],
+          additionalProperties: false,
+        },
+      },
+      handler: discordGetChannelInfo,
+    },
+    {
+      spec: {
+        name: 'discord_get_server_info',
+        description:
+          '获取当前 Discord 频道所属服务器（guild）元数据：名称、描述、所有者 ID、成员数、图标 URL。' +
+          'DM 频道返回 null（DM 不属于任何服务器）。仅当前聊天是 Discord 频道时可用。',
+        inputSchema: {
+          type: 'object',
+          properties: {},
+          required: [],
+          additionalProperties: false,
+        },
+      },
+      handler: discordGetServerInfo,
     },
     {
       spec: {

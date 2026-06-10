@@ -77,6 +77,15 @@ export interface IStreamMapper {
 
 // ───────────────────────── ThreadSession / CodexRunner ─────────────────────────
 
+/**
+ * A4：注入消息携带的图片附件（形状对齐主仓 ContainerInput.images / IPC input 文件的 images[]）。
+ * data 为不带 data-URL 前缀的纯 base64；mimeType 缺省时由接收方按 magic bytes 检测兜底。
+ */
+export interface InjectedImage {
+  data: string;
+  mimeType?: string;
+}
+
 export interface ThreadSessionConfig {
   model?: string;
   cwd?: string;
@@ -124,8 +133,9 @@ export interface ThreadSessionState {
 export interface IThreadSession {
   readonly state: ThreadSessionState;
   start(): Promise<void>;
-  /** 发送一条用户消息（自动判定 turn/start vs turn/steer）。 */
-  sendUserMessage(text: string): Promise<void>;
+  /** 发送一条用户消息（自动判定 turn/start vs turn/steer）。
+   *  A4 契约扩展：可选 images 随同一 turn input 透传（base64 → data URL → UserInput type:'image'）。 */
+  sendUserMessage(text: string, images?: InjectedImage[]): Promise<void>;
   interrupt(): Promise<void>;
   /** B1：主动触发上下文压缩（thread/compact/start）。响应为空对象、忽略。 */
   compact(): Promise<void>;
@@ -149,6 +159,8 @@ export interface IThreadSession {
 /** CodexRunner 的初始输入（对齐 HappyClaw ContainerInput 的精简版）。 */
 export interface CodexRunnerInput {
   prompt: string;
+  /** A4：初始 prompt 携带的图片附件（主仓 ContainerInput.images）；随首个 turn input 透传给 codex。 */
+  images?: InjectedImage[];
   groupFolder: string;
   session: ThreadSessionConfig;
   /**
@@ -157,6 +169,14 @@ export interface CodexRunnerInput {
    * 都从这里取——缺失时这两个工具无法投递（bridge 抛错，模型得到诚实失败）。
    */
   chatJid?: string;
+  /**
+   * A4：触发本 run 的最新消息的 IM source JID（主仓 ContainerInput.currentSourceJid）。
+   * per-channel 工具（discord_*）以 `currentSourceJid || chatJid` 作为初始当前聊天标识
+   * （对齐上游 agent-runner mcpToolsConfig.chatJid 初始化）。
+   */
+  currentSourceJid?: string;
+  /** A4：调用方是否 admin 主容器（主仓 ContainerInput.isAdminHome）；list_tasks IPC 请求据此 stamp。 */
+  isAdminHome?: boolean;
   /** 定时任务运行标记（主仓 ContainerInput.isScheduledTask）；send_message IPC 据此 stamp。 */
   isScheduledTask?: boolean;
   /** 触发本轮的定时任务 id（主仓 ContainerInput.messageTaskId）；send_message IPC 据此 stamp taskId。 */
@@ -169,8 +189,9 @@ export interface CodexRunnerInput {
  */
 export interface ICodexRunner {
   run(input: CodexRunnerInput): Promise<void>;
-  /** 注入后续用户消息（来自 IPC / 队列）。 */
-  inject(text: string): void;
+  /** 注入后续用户消息（来自 IPC / 队列）。
+   *  A4 契约扩展：可选 images（IPC input 文件的 images[]）随消息透传到 session turn input。 */
+  inject(text: string, images?: InjectedImage[]): void;
   /** 请求优雅关闭（对应 HappyClaw 的 _close sentinel）。 */
   shutdown(): void;
 }

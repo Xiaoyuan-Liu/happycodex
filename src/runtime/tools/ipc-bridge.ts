@@ -14,54 +14,123 @@
  *                                                 'uninstall_skill', …}`（字段名跟上游 flat 格式）
  *
  * chatJid/isScheduledTask/currentTaskId 由构造方（agent-runner ← ContainerInput）注入；
- * 缺 chatJid 时 send_message / schedule_task 抛错（主进程会静默丢弃无路由的请求，
- * 抛错让模型得到诚实失败而非假成功）。
+ * 缺 chatJid 时 send_message / schedule_task / send_image / send_file / discord_* 抛错
+ * （主进程会静默丢弃无路由的请求，抛错让模型得到诚实失败而非假成功）。
  *
- * Stage 4 注：listTasks 当前只返回本进程已排队的请求摘要（主进程消费后即删文件，集成态
- * 下快照基本为空）；权威任务列表在主进程，A4 的 pollIpcResult（list_tasks_result_*）接通后
- * 改为查询主进程状态。
+ * A4 请求-响应协议（pollIpcResult，对齐上游 mcp-tools.ts:60）：
+ *   listTasks / installSkill / uninstallSkill / discordGet* 写 {type, requestId, …} 请求文件到
+ *   tasks 通道 → 主进程处理后原子写回 {type}_result_{requestId}.json → 本进程 poll 读取并删除。
+ *   超时（无主进程应答）：listTasks 降级为本地 best-effort 排队快照（standalone 模式），
+ *   其余工具抛上游同文案的超时错误。请求文件超时后**不删**（对齐上游：主进程可能只是慢，
+ *   迟到的执行仍有效；孤儿 result 文件由主进程 10 分钟清理逻辑兜底）。
  */
 
 import { randomUUID } from 'node:crypto';
-import { mkdir, rename, writeFile, readdir, readFile, appendFile, lstat, realpath } from 'node:fs/promises';
+import {
+  mkdir,
+  rename,
+  writeFile,
+  readdir,
+  readFile,
+  appendFile,
+  lstat,
+  realpath,
+  stat,
+  unlink,
+} from 'node:fs/promises';
 import * as path from 'node:path';
 
+import { detectImageMimeTypeFromBase64Strict } from '../../image-detector.js';
 import type {
   ToolBridge,
   ScheduleTaskInput,
   TaskSummary,
   MemoryHit,
+  SendImageResult,
+  DiscordHistoryOptions,
+  DiscordHistoryMessage,
 } from './types.js';
 
 /** memorySearch 返回的最大命中条数。 */
 const MAX_MEMORY_HITS = 50;
+
+/** send_image 的图片大小上限（对齐上游：飞书 / Telegram 共同的 10MB 限制）。 */
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+
+/** pollIpcResult 默认轮询间隔 / 超时（对齐上游 mcp-tools.ts：500ms / 30s；install_skill 120s）。 */
+const DEFAULT_POLL_INTERVAL_MS = 500;
+const DEFAULT_POLL_TIMEOUT_MS = 30_000;
+const INSTALL_SKILL_POLL_TIMEOUT_MS = 120_000;
+
+/** 上游 newRequestId()：时间戳 + 随机段；命中主进程 SAFE_REQUEST_ID_RE（[A-Za-z0-9_-]+）。 */
+function newRequestId(): string {
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/** pollIpcResult 超时错误（listTasks 据此判定走 standalone 降级快照）。 */
+export class IpcPollTimeoutError extends Error {
+  constructor(timeoutMs: number) {
+    super(`Timeout waiting for IPC result (${timeoutMs / 1000}s)`);
+    this.name = 'IpcPollTimeoutError';
+  }
+}
 
 export interface IpcToolBridgeOptions {
   /** IPC 根目录（对齐 HappyClaw `data/ipc/`）。 */
   ipcDir: string;
   /** 记忆根目录（对齐 HappyClaw `data/groups/`，per-folder 下挂 .md）。 */
   memoryDir: string;
+  /**
+   * A4：群组工作区目录（**per-folder 绝对路径**，对齐上游 McpContext.workspaceGroup，
+   * 即主进程 `data/groups/{folder}` / 容器 `/workspace/group`）。
+   * send_image / send_file 的文件路径解析与越界校验锚点；缺省时这两个工具抛错（诚实失败）。
+   */
+  workspaceGroupDir?: string;
   /** 当前会话 chat JID（ContainerInput.chatJid）：message 的 chatJid / schedule_task 的 targetJid。 */
   chatJid?: string;
+  /** A4：调用方是否 admin 主容器（ContainerInput.isAdminHome）：list_tasks 请求 stamp（上游同名字段）。 */
+  isAdminHome?: boolean;
   /** 定时任务运行标记（ContainerInput.isScheduledTask）：message 上条件 stamp。 */
   isScheduledTask?: boolean;
   /** 触发本轮的任务 id（ContainerInput.messageTaskId）：message 上条件 stamp 为 taskId。 */
   currentTaskId?: string;
+  /** pollIpcResult 轮询间隔（毫秒，默认 500；单测可调小）。 */
+  pollIntervalMs?: number;
+  /** pollIpcResult 超时（毫秒）。缺省按上游默认：30s（install_skill 120s）；显式设置则统一覆盖。 */
+  pollTimeoutMs?: number;
 }
 
 export class IpcToolBridge implements ToolBridge {
   private readonly ipcDir: string;
   private readonly memoryDir: string;
-  private readonly chatJid: string;
+  private readonly workspaceGroupDir: string | null;
+  private chatJid: string;
+  private readonly isAdminHome: boolean;
   private readonly isScheduledTask: boolean;
   private readonly currentTaskId: string;
+  private readonly pollIntervalMs: number;
+  private readonly pollTimeoutMs: number;
+  private readonly installPollTimeoutMs: number;
 
   constructor(opts: IpcToolBridgeOptions) {
     this.ipcDir = opts.ipcDir;
     this.memoryDir = opts.memoryDir;
+    this.workspaceGroupDir = opts.workspaceGroupDir ?? null;
     this.chatJid = opts.chatJid ?? '';
+    this.isAdminHome = opts.isAdminHome ?? false;
     this.isScheduledTask = opts.isScheduledTask ?? false;
     this.currentTaskId = opts.currentTaskId ?? '';
+    this.pollIntervalMs = opts.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+    this.pollTimeoutMs = opts.pollTimeoutMs ?? DEFAULT_POLL_TIMEOUT_MS;
+    this.installPollTimeoutMs = opts.pollTimeoutMs ?? INSTALL_SKILL_POLL_TIMEOUT_MS;
+  }
+
+  /**
+   * A4：更新当前聊天标识（对齐上游 agent-runner 主循环对 mcpToolsConfig.chatJid 的就地变更：
+   * IPC input 消息带 sourceJid 时，per-channel 工具（discord_*）应看到最新的来源聊天）。
+   */
+  setChatJid(jid: string): void {
+    if (jid) this.chatJid = jid;
   }
 
   /** 取路由 chatJid；未绑定 → 抛错（对应工具诚实失败，绝不写主进程会静默丢弃的请求）。 */
@@ -86,6 +155,107 @@ export class IpcToolBridge implements ToolBridge {
       text: message,
       ...(this.isScheduledTask ? { isScheduledTask: true } : {}),
       ...(this.currentTaskId ? { taskId: this.currentTaskId } : {}),
+    });
+  }
+
+  async sendImage(folder: string, filePath: string, caption?: string): Promise<SendImageResult> {
+    // 线格式对齐上游 send_image 工具（mcp-tools.ts）：messages 通道、buildSendMessageData 字段序
+    // （chatJid/groupFolder/timestamp 恒 stamp + type:'image'/imageBase64/mimeType/caption/fileName
+    //  + 条件 isScheduledTask/taskId）。消费端命中 src/index.ts processGroupIpc 的
+    // `data.type === 'image' && data.chatJid && data.imageBase64` 分支。
+    const chatJid = this.requireChatJid('send_image');
+    const wsDir = this.requireWorkspaceDir('send_image');
+
+    // 路径解析与越界校验（对齐上游：绝对路径直接用，相对路径锚定工作区；path.sep 后缀防前缀绕过）。
+    const resolved = path.resolve(
+      path.isAbsolute(filePath) ? filePath : path.join(wsDir, filePath),
+    );
+    if (!this.isWithin(resolved, wsDir)) {
+      throw new Error('file path must be within workspace directory.');
+    }
+
+    let st;
+    try {
+      st = await stat(resolved);
+    } catch {
+      throw new Error(`file not found: ${filePath}`);
+    }
+    if (!st.isFile()) {
+      throw new Error(`file not found: ${filePath}`);
+    }
+    if (st.size > MAX_IMAGE_BYTES) {
+      throw new Error(
+        `image file too large (${(st.size / 1024 / 1024).toFixed(1)}MB). Maximum is 10MB.`,
+      );
+    }
+    if (st.size === 0) {
+      throw new Error('image file is empty.');
+    }
+
+    const base64 = (await readFile(resolved)).toString('base64');
+    // magic bytes 检测（与上游 detectImageMimeTypeFromBase64Strict 同源实现）。
+    const mimeType = detectImageMimeTypeFromBase64Strict(base64);
+    if (!mimeType) {
+      throw new Error(
+        'file does not appear to be a supported image format (PNG, JPEG, GIF, WebP, TIFF, BMP).',
+      );
+    }
+
+    const fileName = path.basename(resolved);
+    await this.writeIpc(folder, 'messages', {
+      chatJid,
+      groupFolder: folder,
+      timestamp: new Date().toISOString(),
+      type: 'image',
+      imageBase64: base64,
+      mimeType,
+      ...(caption ? { caption } : {}),
+      fileName,
+      ...(this.isScheduledTask ? { isScheduledTask: true } : {}),
+      ...(this.currentTaskId ? { taskId: this.currentTaskId } : {}),
+    });
+    return { fileName, mimeType, sizeBytes: st.size };
+  }
+
+  async sendFile(folder: string, filePath: string, fileName: string): Promise<void> {
+    // 线格式对齐上游 send_file 工具：tasks 通道，{type:'send_file', chatJid, filePath, fileName,
+    // timestamp}——filePath 必须是相对工作区路径（消费端按 GROUPS_DIR/{sourceGroup}/filePath 解析，
+    // 见 src/index.ts processTaskIpc case 'send_file'）。
+    const chatJid = this.requireChatJid('send_file');
+    const wsDir = this.requireWorkspaceDir('send_file');
+
+    let resolvedPath: string;
+    let relativePath: string;
+    if (path.isAbsolute(filePath)) {
+      resolvedPath = path.resolve(filePath);
+      if (!this.isWithin(resolvedPath, wsDir)) {
+        throw new Error('file must be within the workspace/group directory.');
+      }
+      relativePath = path.relative(wsDir, resolvedPath);
+    } else {
+      relativePath = filePath;
+      resolvedPath = path.resolve(wsDir, filePath);
+      if (!this.isWithin(resolvedPath, wsDir)) {
+        throw new Error('file must be within the workspace/group directory.');
+      }
+    }
+
+    let exists = false;
+    try {
+      exists = (await stat(resolvedPath)).isFile();
+    } catch {
+      exists = false;
+    }
+    if (!exists) {
+      throw new Error(`file not found: ${filePath}`);
+    }
+
+    await this.writeIpc(folder, 'tasks', {
+      type: 'send_file',
+      chatJid,
+      filePath: relativePath,
+      fileName,
+      timestamp: new Date().toISOString(),
     });
   }
 
@@ -126,9 +296,55 @@ export class IpcToolBridge implements ToolBridge {
   }
 
   async listTasks(folder: string): Promise<TaskSummary[]> {
-    // Stage 4 接主进程：权威任务状态在主进程，这里返回 best-effort 排队快照。
-    // 按 taskId 聚合同 folder 下所有 schedule 动作文件，用"最后一个动作"决定状态，
-    // 保证被 cancel 的任务绝不再报 queued（占位实现曾恒报 queued，与现实相反）。#10
+    // A4：真协议——写 {type:'list_tasks', requestId, groupFolder, isAdminHome, timestamp} 请求
+    // （字段对齐上游 mcp-tools.ts list_tasks 工具），poll 主进程写回的
+    // list_tasks_result_{requestId}.json（src/index.ts processTaskIpc case 'list_tasks'）。
+    // 注：主进程鉴权用 IPC 目录身份（sourceGroup / isAdminHome），线上的 groupFolder/isAdminHome
+    // 字段仅协议保真；权威任务列表以主进程回执为准。
+    // folder 越界：读类保持空结果契约（与 memorySearch 一致），不写任何请求。#7
+    if (this.folderEscapes(this.ipcDir, folder)) return [];
+    try {
+      const result = await this.pollIpcResult(
+        folder,
+        {
+          type: 'list_tasks',
+          requestId: newRequestId(),
+          groupFolder: folder,
+          isAdminHome: this.isAdminHome,
+          timestamp: new Date().toISOString(),
+        },
+        'list_tasks_result',
+        this.pollTimeoutMs,
+      );
+      if (!result.success) {
+        throw new Error(`Error listing tasks: ${String(result.error ?? 'Unknown error')}`);
+      }
+      const tasks = Array.isArray(result.tasks) ? result.tasks : [];
+      return tasks.map((t) => {
+        const rec = (t ?? {}) as { id?: unknown; prompt?: unknown; status?: unknown };
+        const id = typeof rec.id === 'string' ? rec.id : '';
+        return {
+          id,
+          // 主进程回执无 name 字段（上游 schema 即如此）：用 prompt 充当展示名，缺省回退 id。
+          name: typeof rec.prompt === 'string' && rec.prompt ? rec.prompt : id,
+          status: typeof rec.status === 'string' ? rec.status : 'unknown',
+        };
+      });
+    } catch (err) {
+      // standalone 降级：超时无主进程应答 → 回退本地 best-effort 排队快照（见下）。
+      // 非超时错误（主进程显式回 success:false 等）原样抛出，模型得到诚实失败。
+      if (!(err instanceof IpcPollTimeoutError)) throw err;
+      return this.listTasksSnapshot(folder);
+    }
+  }
+
+  /**
+   * standalone 降级路径：返回本进程已排队的请求摘要（主进程消费后即删文件，集成态下快照基本为空）。
+   * 按 taskId 聚合同 folder 下所有 schedule 动作文件，用"最后一个动作"决定状态，
+   * 保证被 cancel 的任务绝不再报 queued（占位实现曾恒报 queued，与现实相反）。#10
+   * 注：pollIpcResult 留下的 list_tasks 等请求文件无 taskId，聚合时天然被跳过。
+   */
+  private async listTasksSnapshot(folder: string): Promise<TaskSummary[]> {
     let dir: string;
     try {
       dir = this.channelDir(folder, 'tasks');
@@ -229,28 +445,159 @@ export class IpcToolBridge implements ToolBridge {
     });
   }
 
-  async installSkill(folder: string, name: string): Promise<void> {
-    // 上游走 tasks 通道 + pollIpcResult 等待 install_skill_result_{requestId}.json；
-    // poll 回执是 A4 项，当前 fire-and-forget（requestId 仍按主进程契约必填）。
-    await this.writeIpc(folder, 'tasks', {
-      type: 'install_skill',
-      package: name,
-      requestId: randomUUID(),
-      groupFolder: folder,
-      timestamp: new Date().toISOString(),
-      ts: Date.now(),
-    });
+  async installSkill(folder: string, name: string): Promise<{ installed?: string[] }> {
+    // A4：真协议——poll 主进程写回的 install_skill_result_{requestId}.json
+    // （src/index.ts processTaskIpc case 'install_skill'）。超时 120s（上游默认：安装可能很慢）。
+    let result: Record<string, unknown>;
+    try {
+      result = await this.pollIpcResult(
+        folder,
+        {
+          type: 'install_skill',
+          package: name,
+          requestId: newRequestId(),
+          groupFolder: folder,
+          timestamp: new Date().toISOString(),
+        },
+        'install_skill_result',
+        this.installPollTimeoutMs,
+      );
+    } catch (err) {
+      if (err instanceof IpcPollTimeoutError) {
+        // 上游同文案：安装可能仍在进行（主进程可能只是慢，请求文件不删）。
+        throw new Error(
+          `Timeout waiting for skill installation result (${this.installPollTimeoutMs / 1000}s). The installation may still be in progress.`,
+        );
+      }
+      throw err;
+    }
+    if (!result.success) {
+      throw new Error(`Failed to install skill "${name}": ${String(result.error ?? 'Unknown error')}`);
+    }
+    const installed = Array.isArray(result.installed)
+      ? result.installed.filter((s): s is string => typeof s === 'string')
+      : [];
+    return { installed };
   }
 
   async uninstallSkill(folder: string, name: string): Promise<void> {
-    await this.writeIpc(folder, 'tasks', {
-      type: 'uninstall_skill',
-      skillId: name,
-      requestId: randomUUID(),
-      groupFolder: folder,
-      timestamp: new Date().toISOString(),
-      ts: Date.now(),
-    });
+    let result: Record<string, unknown>;
+    try {
+      result = await this.pollIpcResult(
+        folder,
+        {
+          type: 'uninstall_skill',
+          skillId: name,
+          requestId: newRequestId(),
+          groupFolder: folder,
+          timestamp: new Date().toISOString(),
+        },
+        'uninstall_skill_result',
+        this.pollTimeoutMs,
+      );
+    } catch (err) {
+      if (err instanceof IpcPollTimeoutError) {
+        throw new Error('Timeout waiting for skill uninstall result.');
+      }
+      throw err;
+    }
+    if (!result.success) {
+      throw new Error(`Failed to uninstall skill "${name}": ${String(result.error ?? 'Unknown error')}`);
+    }
+  }
+
+  // ───────────────────────── Discord 读类（请求-响应协议） ─────────────────────────
+
+  async discordGetHistory(
+    folder: string,
+    opts?: DiscordHistoryOptions,
+  ): Promise<DiscordHistoryMessage[]> {
+    const chatJid = this.requireDiscordChatJid('discord_get_history');
+    let result: Record<string, unknown>;
+    try {
+      result = await this.pollIpcResult(
+        folder,
+        {
+          type: 'discord_get_history',
+          chatJid,
+          ...(opts?.limit !== undefined ? { limit: opts.limit } : {}),
+          ...(opts?.before !== undefined ? { before: opts.before } : {}),
+          requestId: newRequestId(),
+          timestamp: new Date().toISOString(),
+        },
+        'discord_get_history_result',
+        this.pollTimeoutMs,
+      );
+    } catch (err) {
+      if (err instanceof IpcPollTimeoutError) {
+        throw new Error('Timeout waiting for Discord history response.');
+      }
+      throw err;
+    }
+    if (!result.success) {
+      throw new Error(
+        `Error fetching Discord history: ${String(result.error ?? 'Unknown error')}`,
+      );
+    }
+    return (Array.isArray(result.messages) ? result.messages : []) as DiscordHistoryMessage[];
+  }
+
+  async discordGetChannelInfo(folder: string): Promise<unknown> {
+    const chatJid = this.requireDiscordChatJid('discord_get_channel_info');
+    let result: Record<string, unknown>;
+    try {
+      result = await this.pollIpcResult(
+        folder,
+        {
+          type: 'discord_get_channel_info',
+          chatJid,
+          requestId: newRequestId(),
+          timestamp: new Date().toISOString(),
+        },
+        'discord_get_channel_info_result',
+        this.pollTimeoutMs,
+      );
+    } catch (err) {
+      if (err instanceof IpcPollTimeoutError) {
+        throw new Error('Timeout waiting for Discord channel info response.');
+      }
+      throw err;
+    }
+    if (!result.success) {
+      throw new Error(
+        `Error fetching Discord channel info: ${String(result.error ?? 'Unknown error')}`,
+      );
+    }
+    return result.channel;
+  }
+
+  async discordGetServerInfo(folder: string): Promise<unknown | null> {
+    const chatJid = this.requireDiscordChatJid('discord_get_server_info');
+    let result: Record<string, unknown>;
+    try {
+      result = await this.pollIpcResult(
+        folder,
+        {
+          type: 'discord_get_server_info',
+          chatJid,
+          requestId: newRequestId(),
+          timestamp: new Date().toISOString(),
+        },
+        'discord_get_server_info_result',
+        this.pollTimeoutMs,
+      );
+    } catch (err) {
+      if (err instanceof IpcPollTimeoutError) {
+        throw new Error('Timeout waiting for Discord server info response.');
+      }
+      throw err;
+    }
+    if (!result.success) {
+      throw new Error(
+        `Error fetching Discord server info: ${String(result.error ?? 'Unknown error')}`,
+      );
+    }
+    return result.guild ?? null;
   }
 
   // ───────────────────────── 记忆类 ─────────────────────────
@@ -324,6 +671,65 @@ export class IpcToolBridge implements ToolBridge {
   }
 
   // ───────────────────────── 内部工具 ─────────────────────────
+
+  /** 取群组工作区目录；未绑定 → 抛错（send_image / send_file 无法解析文件路径）。 */
+  private requireWorkspaceDir(tool: string): string {
+    if (!this.workspaceGroupDir) {
+      throw new Error(`${tool}: no workspace directory bound for this run`);
+    }
+    return this.workspaceGroupDir;
+  }
+
+  /** 取 Discord 路由 chatJid：未绑定或非 discord: 前缀 → 抛错（对齐上游工具的频道前置校验）。 */
+  private requireDiscordChatJid(tool: string): string {
+    const chatJid = this.requireChatJid(tool);
+    if (!chatJid.startsWith('discord:')) {
+      throw new Error(`${tool} only works in Discord channels. Current chat: ${chatJid}`);
+    }
+    return chatJid;
+  }
+
+  /** resolved 是否在 root 内（含 root 自身；path.sep 后缀防 /ws/g1 匹配 /ws/g10 的前缀绕过）。 */
+  private isWithin(resolved: string, root: string): boolean {
+    const normalizedRoot = path.resolve(root);
+    if (resolved === normalizedRoot) return true;
+    const safeRoot = normalizedRoot.endsWith(path.sep) ? normalizedRoot : normalizedRoot + path.sep;
+    return resolved.startsWith(safeRoot);
+  }
+
+  /**
+   * A4：请求-响应协议（对齐上游 mcp-tools.ts pollIpcResult）。
+   * 写一条请求到 tasks 通道 → 轮询 {resultFilePrefix}_{requestId}.json → 读后删除并返回解析结果。
+   * 直接 readFile 并吞 ENOENT（修 TOCTOU，与上游一致）；超时抛 IpcPollTimeoutError。
+   * 超时后**不删请求文件**（对齐上游：主进程可能只是慢，迟到执行仍有效）。
+   */
+  private async pollIpcResult(
+    folder: string,
+    payload: Record<string, unknown> & { requestId: string },
+    resultFilePrefix: string,
+    timeoutMs: number,
+  ): Promise<Record<string, unknown>> {
+    const dir = this.channelDir(folder, 'tasks');
+    const resultFilePath = path.join(dir, `${resultFilePrefix}_${payload.requestId}.json`);
+
+    await this.writeIpc(folder, 'tasks', payload);
+
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      try {
+        const raw = await readFile(resultFilePath, 'utf8');
+        await unlink(resultFilePath).catch(() => {});
+        return JSON.parse(raw) as Record<string, unknown>;
+      } catch (err) {
+        // 结果未就绪——只吞 ENOENT，其余（解析失败 / 权限错）原样抛出。
+        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+      }
+      if (Date.now() >= deadline) {
+        throw new IpcPollTimeoutError(timeoutMs);
+      }
+      await new Promise((resolve) => setTimeout(resolve, this.pollIntervalMs));
+    }
+  }
 
   /** {ipcDir}/{folder}/{channel} 目录。folder 逃出 ipc 根 → 抛错（写类越界）。#7 */
   private channelDir(folder: string, channel: 'messages' | 'tasks'): string {
