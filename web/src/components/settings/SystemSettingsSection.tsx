@@ -335,13 +335,14 @@ export function SystemSettingsSection() {
             onChange={(e) => setSubagentModel(e.target.value)}
             className="h-9 px-3 text-sm border border-border rounded-md bg-transparent max-w-64"
           >
+            {/* happycodex：选项适配 codex 模型名（上游为 sonnet/opus/haiku Claude 别名）。 */}
             <option value="inherit">inherit（继承主模型，默认）</option>
-            <option value="sonnet">sonnet</option>
-            <option value="opus">opus</option>
-            <option value="haiku">haiku</option>
+            <option value="gpt-5.1-codex">gpt-5.1-codex</option>
+            <option value="gpt-5.1-codex-mini">gpt-5.1-codex-mini</option>
+            <option value="gpt-5.1">gpt-5.1</option>
           </select>
           <p className="text-xs text-muted-foreground mt-1">
-            预定义 SubAgent（代码审查 / 网页调研）使用的模型。默认 inherit（继承主会话模型，与原行为一致）；想给子任务单独指定更便宜/更强的模型时再改。第三方 provider 用别名需配 ANTHROPIC_DEFAULT_* 映射。仅在主 Agent 委派任务时生效。
+            预定义 SubAgent（代码审查 / 网页调研）使用的模型。默认 inherit（继承主会话模型，与原行为一致）；想给子任务单独指定更便宜/更强的模型时再改。仅在主 Agent 委派任务时生效。
           </p>
         </div>
       </div>

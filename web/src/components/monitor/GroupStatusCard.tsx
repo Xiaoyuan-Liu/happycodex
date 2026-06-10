@@ -1,6 +1,7 @@
 import { Badge } from '@/components/ui/badge';
 import { Card, CardContent } from '@/components/ui/card';
-import { ProviderSwitcher, type SimpleProvider } from './ProviderSwitcher';
+// Tombstone（happycodex）：上游此处导入 ProviderSwitcher（运行中切换 Claude provider），
+// provider failover 已作废，组件删除，Provider 行随之摘除。
 
 interface GroupStatusCardProps {
   group: {
@@ -15,10 +16,9 @@ interface GroupStatusCardProps {
     selectedProviderId: string | null;
     selectedProviderName: string | null;
   };
-  providers: SimpleProvider[];
 }
 
-export function GroupStatusCard({ group, providers }: GroupStatusCardProps) {
+export function GroupStatusCard({ group }: GroupStatusCardProps) {
   return (
     <Card>
       <CardContent>
@@ -55,15 +55,6 @@ export function GroupStatusCard({ group, providers }: GroupStatusCardProps) {
           <span className="text-foreground font-mono truncate ml-2 max-w-[60%] text-right">
             {group.displayName || group.containerName || '-'}
           </span>
-        </div>
-        <div className="flex items-center justify-between">
-          <span>Provider</span>
-          <ProviderSwitcher
-            groupFolder={group.groupFolder}
-            currentProviderId={group.selectedProviderId}
-            currentProviderName={group.selectedProviderName}
-            providers={providers}
-          />
         </div>
         </div>
       </CardContent>

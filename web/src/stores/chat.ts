@@ -723,7 +723,8 @@ function traceKind(event: StreamEvent): StreamingTraceEvent['kind'] {
   if (event.eventType.startsWith('hook_')) return 'hook';
   if (event.eventType.startsWith('task_')) return 'task';
   if (event.eventType === 'context_audit') return 'context';
-  if (event.eventType === 'memory_recall' || event.eventType === 'compact_boundary') return 'memory';
+  // happycodex：compact_partial（codex 压缩局部摘要）与上游 compact_boundary 同归 memory 类。
+  if (event.eventType === 'memory_recall' || event.eventType === 'compact_boundary' || event.eventType === 'compact_partial') return 'memory';
   if (event.eventType === 'permission_denied') return 'permission';
   if (event.eventType === 'raw_sdk_event') return 'debug';
   return 'status';
@@ -745,6 +746,9 @@ function traceTitle(event: StreamEvent): string {
     case 'permission_denied': return `权限拒绝 ${event.toolName || ''}`.trim();
     case 'memory_recall': return '记忆召回';
     case 'compact_boundary': return '上下文压缩';
+    // happycodex：codex 扩展事件的展示标题。
+    case 'compact_partial': return event.compactReason === 'auto' ? '上下文自动压缩' : '上下文压缩';
+    case 'result': return event.subtype === 'interrupted' ? '回合中断' : event.subtype === 'failed' ? '回合失败' : '回合完成';
     case 'notification': return '通知';
     case 'prompt_suggestion': return '建议';
     default: return event.rawType || event.eventType;
@@ -1045,6 +1049,9 @@ function applyStreamEvent(
       }
       case 'memory_recall':
       case 'compact_boundary':
+      // happycodex：compact_partial 复用 memory 时间线条目（压缩前的局部正文在 event.text，
+      // 完整文本不进 recentEvents，避免刷屏；标题区分 manual/auto）。
+      case 'compact_partial':
         next.recentEvents = pushEvent(prev.recentEvents, 'memory', event.summary || traceTitle(event));
         break;
       case 'notification':
@@ -1735,7 +1742,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
     // ① conversation agent（DB 持久化的）
     if (agentId) {
-      if (event.eventType === 'status' && event.statusText === 'interrupted') {
+      // happycodex：codex 以 result(subtype=interrupted) 表达中断终态（上游为 status/interrupted），两者等价处理。
+      if ((event.eventType === 'status' && event.statusText === 'interrupted')
+        || (event.eventType === 'result' && event.subtype === 'interrupted')) {
         // 与主会话一致的两阶段处理：先冻结（保留已输出内容），
         // 等 new_message (interrupt_partial) 到达后完成最终清理。
         const key = `agent:${agentId}`;
@@ -1988,7 +1997,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
 
     // 中断事件：冻结流式 UI（保留已输出文本），等待 new_message 完成最终转换。
-    if (event.eventType === 'status' && event.statusText === 'interrupted') {
+    // happycodex：codex 以 result(subtype=interrupted) 表达中断终态（上游为 status/interrupted），两者等价处理。
+    if ((event.eventType === 'status' && event.statusText === 'interrupted')
+      || (event.eventType === 'result' && event.subtype === 'interrupted')) {
       // 强制 flush rAF 缓冲：thinking_delta/text_delta 通过 requestAnimationFrame 批处理，
       // 中断信号可能在 rAF 回调执行前到达，导致 thinkingText 仍为空 → hasData=false → 卡片消失。
       const mainKey = `main:${chatJid}`;

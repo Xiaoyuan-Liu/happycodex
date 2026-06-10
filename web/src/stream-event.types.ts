@@ -1,12 +1,22 @@
 /**
- * Canonical StreamEvent type definitions.
+ * StreamEvent type definitions for the web frontend (happycodex adaptation).
  *
- * This is the single source of truth. Build step copies this file to:
- *   - container/agent-runner/src/stream-event.types.ts
- *   - src/stream-event.types.ts
- *   - web/src/stream-event.types.ts
+ * 上游 HappyClaw 中本文件是 `shared/stream-event.ts` 经 `make sync-types` 生成的副本；
+ * happycodex 的单一真相源是 `src/shared/stream-event.ts`（主仓根目录）。
+ * web 是独立的 npm/tsc 项目（tsconfig include 仅 src/），因此沿用上游"本地副本"模式，
+ * 本文件 = happycodex 契约 ∪ 上游遗留成员：
  *
- * DO NOT edit the copies directly -- edit this file and run `make build`.
+ *   - happycodex 契约（src/shared/stream-event.ts，后端实际产出）：
+ *     eventType: init / text_delta / thinking_delta / tool_use_start / tool_use_end /
+ *               tool_progress / task_start / status / usage / result / compact_partial
+ *     扩展字段: ok / subtype / threadId / sourceKind / compactReason
+ *   - 上游遗留成员（codex 后端暂不产出，保留供 UI 降级——chat store 等消费端分支
+ *     代码原样保留，事件不出现即不触发）：
+ *     tool_result / hook_* / task_progress|updated|notification / permission_denied /
+ *     memory_recall / compact_boundary / notification / prompt_suggestion /
+ *     raw_sdk_event / context_audit / todo_update 及对应字段。
+ *
+ * 修改契约时：先改 src/shared/stream-event.ts，再人工同步本文件的契约部分。
  */
 
 export type StreamEventType =
@@ -19,7 +29,11 @@ export type StreamEventType =
   | 'context_audit'
   | 'todo_update'
   | 'usage'
-  | 'status' | 'init';
+  | 'status' | 'init'
+  /** happycodex 扩展：本轮成败终态（codex turnCompleted）。 */
+  | 'result'
+  /** happycodex 扩展：上下文压缩（context compaction）的局部摘要文本。 */
+  | 'compact_partial';
 
 export type StreamAgentScope = 'main' | 'task' | 'subagent' | 'system';
 export type StreamDisplayLevel = 'primary' | 'detail' | 'debug';
@@ -141,15 +155,17 @@ export interface StreamEvent {
   rawEvent?: Record<string, unknown>;
   contextAudit?: ClaudeContextAudit;
   todos?: Array<{ id: string; content: string; status: 'pending' | 'in_progress' | 'completed' }>;
-  /** Token usage data emitted at query completion */
+  /** Token usage data emitted at query completion.
+   *  happycodex 后端为 codex thread/tokenUsage/updated 的透传（字段不保证齐全），
+   *  消费端字段均按可缺省处理。 */
   usage?: {
-    inputTokens: number;
-    outputTokens: number;
-    cacheReadInputTokens: number;
-    cacheCreationInputTokens: number;
-    costUSD: number;
-    durationMs: number;
-    numTurns: number;
+    inputTokens?: number;
+    outputTokens?: number;
+    cacheReadInputTokens?: number;
+    cacheCreationInputTokens?: number;
+    costUSD?: number;
+    durationMs?: number;
+    numTurns?: number;
     modelUsage?: Record<string, {
       inputTokens: number;
       outputTokens: number;
@@ -157,5 +173,18 @@ export interface StreamEvent {
       cacheCreationInputTokens: number;
       costUSD: number;
     }>;
+    [k: string]: unknown;
   };
+
+  // ─── happycodex 扩展字段（对齐 src/shared/stream-event.ts） ───
+  /** happycodex 扩展：工具是否成功（tool_use_end）。 */
+  ok?: boolean;
+  /** happycodex 扩展：result 事件的本轮成败 subtype。 */
+  subtype?: 'completed' | 'interrupted' | 'failed';
+  /** happycodex 扩展：codex thread id。 */
+  threadId?: string;
+  /** happycodex 扩展（B1）：compact_partial 事件的子来源标识。 */
+  sourceKind?: 'compact_partial';
+  /** happycodex 扩展（B1）：本次压缩触发原因 —— manual 或 auto。 */
+  compactReason?: 'manual' | 'auto';
 }

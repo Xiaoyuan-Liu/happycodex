@@ -1,24 +1,23 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef } from 'react';
 import { useMonitorStore } from '../stores/monitor';
 import { useAuthStore } from '../stores/auth';
 import { ContainerStatus } from '../components/monitor/ContainerStatus';
 import { QueueStatus } from '../components/monitor/QueueStatus';
 import { SystemInfo } from '../components/monitor/SystemInfo';
 import { GroupStatusCard } from '../components/monitor/GroupStatusCard';
-import { ProviderSwitcher, type SimpleProvider } from '../components/monitor/ProviderSwitcher';
+// Tombstone（happycodex）：上游此处导入 ProviderSwitcher 并拉取 /api/config/claude/providers
+// 供各群组运行中切换 provider；provider failover 已作废，组件与 Provider 列均已移除。
 import { RefreshCw, AlertTriangle, CheckCircle, Hammer, Loader2 } from 'lucide-react';
 import { PageHeader } from '@/components/common/PageHeader';
 import { SkeletonStatCards } from '@/components/common/Skeletons';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { wsManager } from '../api/ws';
-import { api } from '@/api/client';
 
 export function MonitorPage() {
   const { status, loading, loadStatus, building, buildLogs, buildResult, buildDockerImage, clearBuildResult } = useMonitorStore();
   const isAdmin = useAuthStore((s) => s.user?.role === 'admin');
   const logEndRef = useRef<HTMLDivElement>(null);
-  const [providers, setProviders] = useState<SimpleProvider[]>([]);
 
   useEffect(() => {
     loadStatus();
@@ -50,14 +49,6 @@ export function MonitorPage() {
       unsubComplete();
     };
   }, [loadStatus]);
-
-  // Fetch providers once for all ProviderSwitcher instances
-  useEffect(() => {
-    api
-      .get<{ providers: Array<{ id: string; name: string; enabled: boolean }> }>('/api/config/claude/providers')
-      .then((data) => setProviders(data.providers.filter((p) => p.enabled).map(({ id, name }) => ({ id, name }))))
-      .catch(() => {});
-  }, []);
 
   // Auto-scroll build logs to bottom
   useEffect(() => {
@@ -181,7 +172,7 @@ export function MonitorPage() {
                 {/* 移动端：卡片列表 */}
                 <div className="lg:hidden space-y-3">
                   {status.groups.map((group) => (
-                    <GroupStatusCard key={group.jid} group={group} providers={providers} />
+                    <GroupStatusCard key={group.jid} group={group} />
                   ))}
                 </div>
 
@@ -204,9 +195,6 @@ export function MonitorPage() {
                         </th>
                         <th className="px-4 py-3 text-left text-xs font-medium text-muted-foreground uppercase">
                           进程标识
-                        </th>
-                        <th className="px-4 py-3 text-left text-xs font-medium text-muted-foreground uppercase">
-                          Provider
                         </th>
                       </tr>
                     </thead>
@@ -235,18 +223,6 @@ export function MonitorPage() {
                           </td>
                           <td className="px-4 py-3 text-sm text-muted-foreground font-mono text-xs">
                             {group.displayName || group.containerName || '-'}
-                          </td>
-                          <td className="px-4 py-3 text-sm">
-                            {group.active ? (
-                              <ProviderSwitcher
-                                groupFolder={group.groupFolder}
-                                currentProviderId={group.selectedProviderId}
-                                currentProviderName={group.selectedProviderName}
-                                providers={providers}
-                              />
-                            ) : (
-                              <span className="text-muted-foreground">-</span>
-                            )}
                           </td>
                         </tr>
                       ))}

@@ -397,8 +397,9 @@ export function UsagePage() {
                           cy="50%"
                           outerRadius={90}
                           // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                          // happycodex：上游剥 'claude-' 前缀缩短模型名；codex 模型（gpt-5.1-codex 等）无该前缀，原样展示。
                           label={(props: any) =>
-                            `${String(props.model ?? '').replace('claude-', '')} ${((Number(props.percent) || 0) * 100).toFixed(0)}%`
+                            `${String(props.model ?? '')} ${((Number(props.percent) || 0) * 100).toFixed(0)}%`
                           }
                         >
                           {modelData.map((_, i) => (

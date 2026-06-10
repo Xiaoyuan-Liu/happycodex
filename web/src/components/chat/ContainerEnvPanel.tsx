@@ -9,8 +9,10 @@ interface ContainerEnvPanelProps {
   onClose?: () => void;
 }
 
+// happycodex：env key 沿用上游字段名（后端 routes/config 重写线对齐）；
+// 预设值适配 codex 模型名（上游为 opus/sonnet/haiku 等 Claude 别名）。
 const MODEL_ENV_KEY = 'ANTHROPIC_MODEL';
-const MODEL_PRESETS = ['opus[1m]', 'opus', 'sonnet[1m]', 'sonnet', 'haiku'] as const;
+const MODEL_PRESETS = ['gpt-5.1-codex-max', 'gpt-5.1-codex', 'gpt-5.1-codex-mini', 'gpt-5.1'] as const;
 
 export function ContainerEnvPanel({ groupJid, onClose }: ContainerEnvPanelProps) {
   const { configs, loading, saving, loadConfig, saveConfig } = useContainerEnvStore();
@@ -200,7 +202,7 @@ export function ContainerEnvPanel({ groupJid, onClose }: ContainerEnvPanelProps)
                 type="text"
                 value={model}
                 onChange={(e) => setModel(e.target.value)}
-                placeholder="opus / sonnet / haiku 或完整模型 ID"
+                placeholder="如 gpt-5.1-codex 或完整模型 ID"
                 className="px-2.5 py-1.5 text-xs h-auto font-mono"
                 list="anthropic-model-presets"
               />
@@ -210,7 +212,7 @@ export function ContainerEnvPanel({ groupJid, onClose }: ContainerEnvPanelProps)
                 ))}
               </datalist>
               <p className="text-[11px] text-muted-foreground">
-                留空则回退到全局配置（默认值通常为 <code className="bg-muted px-1 rounded">opus</code>）。
+                留空则回退到全局配置（默认值通常为 <code className="bg-muted px-1 rounded">gpt-5.1-codex</code>）。
               </p>
             </div>
           </div>
