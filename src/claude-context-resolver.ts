@@ -73,11 +73,16 @@ export interface CodexContextPlanArgs {
   externalClaudeDir: string;
   /** data/groups 根（user-global/{userId}/CLAUDE.md 用户全局记忆源，只读数据源）。 */
   groupsDir: string;
+  /**
+   * 技能索引（skills-materializer 产物）：section 为完整 Markdown 节（名称/何时用/入口
+   * 路径），skillsDir 为工作区 .skills 目录（审计 sourcePath）。缺省/null = 无技能不注入。
+   */
+  skillsIndex?: { section: string; skillsDir: string } | null | undefined;
 }
 
 /** AGENTS.md 单个内容源的审计条目（替代上游 ClaudeContextAudit 的轻量版）。 */
 export interface CodexAgentsMdSource {
-  name: 'admin-global-claude-md' | 'user-global-claude-md';
+  name: 'admin-global-claude-md' | 'user-global-claude-md' | 'skills-index';
   sourcePath: string;
   /** 源文件原始字节数。 */
   bytes: number;
@@ -125,6 +130,18 @@ export function truncateUtf8(text: string, maxBytes: number): string {
 
 const TRUNCATION_NOTICE = '\n\n[happycodex] 内容超出 32KiB（project_doc_max_bytes）上限，已截断。';
 
+/** 上游同款 admin-owned 判定（upstream claude-context-resolver.ts:101-104）；
+ *  skills-materializer 的 external 源共用此单一真相。 */
+export function isAdminOwnedGroup(
+  group: RegisteredGroup,
+  ownerHomeFolder?: string | undefined,
+): boolean {
+  return (
+    ownerHomeFolder === ADMIN_HOME_FOLDER ||
+    (!!group.is_home && group.folder === ADMIN_HOME_FOLDER)
+  );
+}
+
 /**
  * 构建 codex 上下文计划：①用户/全局维度 → AGENTS.md 内容；②项目维度 → fallback 键。
  *
@@ -133,13 +150,12 @@ const TRUNCATION_NOTICE = '\n\n[happycodex] 内容超出 32KiB（project_doc_max
  *     externalClaudeDir/CLAUDE.md（上游 host symlink / container 挂 /workspace/CLAUDE.md）。
  *   - is_home 群组：user-global/{ownerId}/CLAUDE.md（上游经 SDK extraDirs 注入；
  *     非 home 群组上游也不注入 system prompt，仅留文件系统访问——此处对齐不注入）。
+ *   - 技能索引（skillsIndex 通道，所有群组）：上游经 SDK skills:'all' 把 frontmatter 注入
+ *     system prompt；codex 等价为 AGENTS.md 索引 + 工作区 .skills/ 按需读取。
  */
 export function buildCodexContextPlan(args: CodexContextPlanArgs): CodexContextPlan {
   const ownerId = args.group.created_by;
-  // 上游同款判定（upstream claude-context-resolver.ts:101-104）。
-  const isAdminOwned =
-    args.ownerHomeFolder === ADMIN_HOME_FOLDER ||
-    (!!args.group.is_home && args.group.folder === ADMIN_HOME_FOLDER);
+  const isAdminOwned = isAdminOwnedGroup(args.group, args.ownerHomeFolder);
 
   const warnings: string[] = [];
   const sources: CodexAgentsMdSource[] = [];
@@ -187,6 +203,18 @@ export function buildCodexContextPlan(args: CodexContextPlanArgs): CodexContextP
       });
       sources.push(source);
     }
+  }
+
+  // ③ 技能索引（skills-materializer 产物；置于用户/全局上下文之后，预算挤占时先裁此节）
+  if (args.skillsIndex?.section) {
+    const source: CodexAgentsMdSource = {
+      name: 'skills-index',
+      sourcePath: args.skillsIndex.skillsDir,
+      bytes: Buffer.byteLength(args.skillsIndex.section, 'utf8'),
+      truncated: false,
+    };
+    sections.push({ source, text: args.skillsIndex.section.trimEnd() });
+    sources.push(source);
   }
 
   // 组装 + 32KiB 预算裁剪（预算扣除 provisioner 添加的 marker 行 + 收尾换行）。

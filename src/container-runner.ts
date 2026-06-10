@@ -61,6 +61,13 @@ import {
   buildCodexContextPlan,
   buildSessionDeveloperInstructions,
 } from './claude-context-resolver.js';
+import { buildSystemPromptAppend } from './prompt-assembly.js';
+import {
+  buildSkillsIndexSection,
+  materializeGroupSkills,
+  WORKSPACE_SKILLS_DIRNAME,
+} from './skills-materializer.js';
+import { getChannelFromJid } from './channel-prefixes.js';
 import { FsCodexHomeProvisioner } from './runtime/multitenant/codex-home.js';
 import type { RegisteredGroup } from './types.js';
 import type { ContainerOutput } from './container-output.js';
@@ -202,6 +209,9 @@ export async function provisionCodexHome(
 
 /**
  * 两处 spawn 共用：构建 context-resolver 接线产物。
+ * - 技能承载 → 四源技能物化到受管群组工作区 {GROUPS_DIR}/{folder}/.skills/（幂等；
+ *   绝不写 customCwd），索引节经 skillsIndex 通道并入 AGENTS.md（上游对应 SDK skills:'all'
+ *   的 frontmatter 注入 + install_skill 落盘目录 data/skills/{ownerId} 即 user 源）；
  * - 用户/全局维度 → AGENTS.md 内容（admin 全局 CLAUDE.md + user-global 记忆，只读源）；
  * - 项目维度 → project_doc_fallback_filenames=["CLAUDE.md"]；
  * - MCP servers → loadUserMcpServers(ownerId)（对应上游注入 Claude settings.json 的位置）。
@@ -211,12 +221,34 @@ function buildCodexHomeContext(
   group: RegisteredGroup,
   ownerHomeFolder?: string,
 ): CodexHomeContextOptions {
+  const groupDir = path.join(GROUPS_DIR, group.folder);
+  const skillsResult = materializeGroupSkills({
+    executionMode,
+    group,
+    ownerHomeFolder,
+    externalClaudeDir: getEffectiveExternalDir(),
+    dataDir: DATA_DIR,
+    projectRoot: process.cwd(),
+    groupDir,
+  });
+  for (const warning of skillsResult.warnings) {
+    logger.warn({ group: group.name, warning }, 'Skill materialization warning');
+  }
+  const skillsIndexSection = buildSkillsIndexSection(skillsResult.skills);
   const plan = buildCodexContextPlan({
     executionMode,
     group,
     ownerHomeFolder,
     externalClaudeDir: getEffectiveExternalDir(),
     groupsDir: GROUPS_DIR,
+    ...(skillsIndexSection
+      ? {
+          skillsIndex: {
+            section: skillsIndexSection,
+            skillsDir: path.join(groupDir, WORKSPACE_SKILLS_DIRNAME),
+          },
+        }
+      : {}),
   });
   const ownerId = group.created_by;
   const mcpServers = ownerId ? loadUserMcpServers(ownerId) : {};
@@ -228,26 +260,47 @@ function buildCodexHomeContext(
 }
 
 /**
- * 两处 spawn 共用：就地派生注入会话动态上下文的 ContainerInput（不 mutate 调用方
- * input——队列/日志/重试路径共享同一引用，对齐上游 dockerInput/hostInput 派生范式）。
- * 调用方预置的 developerInstructions 追加在前（动态会话段殿后，便于"后者胜出"语义）。
+ * 两处 spawn 共用：就地派生注入系统提示词分片 + 会话动态上下文的 ContainerInput
+ * （不 mutate 调用方 input——队列/日志/重试路径共享同一引用，对齐上游 dockerInput/
+ * hostInput 派生范式）。三段顺序：
+ *   1. 调用方预置 developerInstructions（保持在前，既有契约）
+ *   2. 场景化分片拼装产物（上游 systemPrompt preset append 的 codex 等价，见 prompt-assembly）
+ *   3. 会话动态上下文（殿后，便于"后者胜出"语义）
+ *
+ * opts.disableMemoryLayer：host 路径与 HAPPYCLAW_DISABLE_MEMORY_LAYER env 同源同值
+ * （上游 agent-runner 在容器内读该 env 选片；codex 版拼装在宿主侧，直接传值）。
+ * opts.workspaceGlobalDir：host 模式真实 user-global 目录（替换 memory 分片中的
+ * 容器路径 /workspace/global 字面量）；容器模式不传。
  */
 function deriveInputWithSessionContext(
   executionMode: 'host' | 'container',
   group: RegisteredGroup,
   input: ContainerInput,
+  opts?: { disableMemoryLayer?: boolean; workspaceGlobalDir?: string },
 ): ContainerInput {
+  // 上游 normalizeHomeFlags 同式（isMain 为 legacy 兜底）。
+  const isHome = input.isHome !== undefined ? !!input.isHome : !!input.isMain;
+  const promptAppend = buildSystemPromptAppend({
+    channel: getChannelFromJid(input.chatJid),
+    isHome,
+    disableMemoryLayer: opts?.disableMemoryLayer ?? false,
+    agentId: input.agentId,
+    workspaceGlobalDir: opts?.workspaceGlobalDir,
+  });
   const sessionContext = buildSessionDeveloperInstructions({
     executionMode,
     group,
     input,
     timezone: TIMEZONE,
   });
+  const parts = [
+    ...(input.developerInstructions ? [input.developerInstructions] : []),
+    promptAppend,
+    sessionContext,
+  ];
   return {
     ...input,
-    developerInstructions: input.developerInstructions
-      ? `${input.developerInstructions}\n\n${sessionContext}`
-      : sessionContext,
+    developerInstructions: parts.join('\n\n'),
   };
 }
 
@@ -1209,8 +1262,15 @@ export async function runHostAgent(
     });
     // 对齐上游就地派生 hostInput 范式（upstream container-runner.ts:1776-1780）：
     // prepareHostPlugins/contextAudit 注入随 Claude 面删除（tombstone），codex 版派生注入
-    // 会话动态上下文 developerInstructions（不 mutate 调用方 input）。
-    const hostInput = deriveInputWithSessionContext('host', group, input);
+    // 系统提示词分片 + 会话动态上下文 developerInstructions（不 mutate 调用方 input）。
+    // disableMemoryLayer 与上文 HAPPYCLAW_DISABLE_MEMORY_LAYER env 同源同值；
+    // workspaceGlobalDir 取 env 段算出的真实 user-global 路径（禁用记忆层时本就无 memory 分片）。
+    const hostInput = deriveInputWithSessionContext('host', group, input, {
+      disableMemoryLayer,
+      ...(hostEnv['HAPPYCLAW_WORKSPACE_GLOBAL']
+        ? { workspaceGlobalDir: hostEnv['HAPPYCLAW_WORKSPACE_GLOBAL'] }
+        : {}),
+    });
     proc.stdin.write(JSON.stringify(hostInput));
     proc.stdin.end();
 

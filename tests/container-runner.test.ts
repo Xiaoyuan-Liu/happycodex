@@ -514,3 +514,105 @@ describe('writeTasksSnapshot / writeGroupsSnapshot', () => {
     expect(adminSeen.groups.map((g) => g.jid)).toEqual(['g1@x']);
   });
 });
+
+// ─── A4：系统提示词分片 + skills 承载（两处 spawn 共用接线，host 路径验证） ──────
+
+describe('A4 接线：prompt 分片注入 + skills 物化 + AGENTS.md 技能索引（runHostAgent）', () => {
+  test('developerInstructions 含场景化分片（包裹标签 + 顺序：分片在动态会话段之前）', async () => {
+    const folder = 'hg-a4-shards';
+    const { dump } = await runHostWithDump(makeGroup(folder), makeInput(folder));
+
+    const devIns = dump.stdin?.developerInstructions as string;
+    // 选片：isMain=true → isHome（normalizeHomeFlags 同式）→ memory home 版；web 渠道无 channel 片
+    for (const tag of ['<behavior>', '<skill-routing>', '<security>', '<memory-system>', '<guidelines>']) {
+      expect(devIns).toContain(tag);
+    }
+    expect(devIns).not.toContain('<channel-format>');
+    expect(devIns).not.toContain('<agent-override>');
+    // 顺序：分片块在动态会话段之前（后者胜出语义）
+    expect(devIns.indexOf('<behavior>')).toBeLessThan(devIns.indexOf('<happycodex-session-context>'));
+    // host 模式 memory 分片中的容器路径已替换为真实 user-global 目录
+    expect(devIns).toContain(path.join(GROUPS_DIR, 'user-global', 'u1', 'CLAUDE.md'));
+    expect(devIns).not.toContain('/workspace/global');
+  });
+
+  test('调用方预置段仍在最前，分片居中，动态会话段殿后', async () => {
+    const folder = 'hg-a4-order';
+    const input = makeInput(folder, { developerInstructions: '调用方预置段' });
+    const { dump } = await runHostWithDump(makeGroup(folder), input);
+
+    const devIns = dump.stdin?.developerInstructions as string;
+    expect(devIns.startsWith('调用方预置段')).toBe(true);
+    expect(devIns.indexOf('调用方预置段')).toBeLessThan(devIns.indexOf('<behavior>'));
+    expect(devIns.indexOf('<behavior>')).toBeLessThan(devIns.indexOf('<happycodex-session-context>'));
+  });
+
+  test('子会话（agentId）：追加 <agent-override> 分片', async () => {
+    const folder = 'hg-a4-agent';
+    const input = makeInput(folder, { agentId: 'a1', agentName: 'helper' });
+    const { dump } = await runHostWithDump(makeGroup(folder), input);
+
+    const devIns = dump.stdin?.developerInstructions as string;
+    expect(devIns).toContain('<agent-override>');
+    expect(devIns).toContain('子会话行为规则');
+  });
+
+  test('skills 物化：仓库 container/skills 三技能落到 {groupDir}/.skills/ + AGENTS.md 技能索引', async () => {
+    const folder = 'hg-a4-skills';
+    await runHostWithDump(makeGroup(folder), makeInput(folder));
+
+    // 物化（projectRoot=process.cwd() → 仓库自带的 3 个 port 技能）
+    const skillsDir = path.join(GROUPS_DIR, folder, '.skills');
+    for (const id of ['agent-browser', 'install-skill', 'post-test-cleanup']) {
+      expect(fs.existsSync(path.join(skillsDir, id, 'SKILL.md'))).toBe(true);
+    }
+    const manifest = JSON.parse(
+      fs.readFileSync(path.join(skillsDir, '.happycodex-skills.json'), 'utf8'),
+    ) as { managed: string[] };
+    expect(manifest.managed).toEqual(['agent-browser', 'install-skill', 'post-test-cleanup']);
+
+    // AGENTS.md 技能索引（host 模式：宿主绝对入口路径）
+    const agentsMd = fs.readFileSync(
+      path.join(DATA_DIR, 'sessions', folder, '.codex', 'AGENTS.md'),
+      'utf8',
+    );
+    expect(agentsMd).toContain('## 可用技能');
+    expect(agentsMd).toContain('**agent-browser**');
+    expect(agentsMd).toContain(path.join(skillsDir, 'agent-browser', 'SKILL.md'));
+  });
+
+  test('install_skill 落盘端对接：user 源（data/skills/{ownerId}）下次 spawn 物化并同名胜出', async () => {
+    const folder = 'hg-a4-user-skill';
+    // 模拟 install_skill 落盘（routes/skills.ts installSkillForUser 目标目录）
+    const userSkillDir = path.join(DATA_DIR, 'skills', 'u1', 'my-installed');
+    fs.mkdirSync(userSkillDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(userSkillDir, 'SKILL.md'),
+      '---\nname: my-installed\ndescription: 用户安装的技能\n---\n# my-installed\n',
+    );
+    // 同名覆盖 project 源（后者胜出）
+    const overrideDir = path.join(DATA_DIR, 'skills', 'u1', 'agent-browser');
+    fs.mkdirSync(overrideDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(overrideDir, 'SKILL.md'),
+      '---\nname: agent-browser\ndescription: user 源覆盖版\n---\n# override\n',
+    );
+
+    await runHostWithDump(makeGroup(folder), makeInput(folder));
+
+    const skillsDir = path.join(GROUPS_DIR, folder, '.skills');
+    expect(fs.existsSync(path.join(skillsDir, 'my-installed', 'SKILL.md'))).toBe(true);
+    expect(fs.readFileSync(path.join(skillsDir, 'agent-browser', 'SKILL.md'), 'utf8')).toContain(
+      'user 源覆盖版',
+    );
+    const agentsMd = fs.readFileSync(
+      path.join(DATA_DIR, 'sessions', folder, '.codex', 'AGENTS.md'),
+      'utf8',
+    );
+    expect(agentsMd).toContain('my-installed');
+    expect(agentsMd).toContain('用户安装的技能');
+
+    // 清理 user 源，避免影响同套件其他用例（DATA_DIR 共享）
+    fs.rmSync(path.join(DATA_DIR, 'skills', 'u1'), { recursive: true, force: true });
+  });
+});

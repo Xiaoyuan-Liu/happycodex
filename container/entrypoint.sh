@@ -53,8 +53,9 @@ chown node:node /home/node/.npmrc 2>/dev/null || true
 export PATH="$PATH:$NPM_GLOBAL_DIR/bin"
 
 # tombstone（happycodex）：上游此处把 builtin/project/user skills 符号链接进
-# /home/node/.claude/skills/（Claude skills 发现机制）。codex 侧 context/技能注入走
-# AGENTS.md 路线（per-folder CODEX_HOME 物化），留待 context-resolver 阶段。
+# /home/node/.claude/skills/（Claude skills 发现机制）。codex 侧由宿主在 spawn 前完成：
+# skills-materializer 四源复制物化到 {groupDir}/.skills/（经 /workspace/group 挂载可见），
+# 技能索引并入 per-folder CODEX_HOME/AGENTS.md（经 /home/node/.codex 挂载）——容器内无需链接。
 # tombstone（happycodex）：上游此处 `npx tsc` 重编译热挂载的 agent-runner src；
 # happycodex 镜像直接 COPY 编译后的 dist/，无容器内编译步骤。
 
