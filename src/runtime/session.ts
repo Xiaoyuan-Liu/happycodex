@@ -23,6 +23,7 @@
 
 import type {
   IAppServerClient,
+  InjectedImage,
   IStreamMapper,
   IThreadSession,
   ThreadSessionConfig,
@@ -53,7 +54,9 @@ import {
   type TurnSteerParams,
   type TurnSteerResponse,
   type TurnInterruptParams,
+  type UserInput,
 } from '../appserver/protocol.js';
+import { detectImageMimeTypeFromBase64Strict } from '../image-detector.js';
 import { StreamMapper } from './stream-mapper.js';
 
 type StreamEventHandler = (ev: StreamEvent) => void;
@@ -158,17 +161,18 @@ export class ThreadSession implements IThreadSession {
     return merged;
   }
 
-  async sendUserMessage(text: string): Promise<void> {
+  async sendUserMessage(text: string, images?: InjectedImage[]): Promise<void> {
     const threadId = this._state.threadId;
     if (!threadId) {
       throw new Error('ThreadSession.sendUserMessage: thread not started (call start() first)');
     }
+    const input = buildTurnInput(text, images);
 
     const activeTurnId = this._state.activeTurnId;
     if (activeTurnId) {
       const params: TurnSteerParams = {
         threadId,
-        input: [textInput(text)],
+        input,
         expectedTurnId: activeTurnId,
       };
       try {
@@ -189,7 +193,7 @@ export class ThreadSession implements IThreadSession {
 
     const params: TurnStartParams = {
       threadId,
-      input: [textInput(text)],
+      input,
     };
     const res = await this.client.request<TurnStartResponse>(Method.turnStart, params);
     // 同步用响应里的 turn id 注册，不等 turn/started 通知。
@@ -462,6 +466,30 @@ export class ThreadSession implements IThreadSession {
       handler(decorated);
     }
   }
+}
+
+/**
+ * A4：把 text + 可选图片附件构造成 turn/start | turn/steer 的 input 数组。
+ *
+ * 图片走 UserInput 的 `{type:'image', url}` 变体（protocol/ts/v2/UserInput.ts），url 用
+ * data URL（`data:<mime>;base64,<data>`）——codex 内核对 `localImage` 变体的处理就是读盘后
+ * 转成同样的 data URL 再进模型 input，二者等价；data URL 形式免去临时文件落盘与清理。
+ * mimeType 缺省时按 magic bytes 检测（detectImageMimeTypeFromBase64Strict），仍不可识别则
+ * 兜底 image/png（与主进程 send_image 消费端的缺省一致）。
+ * data 为空串的条目跳过（无内容可发，避免构造非法 data URL）。
+ */
+export function buildTurnInput(text: string, images?: InjectedImage[]): UserInput[] {
+  const input: UserInput[] = [textInput(text)];
+  if (!images) return input;
+  for (const img of images) {
+    if (typeof img?.data !== 'string' || img.data.length === 0) continue;
+    const mime =
+      (img.mimeType && img.mimeType.trim()) ||
+      detectImageMimeTypeFromBase64Strict(img.data) ||
+      'image/png';
+    input.push({ type: 'image', url: `data:${mime};base64,${img.data}` });
+  }
+  return input;
 }
 
 /**

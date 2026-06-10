@@ -96,6 +96,18 @@ describe('resolveWorkspacePaths', () => {
     expect(ws.bridgeMemoryRoot).toBe(path.join(DATA, 'memory'));
     expect(ws.bridgeMemoryFolder).toBe('f2');
   });
+
+  test('A4 workspaceGroupDir：HAPPYCLAW_WORKSPACE_GROUP（per-folder）直用；root 语义/缺省回退', () => {
+    // 上游名（per-folder）：直接使用，不拼 {folder}。
+    const a = resolveWorkspacePaths({ HAPPYCLAW_WORKSPACE_GROUP: '/workspace/group' }, 'f1', DATA);
+    expect(a.workspaceGroupDir).toBe('/workspace/group');
+    // 旧名（root 语义）：拼 {folder}。
+    const b = resolveWorkspacePaths({ HAPPYCODEX_WORKSPACE_GROUP: '/legacy/groups' }, 'f1', DATA);
+    expect(b.workspaceGroupDir).toBe(path.join('/legacy/groups', 'f1'));
+    // 全缺省：{dataDir}/groups/{folder}（对齐主进程 GROUPS_DIR 布局）。
+    const c = resolveWorkspacePaths({}, 'f1', DATA);
+    expect(c.workspaceGroupDir).toBe(path.join(DATA, 'groups', 'f1'));
+  });
 });
 
 describe('FixedFolderToolBridge', () => {
@@ -124,6 +136,31 @@ describe('FixedFolderToolBridge', () => {
     // 业务参数原样透传
     expect(fake.calls[0]?.args[1]).toBe('hello');
     expect(fake.calls[3]?.args.slice(1)).toEqual(['jid@x', 'Name']);
+  });
+
+  test('A4 新工具调用钉到 ipcFolder（send_image/send_file/discord_*）', async () => {
+    const fake = new FakeToolBridge();
+    const bridge = new FixedFolderToolBridge(fake, 'pinned-ipc', 'pinned-mem');
+
+    await bridge.sendImage('caller-folder', 'chart.png', 'cap');
+    await bridge.sendFile('caller-folder', 'a.pdf', 'a.pdf');
+    await bridge.discordGetHistory('caller-folder', { limit: 10 });
+    await bridge.discordGetChannelInfo('caller-folder');
+    await bridge.discordGetServerInfo('caller-folder');
+
+    for (const call of fake.calls) {
+      expect(call.args[0]).toBe('pinned-ipc');
+    }
+    expect(fake.opNames()).toEqual([
+      'sendImage',
+      'sendFile',
+      'discordGetHistory',
+      'discordGetChannelInfo',
+      'discordGetServerInfo',
+    ]);
+    // 业务参数原样透传
+    expect(fake.calls[0]?.args.slice(1)).toEqual(['chart.png', 'cap']);
+    expect(fake.calls[2]?.args[1]).toEqual({ limit: 10 });
   });
 
   test('memory 类调用钉到 memoryFolder（与 ipcFolder 独立）', async () => {
@@ -177,5 +214,52 @@ describe('parseRunnerInput — IPC 工具路由上下文（ContainerInput.chatJi
     expect(input.chatJid).toBeUndefined();
     expect(input.isScheduledTask).toBeUndefined();
     expect(input.messageTaskId).toBeUndefined();
+  });
+
+  test('A4：currentSourceJid / isAdminHome 透传（per-channel 工具与 list_tasks stamp 来源）', () => {
+    const input = parseRunnerInput(
+      JSON.stringify({
+        prompt: 'hi',
+        groupFolder: 'main',
+        chatJid: 'web:main',
+        currentSourceJid: 'discord:123456789012345678',
+        isAdminHome: true,
+      }),
+    );
+    expect(input.currentSourceJid).toBe('discord:123456789012345678');
+    expect(input.isAdminHome).toBe(true);
+    // 非法值不产字段
+    const bad = parseRunnerInput(
+      JSON.stringify({ prompt: 'hi', groupFolder: 'g', currentSourceJid: '', isAdminHome: 'yes' }),
+    );
+    expect(bad.currentSourceJid).toBeUndefined();
+    expect(bad.isAdminHome).toBeUndefined();
+  });
+
+  test('A4：images 宽松解析（仅收 data 非空字符串的条目；mimeType 非串丢弃）', () => {
+    const input = parseRunnerInput(
+      JSON.stringify({
+        prompt: 'look',
+        groupFolder: 'g1',
+        images: [
+          { data: 'b64-a', mimeType: 'image/png' },
+          { data: 'b64-b', mimeType: 123 },
+          { data: '' },
+          { mimeType: 'image/png' },
+          'garbage',
+          null,
+        ],
+      }),
+    );
+    expect(input.images).toEqual([{ data: 'b64-a', mimeType: 'image/png' }, { data: 'b64-b' }]);
+    // images 非数组 / 全部非法 → 不产字段
+    const none = parseRunnerInput(
+      JSON.stringify({ prompt: 'x', groupFolder: 'g1', images: [{ data: '' }] }),
+    );
+    expect(none.images).toBeUndefined();
+    const notArr = parseRunnerInput(
+      JSON.stringify({ prompt: 'x', groupFolder: 'g1', images: 'nope' }),
+    );
+    expect(notArr.images).toBeUndefined();
   });
 });

@@ -2,11 +2,12 @@
  * createBuiltinTools 单测 —— 用 FakeToolBridge 验证每个工具的 spec 与 handler 行为。
  *
  * 覆盖：
- *  - 返回 12 个工具且 name 集合正确、唯一；
+ *  - 返回 17 个工具（A4：12 + send_image/send_file/discord_get_*）且 name 集合正确、唯一；
  *  - 每个工具 spec.inputSchema 是合法的 object schema（additionalProperties:false）；
  *  - 逐个 handler：合法 args → 调对应 bridge 方法（断言 bridge.calls）+ success:true；
  *  - 缺必填字段 → success:false 且文案含 "missing required field"；
- *  - memory_search / list_task 把数据带进文本；memory_get 命中文本 / (not found)。
+ *  - memory_search / list_task 把数据带进文本；memory_get 命中文本 / (not found)；
+ *  - A4 新工具：send_image 元数据文案、send_file 文案、discord 历史格式化 / DM null 分支。
  */
 
 import { describe, expect, it, beforeEach } from 'vitest';
@@ -28,12 +29,17 @@ function toolMap(): Map<string, ToolDefinition> {
 
 const EXPECTED_NAMES = [
   'send_message',
+  'send_image',
+  'send_file',
   'schedule_task',
   'list_task',
   'pause_task',
   'resume_task',
   'cancel_task',
   'register_group',
+  'discord_get_history',
+  'discord_get_channel_info',
+  'discord_get_server_info',
   'install_skill',
   'uninstall_skill',
   'memory_append',
@@ -49,13 +55,13 @@ function text(r: { contentItems: Array<{ type: string }> }): string {
 }
 
 describe('createBuiltinTools — registry shape', () => {
-  it('返回恰好 12 个工具', () => {
-    expect(createBuiltinTools()).toHaveLength(12);
+  it('返回恰好 17 个工具（A4 补齐上游完整面）', () => {
+    expect(createBuiltinTools()).toHaveLength(17);
   });
 
-  it('name 集合与 HappyClaw 12 工具一致且唯一', () => {
+  it('name 集合与 HappyClaw 17 工具一致且唯一', () => {
     const names = createBuiltinTools().map((t) => t.spec.name);
-    expect(new Set(names).size).toBe(12);
+    expect(new Set(names).size).toBe(17);
     expect(names.sort()).toEqual([...EXPECTED_NAMES].sort());
   });
 
@@ -234,6 +240,109 @@ describe('createBuiltinTools — handler 合法路径', () => {
     expect(r.success).toBe(true);
     expect(text(r)).toBe('(not found)');
   });
+
+  // ── A4 新工具 ──
+
+  it('send_image → bridge.sendImage(folder, file_path, caption)，文案含元数据', async () => {
+    bridge.sendImageResult = { fileName: 'plot.png', mimeType: 'image/png', sizeBytes: 3072 };
+    const r = await tools.get('send_image')!.handler(
+      { file_path: 'out/plot.png', caption: '趋势图' },
+      ctxWith(bridge),
+    );
+    expect(r.success).toBe(true);
+    expect(bridge.lastCall()).toEqual({ op: 'sendImage', args: [FOLDER, 'out/plot.png', '趋势图'] });
+    expect(text(r)).toBe('Image sent: plot.png (image/png, 3.0KB)');
+  });
+
+  it('send_image 无 caption → caption 传 undefined', async () => {
+    const r = await tools.get('send_image')!.handler({ file_path: 'a.png' }, ctxWith(bridge));
+    expect(r.success).toBe(true);
+    expect(bridge.lastCall()).toEqual({ op: 'sendImage', args: [FOLDER, 'a.png', undefined] });
+  });
+
+  it('send_file → bridge.sendFile(folder, filePath, fileName)，文案对齐上游', async () => {
+    const r = await tools.get('send_file')!.handler(
+      { filePath: 'output/report.pdf', fileName: 'report.pdf' },
+      ctxWith(bridge),
+    );
+    expect(r.success).toBe(true);
+    expect(bridge.lastCall()).toEqual({
+      op: 'sendFile',
+      args: [FOLDER, 'output/report.pdf', 'report.pdf'],
+    });
+    expect(text(r)).toBe('Sending file "report.pdf"...');
+  });
+
+  it('discord_get_history → 格式化消息列表（authorName/id/bot/edited/reply/附件）', async () => {
+    bridge.discordMessages = [
+      {
+        id: '111111111111111111',
+        authorName: 'alice',
+        authorBot: false,
+        content: 'hello',
+        timestamp: '2026-06-10T00:00:00.000Z',
+        attachments: [],
+        edited: false,
+      },
+      {
+        id: '222222222222222222',
+        authorName: 'bot-helper',
+        authorBot: true,
+        content: '',
+        timestamp: '2026-06-10T00:01:00.000Z',
+        attachments: [{ name: 'spec.pdf', url: 'https://cdn/x' }],
+        replyToId: '111111111111111111',
+        edited: true,
+      },
+    ];
+    const r = await tools.get('discord_get_history')!.handler({ limit: 50 }, ctxWith(bridge));
+    expect(r.success).toBe(true);
+    expect(bridge.lastCall()).toEqual({ op: 'discordGetHistory', args: [FOLDER, { limit: 50 }] });
+    const t = text(r);
+    expect(t).toContain('Discord history (2 messages, oldest first)');
+    expect(t).toContain('alice');
+    expect(t).toContain('(id=111111111111111111)');
+    expect(t).toContain('[bot]');
+    expect(t).toContain('(edited)');
+    expect(t).toContain('↪111111111111111111');
+    expect(t).toContain('(empty)');
+    expect(t).toContain('📎 spec.pdf');
+  });
+
+  it('discord_get_history 空结果 → No messages found', async () => {
+    bridge.discordMessages = [];
+    const r = await tools.get('discord_get_history')!.handler({}, ctxWith(bridge));
+    expect(r.success).toBe(true);
+    expect(text(r)).toBe('No messages found in this channel.');
+  });
+
+  it('discord_get_channel_info → JSON 透传进文案', async () => {
+    bridge.discordChannel = { name: 'general', type: 'guild_text', nsfw: false };
+    const r = await tools.get('discord_get_channel_info')!.handler({}, ctxWith(bridge));
+    expect(r.success).toBe(true);
+    expect(bridge.lastCall()).toEqual({ op: 'discordGetChannelInfo', args: [FOLDER] });
+    expect(text(r)).toContain('Discord channel info:');
+    expect(text(r)).toContain('"name": "general"');
+  });
+
+  it('discord_get_server_info → guild JSON；guild=null（DM）→ DM 文案', async () => {
+    bridge.discordGuild = { name: 'My Server', memberCount: 42 };
+    const r1 = await tools.get('discord_get_server_info')!.handler({}, ctxWith(bridge));
+    expect(r1.success).toBe(true);
+    expect(text(r1)).toContain('"memberCount": 42');
+
+    bridge.discordGuild = null;
+    const r2 = await tools.get('discord_get_server_info')!.handler({}, ctxWith(bridge));
+    expect(r2.success).toBe(true);
+    expect(text(r2)).toContain('This is a DM channel');
+  });
+
+  it('install_skill 回执 installed 列表进文案', async () => {
+    bridge.installedSkills = ['memory', 'think'];
+    const r = await tools.get('install_skill')!.handler({ name: 'anthropic/memory' }, ctxWith(bridge));
+    expect(r.success).toBe(true);
+    expect(text(r)).toContain('memory, think');
+  });
 });
 
 describe('createBuiltinTools — 缺必填字段 → success:false', () => {
@@ -264,6 +373,9 @@ describe('createBuiltinTools — 缺必填字段 → success:false', () => {
     expectMissing('schedule_task', { name: 'n', prompt: 'p', schedule: { kind: 'cron' } }));
   it('schedule_task once 缺 at', () =>
     expectMissing('schedule_task', { name: 'n', prompt: 'p', schedule: { kind: 'once' } }));
+  it('send_image 缺 file_path', () => expectMissing('send_image', { caption: 'x' }));
+  it('send_file 缺 filePath', () => expectMissing('send_file', { fileName: 'a.pdf' }));
+  it('send_file 缺 fileName', () => expectMissing('send_file', { filePath: 'a.pdf' }));
   it('pause_task 缺 task_id', () => expectMissing('pause_task', {}));
   it('resume_task 缺 task_id', () => expectMissing('resume_task', {}));
   it('cancel_task 缺 task_id', () => expectMissing('cancel_task', {}));
@@ -275,6 +387,58 @@ describe('createBuiltinTools — 缺必填字段 → success:false', () => {
   it('memory_get 缺 path', () => expectMissing('memory_get', {}));
   it('args 非对象（null）也安全失败', () => expectMissing('send_message', null));
   it('args 非对象（字符串）也安全失败', () => expectMissing('memory_get', 'oops'));
+});
+
+describe('createBuiltinTools — A4 非法字段值（不触达 bridge）', () => {
+  let bridge: FakeToolBridge;
+  let tools: Map<string, ToolDefinition>;
+
+  beforeEach(() => {
+    bridge = new FakeToolBridge();
+    tools = toolMap();
+  });
+
+  it('discord_get_history limit 越界 / 非整数 → success:false', async () => {
+    for (const limit of [0, 101, 1.5, 'ten']) {
+      const r = await tools.get('discord_get_history')!.handler({ limit }, ctxWith(bridge));
+      expect(r.success, `limit=${String(limit)}`).toBe(false);
+      expect(text(r)).toContain('"limit"');
+    }
+    expect(bridge.calls).toHaveLength(0);
+  });
+
+  it('discord_get_history before 非 snowflake → success:false', async () => {
+    for (const before of ['abc', '123', 12345]) {
+      const r = await tools.get('discord_get_history')!.handler({ before }, ctxWith(bridge));
+      expect(r.success, `before=${String(before)}`).toBe(false);
+      expect(text(r)).toContain('"before"');
+    }
+    expect(bridge.calls).toHaveLength(0);
+  });
+
+  it('install_skill 非法包名 → success:false（对齐上游 Invalid package format）', async () => {
+    const r = await tools.get('install_skill')!.handler({ name: 'not a package!!' }, ctxWith(bridge));
+    expect(r.success).toBe(false);
+    expect(text(r)).toContain('Invalid package format');
+    expect(bridge.calls).toHaveLength(0);
+  });
+
+  it('install_skill 允许 owner/repo@skill 与 https URL', async () => {
+    const r1 = await tools.get('install_skill')!.handler({ name: 'owner/repo@skill' }, ctxWith(bridge));
+    expect(r1.success).toBe(true);
+    const r2 = await tools.get('install_skill')!.handler(
+      { name: 'https://example.com/skill.git' },
+      ctxWith(bridge),
+    );
+    expect(r2.success).toBe(true);
+  });
+
+  it('uninstall_skill 非法 skill ID（含斜杠）→ success:false', async () => {
+    const r = await tools.get('uninstall_skill')!.handler({ name: 'a/b' }, ctxWith(bridge));
+    expect(r.success).toBe(false);
+    expect(text(r)).toContain('Invalid skill ID');
+    expect(bridge.calls).toHaveLength(0);
+  });
 });
 
 describe('createBuiltinTools — schedule_task 非法 schedule', () => {

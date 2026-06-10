@@ -35,6 +35,9 @@ import type {
   ScheduleTaskInput,
   TaskSummary,
   MemoryHit,
+  SendImageResult,
+  DiscordHistoryOptions,
+  DiscordHistoryMessage,
 } from './runtime/tools/types.js';
 import { createBuiltinTools } from './runtime/tools/builtin.js';
 import { IpcInputLoop, ipcInputDir, type IpcInputMessage } from './runtime/ipc-input.js';
@@ -76,6 +79,13 @@ export interface ResolvedWorkspacePaths {
   bridgeMemoryRoot: string;
   /** bridge memory 调用使用的 folder。 */
   bridgeMemoryFolder: string;
+  /**
+   * A4：群组工作区目录（per-folder 绝对路径，对齐上游 WORKSPACE_GROUP）。
+   * send_image / send_file 的文件路径锚点。HAPPYCLAW_WORKSPACE_GROUP（上游名，per-folder）
+   * 优先；HAPPYCODEX_WORKSPACE_GROUP（root 语义）次之；缺省 {dataDir}/groups/{folder}
+   * （对齐主进程 GROUPS_DIR 布局，send_file 的相对路径在消费端按同一锚点还原）。
+   */
+  workspaceGroupDir: string;
 }
 
 /**
@@ -94,8 +104,10 @@ export function resolveWorkspacePaths(
 ): ResolvedWorkspacePaths {
   const perFolderIpc = env.HAPPYCLAW_WORKSPACE_IPC;
   const perFolderMemory = env.HAPPYCLAW_WORKSPACE_MEMORY;
+  const perFolderGroup = env.HAPPYCLAW_WORKSPACE_GROUP;
   const ipcRoot = env.HAPPYCODEX_WORKSPACE_IPC || path.join(dataDir, 'ipc');
   const memoryRoot = env.HAPPYCODEX_WORKSPACE_MEMORY || path.join(dataDir, 'memory');
+  const groupRoot = env.HAPPYCODEX_WORKSPACE_GROUP || path.join(dataDir, 'groups');
 
   return {
     inputDir: perFolderIpc
@@ -105,6 +117,7 @@ export function resolveWorkspacePaths(
     bridgeIpcFolder: perFolderIpc ? path.basename(perFolderIpc) : groupFolder,
     bridgeMemoryRoot: perFolderMemory ? path.dirname(perFolderMemory) : memoryRoot,
     bridgeMemoryFolder: perFolderMemory ? path.basename(perFolderMemory) : groupFolder,
+    workspaceGroupDir: perFolderGroup || path.join(groupRoot, groupFolder),
   };
 }
 
@@ -129,6 +142,16 @@ class FixedFolderToolBridge implements ToolBridge {
   sendMessage(_folder: string, message: string): Promise<void> {
     return this.inner.sendMessage(this.ipcFolder, message);
   }
+  sendImage(_folder: string, filePath: string, caption?: string): Promise<SendImageResult> {
+    // 工作区文件解析锚点由内层 bridge 的 workspaceGroupDir 承担（per-folder 绝对路径），
+    // folder 参数只决定 IPC 落盘 namespace —— 钉到 ipcFolder。
+    return caption === undefined
+      ? this.inner.sendImage(this.ipcFolder, filePath)
+      : this.inner.sendImage(this.ipcFolder, filePath, caption);
+  }
+  sendFile(_folder: string, filePath: string, fileName: string): Promise<void> {
+    return this.inner.sendFile(this.ipcFolder, filePath, fileName);
+  }
   scheduleTask(_folder: string, input: ScheduleTaskInput): Promise<{ taskId: string }> {
     return this.inner.scheduleTask(this.ipcFolder, input);
   }
@@ -149,11 +172,25 @@ class FixedFolderToolBridge implements ToolBridge {
       ? this.inner.registerGroup(this.ipcFolder, jid)
       : this.inner.registerGroup(this.ipcFolder, jid, name);
   }
-  installSkill(_folder: string, name: string): Promise<void> {
+  installSkill(_folder: string, name: string): Promise<{ installed?: string[] }> {
     return this.inner.installSkill(this.ipcFolder, name);
   }
   uninstallSkill(_folder: string, name: string): Promise<void> {
     return this.inner.uninstallSkill(this.ipcFolder, name);
+  }
+  discordGetHistory(
+    _folder: string,
+    opts?: DiscordHistoryOptions,
+  ): Promise<DiscordHistoryMessage[]> {
+    return opts === undefined
+      ? this.inner.discordGetHistory(this.ipcFolder)
+      : this.inner.discordGetHistory(this.ipcFolder, opts);
+  }
+  discordGetChannelInfo(_folder: string): Promise<unknown> {
+    return this.inner.discordGetChannelInfo(this.ipcFolder);
+  }
+  discordGetServerInfo(_folder: string): Promise<unknown | null> {
+    return this.inner.discordGetServerInfo(this.ipcFolder);
   }
   memoryAppend(_folder: string, content: string, scope?: string): Promise<void> {
     return scope === undefined
@@ -251,13 +288,32 @@ export function parseRunnerInput(raw: string): CodexRunnerInput {
 
   // IPC 工具路由上下文（主仓 ContainerInput 字段，IpcToolBridge 写盘时 stamp）。
   const chatJid = isStr(obj.chatJid) && obj.chatJid ? obj.chatJid : undefined;
+  const currentSourceJid =
+    isStr(obj.currentSourceJid) && obj.currentSourceJid ? obj.currentSourceJid : undefined;
   const messageTaskId = isStr(obj.messageTaskId) && obj.messageTaskId ? obj.messageTaskId : undefined;
+
+  // A4：初始 prompt 的图片附件（主仓 ContainerInput.images）——宽松校验，只收 data 为非空字符串的条目。
+  const images = Array.isArray(obj.images)
+    ? obj.images
+        .filter(
+          (it): it is { data: string; mimeType?: unknown } =>
+            !!it && typeof it === 'object' && typeof (it as { data?: unknown }).data === 'string' &&
+            ((it as { data: string }).data.length > 0),
+        )
+        .map((it) => ({
+          data: it.data,
+          ...(typeof it.mimeType === 'string' && it.mimeType ? { mimeType: it.mimeType } : {}),
+        }))
+    : undefined;
 
   return {
     prompt,
+    ...(images && images.length > 0 ? { images } : {}),
     groupFolder,
     session,
     ...(chatJid ? { chatJid } : {}),
+    ...(currentSourceJid ? { currentSourceJid } : {}),
+    ...(obj.isAdminHome === true ? { isAdminHome: true } : {}),
     ...(obj.isScheduledTask === true ? { isScheduledTask: true } : {}),
     ...(messageTaskId ? { messageTaskId } : {}),
   };
@@ -288,9 +344,12 @@ async function main(): Promise<void> {
   // ── 构造 codex 运行时（per-folder CODEX_HOME 隔离交由调用方/多租户层；standalone 入口用进程默认 CODEX_HOME） ──
   const client = new AppServerClient();
 
-  // 可选工具层（Stage 3）：IpcToolBridge 写输出侧 messages/ tasks/ + 记忆。
+  // 可选工具层（Stage 3 / A4）：IpcToolBridge 写输出侧 messages/ tasks/ + 记忆 + 请求-响应回执。
   // FixedFolderToolBridge 把工具调用钉到 env 解析出的 per-folder 目标（见适配器注释）。
   let tools: { registry: ToolRegistry; bridge: ToolBridge } | undefined;
+  // A4：保留内层 bridge 引用 —— IPC input 消息带 sourceJid 时就地更新 per-channel 工具的
+  // 当前聊天标识（对齐上游主循环对 mcpToolsConfig.chatJid 的就地变更）。
+  let innerBridge: IpcToolBridge | null = null;
   if (enableTools) {
     const registry = new ToolRegistry();
     // 对齐上游：HAPPYCLAW_DISABLE_MEMORY_LAYER === 'true' 时跳过 memory 工具注册
@@ -300,14 +359,20 @@ async function main(): Promise<void> {
       if (disableMemoryLayer && def.spec.name.startsWith('memory_')) continue;
       registry.register(def);
     }
+    // 当前聊天标识初始化对齐上游（agent-runner index.ts:1857）：currentSourceJid 优先。
+    const initialChatJid = input.currentSourceJid || input.chatJid;
     const inner = new IpcToolBridge({
       ipcDir: ws.bridgeIpcRoot,
       memoryDir: ws.bridgeMemoryRoot,
+      // A4：send_image/send_file 的文件路径锚点（per-folder 群组工作区）。
+      workspaceGroupDir: ws.workspaceGroupDir,
       // 路由上下文：send_message/schedule_task 的 chatJid/targetJid 来源（主进程 IPC 消费契约）。
-      ...(input.chatJid ? { chatJid: input.chatJid } : {}),
+      ...(initialChatJid ? { chatJid: initialChatJid } : {}),
+      ...(input.isAdminHome ? { isAdminHome: true } : {}),
       ...(input.isScheduledTask ? { isScheduledTask: true } : {}),
       ...(input.messageTaskId ? { currentTaskId: input.messageTaskId } : {}),
     });
+    innerBridge = inner;
     const bridge = new FixedFolderToolBridge(inner, ws.bridgeIpcFolder, ws.bridgeMemoryFolder);
     tools = { registry, bridge };
     log(
@@ -379,9 +444,11 @@ async function main(): Promise<void> {
 
   const inputLoop = new IpcInputLoop(inputDir, {
     onMessage: (msg: IpcInputMessage) => {
-      // standalone 入口只桥接文本（图片/sourceJid 透传给主仓阶段再接；inject 契约只吃 text）。
-      log(`inject message (${msg.text.length} chars)`);
-      runner.inject(msg.text);
+      // A4：images 随消息透传到 session turn input；sourceJid 就地更新 per-channel 工具的
+      // 当前聊天标识（对齐上游主循环：mcpToolsConfig.chatJid = nextMessage.sourceJid）。
+      if (msg.sourceJid && innerBridge) innerBridge.setChatJid(msg.sourceJid);
+      log(`inject message (${msg.text.length} chars, ${msg.images?.length ?? 0} images)`);
+      runner.inject(msg.text, msg.images);
     },
     onClose: () => beginShutdown('_close sentinel', true),
     onInterrupt: () => interruptCurrentTurn(),

@@ -21,7 +21,12 @@ import {
   OUTPUT_START_MARKER,
   OUTPUT_END_MARKER,
 } from '../src/shared/stream-event.js';
-import { ThreadSession, deriveTurnSubtype, deriveSubagentType } from '../src/runtime/session.js';
+import {
+  ThreadSession,
+  buildTurnInput,
+  deriveTurnSubtype,
+  deriveSubagentType,
+} from '../src/runtime/session.js';
 import { RpcError } from '../src/appserver/client.js';
 import { ERR_SERVER_OVERLOADED } from '../src/appserver/protocol.js';
 import { CodexRunner, wrapStreamEvent } from '../src/runtime/codex-runner.js';
@@ -235,6 +240,41 @@ describe('ThreadSession.sendUserMessage (turn/start vs turn/steer)', () => {
     const params = client.requests.at(-1)!.params as Record<string, unknown>;
     expect(params.expectedTurnId).toBe('turn_1');
     expect(params.input).toEqual([{ type: 'text', text: 'steer me', text_elements: [] }]);
+  });
+
+  it('A4：images 随 turn/start input 透传（text + image data-URL 项）', async () => {
+    const { client, session } = await startedSession();
+    const pngB64 = Buffer.from([
+      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+    ]).toString('base64');
+
+    await session.sendUserMessage('看下这两张图', [
+      { data: 'abc123', mimeType: 'image/jpeg' },
+      { data: pngB64 }, // 无 mimeType → magic bytes 检测出 image/png
+    ]);
+
+    const params = client.requests.at(-1)!.params as Record<string, unknown>;
+    expect(client.lastMethod()).toBe('turn/start');
+    expect(params.input).toEqual([
+      { type: 'text', text: '看下这两张图', text_elements: [] },
+      { type: 'image', url: 'data:image/jpeg;base64,abc123' },
+      { type: 'image', url: `data:image/png;base64,${pngB64}` },
+    ]);
+  });
+
+  it('A4：有 active turn 时 images 随 turn/steer input 透传', async () => {
+    const { client, session } = await startedSession();
+    client.emit('turn/started', { threadId: 'th_1', turn: { id: 'turn_img' } });
+
+    await session.sendUserMessage('补一张', [{ data: 'zzz', mimeType: 'image/webp' }]);
+
+    expect(client.lastMethod()).toBe('turn/steer');
+    const params = client.requests.at(-1)!.params as Record<string, unknown>;
+    expect(params.expectedTurnId).toBe('turn_img');
+    expect(params.input).toEqual([
+      { type: 'text', text: '补一张', text_elements: [] },
+      { type: 'image', url: 'data:image/webp;base64,zzz' },
+    ]);
   });
 
   it('turn/completed 清空 activeTurnId 并触发 onTurnCompleted；之后 sendUserMessage 回到 turn/start', async () => {
@@ -826,6 +866,42 @@ describe('deriveTurnSubtype', () => {
   });
 });
 
+// ───────────────────────── buildTurnInput（A4） ─────────────────────────
+
+describe('buildTurnInput', () => {
+  it('无 images → 仅 textInput', () => {
+    expect(buildTurnInput('hi')).toEqual([{ type: 'text', text: 'hi', text_elements: [] }]);
+    expect(buildTurnInput('hi', [])).toEqual([{ type: 'text', text: 'hi', text_elements: [] }]);
+  });
+
+  it('mimeType 显式提供时直接使用；缺省时 magic bytes 检测；不可识别兜底 image/png', () => {
+    const jpegB64 = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0, 0, 0, 0, 0, 0, 0]).toString('base64');
+    const out = buildTurnInput('t', [
+      { data: 'AAA', mimeType: 'image/gif' },
+      { data: jpegB64 }, // 检测 → image/jpeg
+      { data: 'bm90LWFuLWltYWdl' }, // "not-an-image" → 兜底 image/png
+    ]);
+    expect(out).toEqual([
+      { type: 'text', text: 't', text_elements: [] },
+      { type: 'image', url: 'data:image/gif;base64,AAA' },
+      { type: 'image', url: `data:image/jpeg;base64,${jpegB64}` },
+      { type: 'image', url: 'data:image/png;base64,bm90LWFuLWltYWdl' },
+    ]);
+  });
+
+  it('data 为空串 / 非字符串的条目被跳过（防御性）', () => {
+    const out = buildTurnInput('t', [
+      { data: '' },
+      { data: 123 as unknown as string },
+      { data: 'ok', mimeType: 'image/png' },
+    ]);
+    expect(out).toEqual([
+      { type: 'text', text: 't', text_elements: [] },
+      { type: 'image', url: 'data:image/png;base64,ok' },
+    ]);
+  });
+});
+
 // ───────────────────────── CodexRunner ─────────────────────────
 
 describe('wrapStreamEvent', () => {
@@ -896,6 +972,41 @@ describe('CodexRunner.inject', () => {
     client.emit('turn/completed', { threadId: 'th_inj', turn: { id: 'turn_1', status: 'completed' } });
     await runPromise;
     expect(client.methods()).toContain('turn/steer');
+  });
+
+  it('A4：run(input.images) 随初始 turn/start 透传；inject(text, images) 随 steer 透传', async () => {
+    const client = new FakeAppServerClient();
+    client.responses['thread/start'] = { thread: { id: 'th_img', sessionId: 's', path: null } };
+    const runner = new CodexRunner({ client, config: {}, sink: () => {}, mapper: new FakeMapper() });
+
+    const runPromise = runner.run({
+      prompt: '初始带图',
+      images: [{ data: 'init-b64', mimeType: 'image/png' }],
+      groupFolder: 'g',
+      session: {},
+    });
+    await vi.waitFor(() => expect(client.methods()).toContain('turn/start'));
+    const startParams = client.requests.find((r) => r.method === 'turn/start')!.params as {
+      input: unknown[];
+    };
+    expect(startParams.input).toEqual([
+      { type: 'text', text: '初始带图', text_elements: [] },
+      { type: 'image', url: 'data:image/png;base64,init-b64' },
+    ]);
+
+    client.emit('turn/started', { threadId: 'th_img', turn: { id: 'turn_1' } });
+    runner.inject('注入带图', [{ data: 'inj-b64', mimeType: 'image/jpeg' }]);
+    await vi.waitFor(() => expect(client.methods()).toContain('turn/steer'));
+    const steerParams = client.requests.find((r) => r.method === 'turn/steer')!.params as {
+      input: unknown[];
+    };
+    expect(steerParams.input).toEqual([
+      { type: 'text', text: '注入带图', text_elements: [] },
+      { type: 'image', url: 'data:image/jpeg;base64,inj-b64' },
+    ]);
+
+    client.emit('turn/completed', { threadId: 'th_img', turn: { id: 'turn_1', status: 'completed' } });
+    await runPromise;
   });
 
   it('#1/#2 在途注入未完成时，turn/completed 不提前结束 run()（在飞 turn + 队列门控）', async () => {

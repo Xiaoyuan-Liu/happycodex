@@ -5,7 +5,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdtemp, rm, readdir, readFile, mkdir, writeFile, symlink } from 'node:fs/promises';
+import { mkdtemp, rm, readdir, readFile, mkdir, writeFile, symlink, rename } from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
@@ -18,13 +18,23 @@ const CHAT_JID = 'web:home-test';
 let root: string;
 let ipcDir: string;
 let memoryDir: string;
+let workspaceDir: string;
 let bridge: IpcToolBridge;
 
 beforeEach(async () => {
   root = await mkdtemp(path.join(os.tmpdir(), 'happycodex-ipc-'));
   ipcDir = path.join(root, 'ipc');
   memoryDir = path.join(root, 'groups');
-  bridge = new IpcToolBridge({ ipcDir, memoryDir, chatJid: CHAT_JID });
+  workspaceDir = path.join(root, 'groups', FOLDER); // 群组工作区（send_image/send_file 锚点）
+  // A4：poll 间隔/超时调小——本套件无主进程应答，读类工具快速进入超时/降级路径。
+  bridge = new IpcToolBridge({
+    ipcDir,
+    memoryDir,
+    workspaceGroupDir: workspaceDir,
+    chatJid: CHAT_JID,
+    pollIntervalMs: 5,
+    pollTimeoutMs: 100,
+  });
 });
 
 afterEach(async () => {
@@ -149,7 +159,7 @@ describe('IpcToolBridge — scheduleTask / list / lifecycle', () => {
     expect(await listChannel('tasks')).toEqual([]);
   });
 
-  it('listTasks 返回已排队的 create 请求摘要', async () => {
+  it('listTasks（standalone 降级：无主进程应答超时后）返回已排队的 create 请求摘要', async () => {
     const { taskId } = await bridge.scheduleTask(FOLDER, input);
     const tasks = await bridge.listTasks(FOLDER);
     expect(tasks).toHaveLength(1);
@@ -248,9 +258,15 @@ describe('IpcToolBridge — register / skills', () => {
     expect(p.name).toBe('My Group');
   });
 
-  it('install/uninstallSkill 写 tasks/ 请求（package/skillId + requestId，主进程契约必填）', async () => {
-    await bridge.installSkill(FOLDER, 'anthropic/pdf');
-    await bridge.uninstallSkill(FOLDER, 'pdf');
+  it('install/uninstallSkill 写 tasks/ 请求（package/skillId + requestId，主进程契约必填）；无主进程应答 → 超时抛错且请求文件保留', async () => {
+    // A4：升级为请求-响应协议。本套件无主进程写回 *_result_{requestId}.json → 超时（上游同文案）。
+    await expect(bridge.installSkill(FOLDER, 'anthropic/pdf')).rejects.toThrow(
+      /Timeout waiting for skill installation result/,
+    );
+    await expect(bridge.uninstallSkill(FOLDER, 'pdf')).rejects.toThrow(
+      /Timeout waiting for skill uninstall result/,
+    );
+    // 超时后请求文件不删（主进程可能只是慢，迟到执行仍有效——对齐上游）。
     const files = (await listChannel('tasks')).filter((f) => f.endsWith('.json'));
     expect(files).toHaveLength(2);
     const types = new Set<string>();
@@ -404,5 +420,369 @@ describe('IpcToolBridge — #8 符号链接穿越防护（物理 containment）'
     // 真实文件 target.md 命中；symlink alias.md 被跳过。
     expect(hits.some((h) => h.path === 'target.md')).toBe(true);
     expect(hits.some((h) => h.path === 'alias.md')).toBe(false);
+  });
+});
+
+// ───────────────────────── A4：send_image / send_file ─────────────────────────
+
+/** 一个合法的最小 PNG 头（magic 8 字节 + 补足 ≥12 字节，命中 detectImageMimeTypeStrict）。 */
+const PNG_BYTES = Buffer.from([
+  0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+]);
+
+describe('IpcToolBridge — sendImage（A4）', () => {
+  it('工作区内 PNG → messages 通道 type:image（命中主进程消费端字段）+ 返回元数据', async () => {
+    await mkdir(workspaceDir, { recursive: true });
+    await writeFile(path.join(workspaceDir, 'chart.png'), PNG_BYTES);
+
+    const r = await bridge.sendImage(FOLDER, 'chart.png', '本周趋势');
+    expect(r).toEqual({ fileName: 'chart.png', mimeType: 'image/png', sizeBytes: PNG_BYTES.length });
+
+    const files = (await listChannel('messages')).filter((f) => f.endsWith('.json'));
+    expect(files).toHaveLength(1);
+    const p = (await readChannelJson('messages', files[0]!)) as Record<string, unknown>;
+    // 主进程消费契约（index.ts image 分支）：data.type === 'image' && data.chatJid && data.imageBase64
+    expect(p.type).toBe('image');
+    expect(p.chatJid).toBe(CHAT_JID);
+    expect(p.groupFolder).toBe(FOLDER);
+    expect(p.imageBase64).toBe(PNG_BYTES.toString('base64'));
+    expect(p.mimeType).toBe('image/png');
+    expect(p.caption).toBe('本周趋势');
+    expect(p.fileName).toBe('chart.png');
+    expect(typeof p.timestamp).toBe('string');
+    // 非定时任务运行：不得 stamp isScheduledTask/taskId
+    expect('isScheduledTask' in p).toBe(false);
+    expect('taskId' in p).toBe(false);
+  });
+
+  it('无 caption → 落盘不带 caption 键（对齐上游 caption || undefined 语义）', async () => {
+    await mkdir(workspaceDir, { recursive: true });
+    await writeFile(path.join(workspaceDir, 'x.png'), PNG_BYTES);
+    await bridge.sendImage(FOLDER, 'x.png');
+    const files = (await listChannel('messages')).filter((f) => f.endsWith('.json'));
+    const p = (await readChannelJson('messages', files[0]!)) as Record<string, unknown>;
+    expect('caption' in p).toBe(false);
+  });
+
+  it('定时任务运行 → 条件 stamp isScheduledTask/taskId（任务广播分支路由依据）', async () => {
+    await mkdir(workspaceDir, { recursive: true });
+    await writeFile(path.join(workspaceDir, 'x.png'), PNG_BYTES);
+    const taskBridge = new IpcToolBridge({
+      ipcDir,
+      memoryDir,
+      workspaceGroupDir: workspaceDir,
+      chatJid: CHAT_JID,
+      isScheduledTask: true,
+      currentTaskId: 'task-img-1',
+    });
+    await taskBridge.sendImage(FOLDER, 'x.png');
+    const files = (await listChannel('messages')).filter((f) => f.endsWith('.json'));
+    const p = (await readChannelJson('messages', files[0]!)) as Record<string, unknown>;
+    expect(p.isScheduledTask).toBe(true);
+    expect(p.taskId).toBe('task-img-1');
+  });
+
+  it('路径穿越（../）逃出工作区 → 抛错且不落盘', async () => {
+    await writeFile(path.join(root, 'evil.png'), PNG_BYTES);
+    await expect(bridge.sendImage(FOLDER, '../../evil.png')).rejects.toThrow(
+      /within workspace directory/,
+    );
+    expect((await listChannel('messages')).filter((f) => f.endsWith('.json'))).toEqual([]);
+  });
+
+  it('文件不存在 / 空文件 / 非图片内容 → 各自抛对应错误', async () => {
+    await mkdir(workspaceDir, { recursive: true });
+    await expect(bridge.sendImage(FOLDER, 'missing.png')).rejects.toThrow(/file not found/);
+
+    await writeFile(path.join(workspaceDir, 'empty.png'), Buffer.alloc(0));
+    await expect(bridge.sendImage(FOLDER, 'empty.png')).rejects.toThrow(/image file is empty/);
+
+    await writeFile(path.join(workspaceDir, 'fake.png'), Buffer.from('definitely not an image'));
+    await expect(bridge.sendImage(FOLDER, 'fake.png')).rejects.toThrow(/supported image format/);
+  });
+
+  it('未绑定 chatJid / 未绑定工作区目录 → 抛错（诚实失败）', async () => {
+    const noJid = new IpcToolBridge({ ipcDir, memoryDir, workspaceGroupDir: workspaceDir });
+    await expect(noJid.sendImage(FOLDER, 'x.png')).rejects.toThrow(/no chatJid/);
+    const noWs = new IpcToolBridge({ ipcDir, memoryDir, chatJid: CHAT_JID });
+    await expect(noWs.sendImage(FOLDER, 'x.png')).rejects.toThrow(/no workspace directory/);
+  });
+});
+
+describe('IpcToolBridge — sendFile（A4）', () => {
+  it('相对路径 → tasks 通道 {type:send_file, chatJid, filePath, fileName, timestamp}（命中消费端 case）', async () => {
+    await mkdir(path.join(workspaceDir, 'output'), { recursive: true });
+    await writeFile(path.join(workspaceDir, 'output', 'report.pdf'), 'pdf-bytes');
+
+    await bridge.sendFile(FOLDER, 'output/report.pdf', 'report.pdf');
+
+    const files = (await listChannel('tasks')).filter((f) => f.endsWith('.json'));
+    expect(files).toHaveLength(1);
+    const p = (await readChannelJson('tasks', files[0]!)) as Record<string, unknown>;
+    // 主进程消费契约（processTaskIpc case 'send_file'）：data.chatJid && data.filePath && data.fileName；
+    // filePath 为相对工作区路径（消费端按 GROUPS_DIR/{sourceGroup}/filePath 还原）。
+    expect(p.type).toBe('send_file');
+    expect(p.chatJid).toBe(CHAT_JID);
+    expect(p.filePath).toBe('output/report.pdf');
+    expect(p.fileName).toBe('report.pdf');
+    expect(typeof p.timestamp).toBe('string');
+  });
+
+  it('工作区内绝对路径 → 转相对路径落盘（消费端锚点一致）', async () => {
+    await mkdir(workspaceDir, { recursive: true });
+    const abs = path.join(workspaceDir, 'data.zip');
+    await writeFile(abs, 'zip-bytes');
+    await bridge.sendFile(FOLDER, abs, 'data.zip');
+    const files = (await listChannel('tasks')).filter((f) => f.endsWith('.json'));
+    const p = (await readChannelJson('tasks', files[0]!)) as Record<string, unknown>;
+    expect(p.filePath).toBe('data.zip');
+  });
+
+  it('工作区外绝对路径 / 穿越 / 不存在 → 抛错且不落盘', async () => {
+    await writeFile(path.join(root, 'outside.bin'), 'x');
+    await expect(
+      bridge.sendFile(FOLDER, path.join(root, 'outside.bin'), 'outside.bin'),
+    ).rejects.toThrow(/within the workspace/);
+    await expect(bridge.sendFile(FOLDER, '../../outside.bin', 'outside.bin')).rejects.toThrow(
+      /within the workspace/,
+    );
+    await expect(bridge.sendFile(FOLDER, 'nope.pdf', 'nope.pdf')).rejects.toThrow(/file not found/);
+    expect((await listChannel('tasks')).filter((f) => f.endsWith('.json'))).toEqual([]);
+  });
+});
+
+// ───────────────────────── A4：pollIpcResult 请求-响应协议 ─────────────────────────
+
+/**
+ * 假主进程应答器：轮询 tasks 通道直到出现指定 type 的请求文件，按上游写回端语义
+ * 原子写 {prefix}_{requestId}.json 结果，并返回读到的请求 payload（供字段断言）。
+ */
+async function respondToRequest(
+  type: string,
+  prefix: string,
+  result: unknown,
+): Promise<Record<string, unknown>> {
+  const dir = path.join(ipcDir, FOLDER, 'tasks');
+  for (let i = 0; i < 400; i++) {
+    let entries: string[] = [];
+    try {
+      entries = await readdir(dir);
+    } catch {
+      /* 尚未创建 */
+    }
+    for (const f of entries.filter((n) => n.endsWith('.json') && !n.includes('_result_'))) {
+      let data: Record<string, unknown>;
+      try {
+        data = JSON.parse(await readFile(path.join(dir, f), 'utf8')) as Record<string, unknown>;
+      } catch {
+        continue;
+      }
+      if (data.type === type) {
+        // 主进程语义：处理完请求后删请求文件 + 原子写回结果文件。
+        await rm(path.join(dir, f), { force: true });
+        const target = path.join(dir, `${prefix}_${String(data.requestId)}.json`);
+        await writeFile(`${target}.tmp`, JSON.stringify(result), 'utf8');
+        await rename(`${target}.tmp`, target);
+        return data;
+      }
+    }
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  throw new Error(`request of type ${type} never appeared`);
+}
+
+describe('IpcToolBridge — pollIpcResult 请求-响应协议（A4）', () => {
+  it('listTasks：写 {type:list_tasks, requestId, groupFolder, isAdminHome} 请求 → 读回执并映射 TaskSummary；result 文件读后删除', async () => {
+    const adminBridge = new IpcToolBridge({
+      ipcDir,
+      memoryDir,
+      chatJid: CHAT_JID,
+      isAdminHome: true,
+      pollIntervalMs: 5,
+      pollTimeoutMs: 2000,
+    });
+    const [tasks, req] = await Promise.all([
+      adminBridge.listTasks(FOLDER),
+      respondToRequest('list_tasks', 'list_tasks_result', {
+        success: true,
+        tasks: [
+          {
+            id: 't-1',
+            groupFolder: FOLDER,
+            prompt: '每日汇报',
+            schedule_type: 'cron',
+            schedule_value: '0 9 * * *',
+            status: 'active',
+            next_run: '2026-06-11T09:00:00.000Z',
+          },
+          { id: 't-2', groupFolder: FOLDER, prompt: '', schedule_type: 'once', schedule_value: 'x', status: 'paused', next_run: null },
+        ],
+      }),
+    ]);
+    // 请求字段对齐上游 list_tasks 工具线格式。
+    expect(req.requestId).toMatch(/^[A-Za-z0-9_-]+$/);
+    expect(req.groupFolder).toBe(FOLDER);
+    expect(req.isAdminHome).toBe(true);
+    expect(typeof req.timestamp).toBe('string');
+    // 回执映射：name ← prompt（缺省回退 id）。
+    expect(tasks).toEqual([
+      { id: 't-1', name: '每日汇报', status: 'active' },
+      { id: 't-2', name: 't-2', status: 'paused' },
+    ]);
+    // result 文件读后删除（不残留）。
+    const leftovers = (await listChannel('tasks')).filter((f) => f.includes('_result_'));
+    expect(leftovers).toEqual([]);
+  });
+
+  it('listTasks：主进程回 success:false → 抛错（不降级，诚实失败）', async () => {
+    const [res] = await Promise.allSettled([
+      bridge.listTasks(FOLDER),
+      respondToRequest('list_tasks', 'list_tasks_result', { success: false, error: 'db locked' }),
+    ]);
+    expect(res.status).toBe('rejected');
+    expect(String((res as PromiseRejectedResult).reason)).toMatch(/Error listing tasks: db locked/);
+  });
+
+  it('installSkill：回执 success + installed 列表透传；请求字段对齐（package/requestId/groupFolder）', async () => {
+    const [r, req] = await Promise.all([
+      bridge.installSkill(FOLDER, 'anthropic/memory'),
+      respondToRequest('install_skill', 'install_skill_result', {
+        success: true,
+        installed: ['memory', 'think'],
+      }),
+    ]);
+    expect(r.installed).toEqual(['memory', 'think']);
+    expect(req.package).toBe('anthropic/memory');
+    expect(req.groupFolder).toBe(FOLDER);
+    expect(req.requestId).toMatch(/^[A-Za-z0-9_-]+$/);
+  });
+
+  it('installSkill：回执 success:false → 抛 Failed to install skill', async () => {
+    const [res] = await Promise.allSettled([
+      bridge.installSkill(FOLDER, 'anthropic/broken'),
+      respondToRequest('install_skill', 'install_skill_result', {
+        success: false,
+        error: 'registry unreachable',
+      }),
+    ]);
+    expect(res.status).toBe('rejected');
+    expect(String((res as PromiseRejectedResult).reason)).toMatch(
+      /Failed to install skill "anthropic\/broken": registry unreachable/,
+    );
+  });
+
+  it('uninstallSkill：回执 success → 正常返回；请求字段对齐（skillId）', async () => {
+    const [, req] = await Promise.all([
+      bridge.uninstallSkill(FOLDER, 'memory'),
+      respondToRequest('uninstall_skill', 'uninstall_skill_result', { success: true }),
+    ]);
+    expect(req.skillId).toBe('memory');
+    expect(req.groupFolder).toBe(FOLDER);
+  });
+});
+
+describe('IpcToolBridge — discord_*（A4）', () => {
+  const DISCORD_JID = 'discord:123456789012345678';
+
+  function discordBridge(): IpcToolBridge {
+    return new IpcToolBridge({
+      ipcDir,
+      memoryDir,
+      chatJid: DISCORD_JID,
+      pollIntervalMs: 5,
+      pollTimeoutMs: 2000,
+    });
+  }
+
+  it('非 discord 聊天 → 三个工具都抛 only works in Discord channels（不写请求）', async () => {
+    await expect(bridge.discordGetHistory(FOLDER)).rejects.toThrow(
+      /discord_get_history only works in Discord channels\. Current chat: web:home-test/,
+    );
+    await expect(bridge.discordGetChannelInfo(FOLDER)).rejects.toThrow(
+      /discord_get_channel_info only works in Discord channels/,
+    );
+    await expect(bridge.discordGetServerInfo(FOLDER)).rejects.toThrow(
+      /discord_get_server_info only works in Discord channels/,
+    );
+    expect((await listChannel('tasks')).filter((f) => f.endsWith('.json'))).toEqual([]);
+  });
+
+  it('discordGetHistory：请求字段对齐（chatJid/limit/before/requestId）+ 回执 messages 透传', async () => {
+    const msg = {
+      id: '111111111111111111',
+      authorName: 'alice',
+      authorBot: false,
+      content: 'hi there',
+      timestamp: '2026-06-10T00:00:00.000Z',
+      attachments: [],
+      edited: false,
+    };
+    const [messages, req] = await Promise.all([
+      discordBridge().discordGetHistory(FOLDER, { limit: 25, before: '222222222222222222' }),
+      respondToRequest('discord_get_history', 'discord_get_history_result', {
+        success: true,
+        messages: [msg],
+      }),
+    ]);
+    expect(messages).toEqual([msg]);
+    expect(req.chatJid).toBe(DISCORD_JID);
+    expect(req.limit).toBe(25);
+    expect(req.before).toBe('222222222222222222');
+    expect(req.requestId).toMatch(/^[A-Za-z0-9_-]+$/);
+  });
+
+  it('discordGetHistory：回执 success:false → 抛 Error fetching Discord history', async () => {
+    const [res] = await Promise.allSettled([
+      discordBridge().discordGetHistory(FOLDER),
+      respondToRequest('discord_get_history', 'discord_get_history_result', {
+        success: false,
+        error: 'channel not cached',
+      }),
+    ]);
+    expect(res.status).toBe('rejected');
+    expect(String((res as PromiseRejectedResult).reason)).toMatch(
+      /Error fetching Discord history: channel not cached/,
+    );
+  });
+
+  it('discordGetChannelInfo / discordGetServerInfo：回执 channel/guild 透传；guild 缺省 → null（DM）', async () => {
+    const [channel] = await Promise.all([
+      discordBridge().discordGetChannelInfo(FOLDER),
+      respondToRequest('discord_get_channel_info', 'discord_get_channel_info_result', {
+        success: true,
+        channel: { name: 'general', type: 'guild_text' },
+      }),
+    ]);
+    expect(channel).toEqual({ name: 'general', type: 'guild_text' });
+
+    const [guild] = await Promise.all([
+      discordBridge().discordGetServerInfo(FOLDER),
+      respondToRequest('discord_get_server_info', 'discord_get_server_info_result', {
+        success: true,
+        guild: null,
+      }),
+    ]);
+    expect(guild).toBeNull();
+  });
+
+  it('setChatJid 就地切换当前聊天（对齐上游 sourceJid 变更语义）：web → discord 后工具可用', async () => {
+    const b = new IpcToolBridge({
+      ipcDir,
+      memoryDir,
+      chatJid: CHAT_JID, // 初始 web
+      pollIntervalMs: 5,
+      pollTimeoutMs: 2000,
+    });
+    await expect(b.discordGetChannelInfo(FOLDER)).rejects.toThrow(/only works in Discord channels/);
+    b.setChatJid(DISCORD_JID);
+    const [channel, req] = await Promise.all([
+      b.discordGetChannelInfo(FOLDER),
+      respondToRequest('discord_get_channel_info', 'discord_get_channel_info_result', {
+        success: true,
+        channel: { name: 'switched' },
+      }),
+    ]);
+    expect(channel).toEqual({ name: 'switched' });
+    expect(req.chatJid).toBe(DISCORD_JID);
   });
 });

@@ -8,6 +8,9 @@ import type {
   ScheduleTaskInput,
   TaskSummary,
   MemoryHit,
+  SendImageResult,
+  DiscordHistoryOptions,
+  DiscordHistoryMessage,
 } from '../../src/runtime/tools/types.js';
 
 export interface RecordedCall {
@@ -23,6 +26,15 @@ export class FakeToolBridge implements ToolBridge {
   memoryHits: MemoryHit[] = [];
   memoryValue: string | null = 'remembered-value';
   nextTaskId = 'task_fake_1';
+  sendImageResult: SendImageResult = {
+    fileName: 'chart.png',
+    mimeType: 'image/png',
+    sizeBytes: 2048,
+  };
+  installedSkills: string[] = [];
+  discordMessages: DiscordHistoryMessage[] = [];
+  discordChannel: unknown = { name: 'general', type: 'guild_text' };
+  discordGuild: unknown | null = { name: 'My Server', memberCount: 5 };
 
   private record(op: string, ...args: unknown[]): void {
     this.calls.push({ op, args });
@@ -38,6 +50,13 @@ export class FakeToolBridge implements ToolBridge {
 
   async sendMessage(folder: string, message: string): Promise<void> {
     this.record('sendMessage', folder, message);
+  }
+  async sendImage(folder: string, filePath: string, caption?: string): Promise<SendImageResult> {
+    this.record('sendImage', folder, filePath, caption);
+    return this.sendImageResult;
+  }
+  async sendFile(folder: string, filePath: string, fileName: string): Promise<void> {
+    this.record('sendFile', folder, filePath, fileName);
   }
   async scheduleTask(folder: string, input: ScheduleTaskInput): Promise<{ taskId: string }> {
     this.record('scheduleTask', folder, input);
@@ -59,8 +78,9 @@ export class FakeToolBridge implements ToolBridge {
   async registerGroup(folder: string, jid: string, name?: string): Promise<void> {
     this.record('registerGroup', folder, jid, name);
   }
-  async installSkill(folder: string, name: string): Promise<void> {
+  async installSkill(folder: string, name: string): Promise<{ installed?: string[] }> {
     this.record('installSkill', folder, name);
+    return { installed: this.installedSkills };
   }
   async uninstallSkill(folder: string, name: string): Promise<void> {
     this.record('uninstallSkill', folder, name);
@@ -75,5 +95,20 @@ export class FakeToolBridge implements ToolBridge {
   async memoryGet(folder: string, path: string): Promise<string | null> {
     this.record('memoryGet', folder, path);
     return this.memoryValue;
+  }
+  async discordGetHistory(
+    folder: string,
+    opts?: DiscordHistoryOptions,
+  ): Promise<DiscordHistoryMessage[]> {
+    this.record('discordGetHistory', folder, opts);
+    return this.discordMessages;
+  }
+  async discordGetChannelInfo(folder: string): Promise<unknown> {
+    this.record('discordGetChannelInfo', folder);
+    return this.discordChannel;
+  }
+  async discordGetServerInfo(folder: string): Promise<unknown | null> {
+    this.record('discordGetServerInfo', folder);
+    return this.discordGuild;
   }
 }

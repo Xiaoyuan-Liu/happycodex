@@ -151,7 +151,7 @@ export interface ThreadStartParams {
   baseInstructions?: string | null;
   developerInstructions?: string | null;
   ephemeral?: boolean | null;
-  /** 实验：客户端代理执行的自定义工具 schema（对应 HappyClaw 的 12 个 MCP 工具，R3 路 A）。 */
+  /** 实验：客户端代理执行的自定义工具 schema（对应 HappyClaw 的 17 个 MCP 工具，R3 路 A）。 */
   dynamicTools?: DynamicToolSpec[] | null;
   config?: Record<string, unknown> | null;
 }
