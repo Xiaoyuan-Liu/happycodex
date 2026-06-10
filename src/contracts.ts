@@ -151,6 +151,16 @@ export interface CodexRunnerInput {
   prompt: string;
   groupFolder: string;
   session: ThreadSessionConfig;
+  /**
+   * 当前会话 chat JID（主仓 ContainerInput.chatJid）。
+   * IPC 工具的路由来源：send_message 的 `chatJid`、schedule_task 的 `targetJid`
+   * 都从这里取——缺失时这两个工具无法投递（bridge 抛错，模型得到诚实失败）。
+   */
+  chatJid?: string;
+  /** 定时任务运行标记（主仓 ContainerInput.isScheduledTask）；send_message IPC 据此 stamp。 */
+  isScheduledTask?: boolean;
+  /** 触发本轮的定时任务 id（主仓 ContainerInput.messageTaskId）；send_message IPC 据此 stamp taskId。 */
+  messageTaskId?: string;
 }
 
 /**

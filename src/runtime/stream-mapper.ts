@@ -23,8 +23,9 @@ import {
   type ReasoningTextDeltaNotification,
   type ThreadItem,
   type ThreadStartedNotification,
+  type ThreadStatusChangedNotification,
+  type ThreadTokenUsageUpdatedNotification,
   type TurnCompletedNotification,
-  type TurnStartedNotification,
 } from '../appserver/protocol.js';
 import type { IStreamMapper } from '../contracts.js';
 import type { StreamEvent } from '../shared/stream-event.js';
@@ -141,18 +142,14 @@ export class StreamMapper implements IStreamMapper {
         ];
       }
 
-      case ServerNotif.turnStarted: {
-        const n = p as unknown as TurnStartedNotification;
-        return [
-          {
-            eventType: 'task_start',
-            turnId: n.turn?.id,
-            // threadId 透传：子代理 thread 的 turn 事件靠它被 decorateScope 标为 subagent，
-            // 否则信封层会把子代理 turn 误判为主线程终态（过早 success + 清累积正文）。
-            ...(n.threadId ? { threadId: n.threadId } : {}),
-          },
-        ];
-      }
+      // 契约对齐（W2 线报①）：上游 task_start 语义 = Claude SDK Task（子代理）启动；
+      // codex 的 turn/started 只是主线程轮次边界，若映射成 task_start 会让前端每轮
+      // 推一条「Task 启动」噪声 trace/时间线。轮次生命周期由 session 层直接消费原始
+      // 通知（registerTurnStart，见 session.handleNotification），子代理面板由
+      // tool_use_start(collabAgentToolCall) 驱动，turn 终态仍走 turnCompleted→result，
+      // 故此处不产任何事件。task_start 仍保留在冻结契约中（上游兼容；codex 侧无生产者）。
+      case ServerNotif.turnStarted:
+        return [];
 
       case ServerNotif.turnCompleted: {
         const n = p as unknown as TurnCompletedNotification;
@@ -167,19 +164,34 @@ export class StreamMapper implements IStreamMapper {
       }
 
       case ServerNotif.threadStatusChanged: {
+        const n = p as unknown as Partial<ThreadStatusChangedNotification>;
         return [
           {
             eventType: 'status',
-            statusText: stringifyStatus((p as { status?: unknown }).status),
+            // ThreadStatus 是 tagged union：notLoaded | idle | systemError | active。
+            // 'idle' 是上游前端清流式残留的关键信号（W2 线报②），按 .type 字符串化透传。
+            statusText: stringifyStatus(n.status),
+            // threadId 透传：decorateScope 据此把子代理 thread 的 status（含 idle）标
+            // subagent，避免子代理空闲被消费端误当主会话 idle 提前清掉流式 UI。
+            ...(n.threadId ? { threadId: n.threadId } : {}),
           },
         ];
       }
 
       case ServerNotif.threadTokenUsageUpdated: {
+        const n = p as unknown as Partial<ThreadTokenUsageUpdatedNotification>;
         return [
           {
             eventType: 'usage',
-            usage: p,
+            // 契约对齐（W2 线报③）：归一化成上游 shared/stream-event.ts 的结构化 usage
+            // 形状（inputTokens/outputTokens/cacheReadInputTokens/...），前端
+            // （chat store ⑤.5 usage → token_usage）与主进程（readStreamUsage →
+            // usage_records/billing）直接消费，不再透传 codex 原始通知形状。
+            usage: normalizeTokenUsage(n.tokenUsage),
+            // turnId/threadId 透传：turnId 供前端按 turn 绑定 token_usage 到对应回复；
+            // threadId 供 decorateScope 标注子代理用量（计费仍全量累加，不按 scope 过滤）。
+            ...(n.turnId ? { turnId: n.turnId } : {}),
+            ...(n.threadId ? { threadId: n.threadId } : {}),
           },
         ];
       }
@@ -293,6 +305,42 @@ export function mapTurnStatus(status: unknown): 'completed' | 'interrupted' | 'f
   }
 }
 
+/**
+ * thread/tokenUsage/updated 的 tokenUsage → 上游结构化 usage 形状（W2 线报③）。
+ *
+ * token 取 tokenUsage.last（最近一次模型调用的**增量**）而非 total（线程累计）：
+ * codex 一轮内可发多次 usage 通知，下游 usage_records/billing 是增量累加语义，
+ * 取 total 会按累计值重复计数；各事件 last 之和 ≈ 本轮总量，与上游「每轮一条
+ * usage」的累加结果对齐（与 index.ts readStreamUsage 既有决策同口径）。
+ * cacheReadInputTokens ← last.cachedInputTokens（字段名归一）；
+ * cacheCreationInputTokens/costUSD/durationMs/numTurns 无 codex 数据源
+ * （billing token-only 决策，costUSD 恒 0），恒 0。
+ * 防御：tokenUsage/last 缺失或字段非有限数字时各项回退 0（不抛）。
+ */
+export function normalizeTokenUsage(tokenUsage: unknown): {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadInputTokens: number;
+  cacheCreationInputTokens: number;
+  costUSD: number;
+  durationMs: number;
+  numTurns: number;
+} {
+  const last =
+    typeof tokenUsage === 'object' && tokenUsage !== null
+      ? (tokenUsage as Record<string, unknown>)['last']
+      : undefined;
+  return {
+    inputTokens: readNum(last, 'inputTokens'),
+    outputTokens: readNum(last, 'outputTokens'),
+    cacheReadInputTokens: readNum(last, 'cachedInputTokens'),
+    cacheCreationInputTokens: 0,
+    costUSD: 0,
+    durationMs: 0,
+    numTurns: 0,
+  };
+}
+
 /** thread/status/changed 的 status 字符串化：tagged object 取 .type，否则 String()。 */
 export function stringifyStatus(status: unknown): string {
   if (status == null) return '';
@@ -334,6 +382,12 @@ function isNotableHook(eventName: string, status: string): boolean {
 function readString(obj: unknown, key: string): string {
   const v = (obj as Record<string, unknown> | null | undefined)?.[key];
   return typeof v === 'string' ? v : '';
+}
+
+function readNum(obj: unknown, key: string): number {
+  if (typeof obj !== 'object' || obj === null) return 0;
+  const v = (obj as Record<string, unknown>)[key];
+  return typeof v === 'number' && Number.isFinite(v) ? v : 0;
 }
 
 function truncate(s: string, max: number): string {

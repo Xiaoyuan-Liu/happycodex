@@ -37,6 +37,10 @@ rm -rf upstream-happyclaw && mkdir upstream-happyclaw && \
 | `src/stream-event.types.ts`（eventType/agentScope/statusText） | `src/shared/stream-event.ts`（type/scope/status） | StreamEvent；接主仓时对齐字段/marker |
 | 主进程 IPC 消费（`index.ts` handleIpcTask 等） | `src/runtime/tools/ipc-bridge.ts` | 12 工具协议，需逐一对齐 |
 | sessions 表 / `db.ts` | A 阶段映射 thread_id→session_id | `provider_id` 列作废 |
+| `src/claude-context-resolver.ts`（CLAUDE.md/rules/skills symlink+挂载计划） | `src/claude-context-resolver.ts`（同名 codex 版） | 三通道替换：用户/全局→CODEX_HOME/AGENTS.md 物化；项目→config.toml project_doc_fallback_filenames=["CLAUDE.md"] 零拷贝直读；会话动态→ContainerInput.developerInstructions。CLAUDE.md 只读数据源不回写 |
+| `src/index.ts`（主进程 10k 行编排） | `src/index.ts`（忠实裁剪搬迁） | Claude 触点替换：`.claude` 会话清理→session-files.clearSessionFiles（SessionStore+CODEX_HOME）；summarizeWithClaude→summarizeWithCodex（sdkQuery=codex exec 真实现）；feedStreamEventToCard/usage/Task 持久化对齐冻结 StreamEvent 契约（parentToolUseId→agentScope、sessionId→threadId、Task 工具→collabAgentToolCall、usage 经 readStreamUsage 窄化取 tokenUsage.last 增量）；provider-switch 分支与 registerProcess.selectedProviderId 随 failover 作废删除；plugin-importer→A5 stub |
+| `src/sdk-query.ts`（Claude SDK 一次性问答） | `src/sdk-query.ts`（codex exec --ephemeral 真版） | --output-last-message + stdin prompt + 共享 CODEX_HOME；失败/超时恒 null（调用方降级语义不变） |
+| `src/task-routing.ts` / `config/*.json|*.md` | 逐字 port | task-routing 纯函数 + default-groups/mount-allowlist/global-claude-md.template（用户维度数据源） |
 
 ## 迁移水位线 / 台账
 

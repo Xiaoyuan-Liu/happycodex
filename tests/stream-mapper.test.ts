@@ -11,6 +11,7 @@ import {
   extractToolName,
   extractToolOk,
   mapTurnStatus,
+  normalizeTokenUsage,
   stringifyStatus,
 } from '../src/runtime/stream-mapper.js';
 import type { StreamEvent } from '../src/shared/stream-event.js';
@@ -223,12 +224,22 @@ describe('StreamMapper — thread / turn lifecycle', () => {
     expect(out).toEqual([{ eventType: 'init', threadId: 'th_42' }]);
   });
 
-  it('turn/started → task_start', () => {
+  it('turn/started → []（W2 ①：上游 task_start=SDK Task 启动，codex 轮次边界不产事件）', () => {
     const out = map(ServerNotif.turnStarted, {
       threadId: 'th',
       turn: { id: 'tn_7', status: 'inProgress' },
     });
-    expect(out).toEqual([{ eventType: 'task_start', turnId: 'tn_7', threadId: 'th' }]);
+    expect(out).toEqual([]);
+  });
+
+  it('turn/started 不产 task_start（防回归：每轮一条「Task 启动」噪声 trace）', () => {
+    const main = map(ServerNotif.turnStarted, { threadId: 'th_main', turn: { id: 't1' } });
+    const child = map(ServerNotif.turnStarted, { threadId: 'th_child', turn: { id: 't2' } });
+    const bare = map(ServerNotif.turnStarted, { turn: { id: 't3' } });
+    for (const out of [main, child, bare]) {
+      expect(out.some((e) => e.eventType === 'task_start')).toBe(false);
+      expect(out).toEqual([]);
+    }
   });
 
   it('turn/completed status=completed → result completed', () => {
@@ -257,25 +268,94 @@ describe('StreamMapper — thread / turn lifecycle', () => {
 });
 
 describe('StreamMapper — status / usage', () => {
-  it('thread/status/changed → status，tagged object 取 .type', () => {
+  it('thread/status/changed → status，tagged object 取 .type，threadId 透传', () => {
     const out = map(ServerNotif.threadStatusChanged, {
       threadId: 'th',
       status: { type: 'active', activeFlags: ['turn'] },
     });
-    expect(out).toEqual([{ eventType: 'status', statusText: 'active' }]);
+    expect(out).toEqual([{ eventType: 'status', statusText: 'active', threadId: 'th' }]);
   });
 
-  it('thread/status/changed status=idle', () => {
+  it('thread/status/changed status=idle（W2 ②：上游前端清流式残留的关键信号）', () => {
     const out = map(ServerNotif.threadStatusChanged, { threadId: 'th', status: { type: 'idle' } });
-    expect(out[0]).toMatchObject({ eventType: 'status', statusText: 'idle' });
+    expect(out).toEqual([{ eventType: 'status', statusText: 'idle', threadId: 'th' }]);
   });
 
-  it('thread/tokenUsage/updated → usage，透传 params', () => {
-    const params = { threadId: 'th', turnId: 'tn', tokenUsage: { total: { input: 10 } } };
-    const out = map(ServerNotif.threadTokenUsageUpdated, params);
-    expect(out).toHaveLength(1);
-    expect(out[0]?.eventType).toBe('usage');
-    expect(out[0]?.usage).toEqual(params);
+  it('thread/status/changed 透传 threadId（W2 ②：decorateScope 标注子代理 idle 的前提）', () => {
+    const out = map(ServerNotif.threadStatusChanged, {
+      threadId: 'th_child',
+      status: { type: 'idle' },
+    });
+    expect(out[0]?.threadId).toBe('th_child');
+  });
+
+  it('thread/status/changed 缺 threadId 时不附该字段（防御）', () => {
+    const out = map(ServerNotif.threadStatusChanged, { status: { type: 'systemError' } });
+    expect(out).toEqual([{ eventType: 'status', statusText: 'systemError' }]);
+  });
+
+  it('thread/tokenUsage/updated → usage 归一化为上游结构化形状（W2 ③）', () => {
+    const out = map(ServerNotif.threadTokenUsageUpdated, {
+      threadId: 'th',
+      turnId: 'tn',
+      tokenUsage: {
+        total: { totalTokens: 999, inputTokens: 900, cachedInputTokens: 50, outputTokens: 99, reasoningOutputTokens: 9 },
+        last: { totalTokens: 130, inputTokens: 100, cachedInputTokens: 20, outputTokens: 30, reasoningOutputTokens: 5 },
+        modelContextWindow: 272000,
+      },
+    });
+    expect(out).toEqual([
+      {
+        eventType: 'usage',
+        usage: {
+          // token 取 last（增量）而非 total（线程累计）：billing/usage_records 累加语义。
+          inputTokens: 100,
+          outputTokens: 30,
+          // 字段名归一：codex cachedInputTokens → 上游 cacheReadInputTokens。
+          cacheReadInputTokens: 20,
+          // 无 codex 数据源（billing token-only：costUSD 恒 0）。
+          cacheCreationInputTokens: 0,
+          costUSD: 0,
+          durationMs: 0,
+          numTurns: 0,
+        },
+        turnId: 'tn',
+        threadId: 'th',
+      },
+    ]);
+  });
+
+  it('thread/tokenUsage/updated 缺 tokenUsage/last 时各项回退 0（防御，不抛）', () => {
+    const noTokenUsage = map(ServerNotif.threadTokenUsageUpdated, { threadId: 'th', turnId: 'tn' });
+    expect(noTokenUsage[0]?.usage).toEqual({
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadInputTokens: 0,
+      cacheCreationInputTokens: 0,
+      costUSD: 0,
+      durationMs: 0,
+      numTurns: 0,
+    });
+
+    const totalOnly = map(ServerNotif.threadTokenUsageUpdated, {
+      threadId: 'th',
+      tokenUsage: { total: { inputTokens: 10, outputTokens: 5 } },
+    });
+    // 只认 last（增量），total-only 不回退到累计值（避免重复计数）。
+    expect(totalOnly[0]?.usage).toMatchObject({ inputTokens: 0, outputTokens: 0 });
+  });
+
+  it('thread/tokenUsage/updated 透传 turnId/threadId（前端按 turn 绑定 token_usage）', () => {
+    const out = map(ServerNotif.threadTokenUsageUpdated, {
+      threadId: 'th_x',
+      turnId: 'tn_x',
+      tokenUsage: {
+        total: { totalTokens: 1, inputTokens: 1, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0 },
+        last: { totalTokens: 1, inputTokens: 1, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0 },
+        modelContextWindow: null,
+      },
+    });
+    expect(out[0]).toMatchObject({ eventType: 'usage', turnId: 'tn_x', threadId: 'th_x' });
   });
 });
 
@@ -468,6 +548,36 @@ describe('helper 函数', () => {
     expect(stringifyStatus(null)).toBe('');
     expect(stringifyStatus(undefined)).toBe('');
     expect(stringifyStatus(42)).toBe('42');
+  });
+
+  it('normalizeTokenUsage：last 增量 + 字段名归一 + 缺省回退 0', () => {
+    expect(
+      normalizeTokenUsage({
+        total: { totalTokens: 200, inputTokens: 150, cachedInputTokens: 40, outputTokens: 50, reasoningOutputTokens: 10 },
+        last: { totalTokens: 42, inputTokens: 30, cachedInputTokens: 8, outputTokens: 12, reasoningOutputTokens: 2 },
+        modelContextWindow: 128000,
+      }),
+    ).toEqual({
+      inputTokens: 30,
+      outputTokens: 12,
+      cacheReadInputTokens: 8,
+      cacheCreationInputTokens: 0,
+      costUSD: 0,
+      durationMs: 0,
+      numTurns: 0,
+    });
+    // 防御：非对象 / null / 字段非数字 → 全 0。
+    for (const bad of [undefined, null, 'x', 42, { last: { inputTokens: 'NaN-ish' } }]) {
+      expect(normalizeTokenUsage(bad)).toEqual({
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadInputTokens: 0,
+        cacheCreationInputTokens: 0,
+        costUSD: 0,
+        durationMs: 0,
+        numTurns: 0,
+      });
+    }
   });
 
   it('extractHookEventName / extractHookStatus 容错', () => {

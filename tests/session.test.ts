@@ -162,7 +162,29 @@ describe('ThreadSession.start', () => {
     expect(client.lastMethod()).toBe('thread/resume');
     const params = client.requests[0]!.params as Record<string, unknown>;
     expect(params.threadId).toBe('th_resumed');
+    // 未配置 developerInstructions 时不带覆盖键（沿用 thread 既有配置）
+    expect('developerInstructions' in params).toBe(false);
     expect(session.state.threadId).toBe('th_resumed');
+  });
+
+  it('resume + developerInstructions → 作为配置覆盖随 thread/resume 透传（会话动态上下文刷新）', async () => {
+    const client = new FakeAppServerClient();
+    client.responses['thread/resume'] = {
+      thread: { id: 'th_resumed', sessionId: 'sess_r', path: null },
+    };
+    const session = new ThreadSession(client, {
+      resumeThreadId: 'th_resumed',
+      developerInstructions: '<happycodex-session-context>fresh</happycodex-session-context>',
+    });
+
+    await session.start();
+
+    expect(client.lastMethod()).toBe('thread/resume');
+    const params = client.requests[0]!.params as Record<string, unknown>;
+    expect(params.threadId).toBe('th_resumed');
+    expect(params.developerInstructions).toBe(
+      '<happycodex-session-context>fresh</happycodex-session-context>',
+    );
   });
 
   it('thread/started 通知也能兜底吸收 thread 标识', async () => {
@@ -530,6 +552,28 @@ describe('ThreadSession B2 子代理 agentScope 注入', () => {
       },
     });
     expect(session.decorateScope({ eventType: 'text_delta', threadId: 'th_child2' }).agentScope).toBe('subagent');
+  });
+
+  it('W2 ②：子代理 thread 的 thread/status/changed idle → statusText:idle + agentScope:subagent（真实 mapper 端到端）', async () => {
+    const client = new FakeAppServerClient();
+    client.responses['thread/start'] = { thread: { id: 'th_main', sessionId: 's', path: null } };
+    const session = new ThreadSession(client, {}); // 默认真实 StreamMapper
+    await session.start();
+    const events: StreamEvent[] = [];
+    session.onStreamEvent((ev) => events.push(ev));
+
+    // 登记子代理 thread（collabAgentToolCall item）。
+    client.emit('item/started', collabNote(['th_child']));
+
+    // 子代理空闲：idle 被标 subagent —— Web/web.ts 消费端据此不清主会话流式 UI。
+    client.emit('thread/status/changed', { threadId: 'th_child', status: { type: 'idle' } });
+    const childIdle = events.find((e) => e.eventType === 'status' && e.statusText === 'idle');
+    expect(childIdle).toMatchObject({ agentScope: 'subagent', threadId: 'th_child' });
+
+    // 主线程空闲 → main（前端 status/idle 清流式残留的合法信号）。
+    client.emit('thread/status/changed', { threadId: 'th_main', status: { type: 'idle' } });
+    const idles = events.filter((e) => e.eventType === 'status' && e.statusText === 'idle');
+    expect(idles.at(-1)).toMatchObject({ agentScope: 'main', threadId: 'th_main' });
   });
 
   it('subagentType 从 prompt 解析（命中已知 agent 名）→ 注入到 agentScope:subagent 事件', async () => {

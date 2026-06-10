@@ -9,6 +9,8 @@
  *   - happycodex 契约（src/shared/stream-event.ts，后端实际产出）：
  *     eventType: init / text_delta / thinking_delta / tool_use_start / tool_use_end /
  *               tool_progress / task_start / status / usage / result / compact_partial
+ *     （task_start 在契约中保留但 codex 侧当前无生产者——W2 ①：turn/started 不再
+ *       映射成 task_start；子代理生命周期走 tool_use_start/end(collabAgentToolCall)。）
  *     扩展字段: ok / subtype / threadId / sourceKind / compactReason
  *   - 上游遗留成员（codex 后端暂不产出，保留供 UI 降级——chat store 等消费端分支
  *     代码原样保留，事件不出现即不触发）：
@@ -156,8 +158,9 @@ export interface StreamEvent {
   contextAudit?: ClaudeContextAudit;
   todos?: Array<{ id: string; content: string; status: 'pending' | 'in_progress' | 'completed' }>;
   /** Token usage data emitted at query completion.
-   *  happycodex 后端为 codex thread/tokenUsage/updated 的透传（字段不保证齐全），
-   *  消费端字段均按可缺省处理。 */
+   *  happycodex 后端已在 stream-mapper 归一化为上游结构化形状（W2 ③）：
+   *  token 取 codex tokenUsage.last 增量、costUSD 恒 0（billing token-only）、
+   *  cacheCreation/durationMs/numTurns 无数据源恒 0；消费端字段仍按可缺省防御处理。 */
   usage?: {
     inputTokens?: number;
     outputTokens?: number;

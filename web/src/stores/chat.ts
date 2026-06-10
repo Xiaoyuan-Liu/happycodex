@@ -1975,6 +1975,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // 与 waiting，避免 spinner/思考动画永久残留。那些 send_message 已作为独立 new_message
     // 在消息列表中，无需保留 streaming 富内容。
     if (event.eventType === 'status' && event.statusText === 'idle') {
+      // happycodex（W2 ②）：仅主会话 idle 清流式残留。子代理 thread 的
+      // thread/status/changed idle（携 threadId → 后端 decorateScope 标 subagent）
+      // 在主轮仍在飞时到达，直接忽略，避免提前清掉 waiting/streaming。
+      if (event.agentScope === 'subagent') return;
       const mainKey = `main:${chatJid}`;
       const pendingEntry = pendingDeltas.get(mainKey);
       if (pendingEntry) {

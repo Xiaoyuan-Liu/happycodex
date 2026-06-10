@@ -291,6 +291,12 @@ export interface ThreadResumeParams {
   threadId: string;
   /** [UNSTABLE] 直接按 rollout 路径恢复；非运行线程 path 优先于 threadId。 */
   path?: string;
+  /**
+   * resume 时的配置覆盖（生成产物 ThreadResumeParams 支持，见 protocol/ts/v2/ThreadResumeParams.ts）。
+   * context-resolver 的会话动态上下文（developerInstructions）每次会话都重新生成，
+   * resume 已有 thread 时经此覆盖刷新（否则沿用 start 时的陈旧值）。
+   */
+  developerInstructions?: string | null;
 }
 
 /** thread/fork 参数子集（B2 子代理 fork 包装；完整见 protocol/ts/v2/ThreadForkParams.ts）。
@@ -451,9 +457,36 @@ export interface ItemCompletedNotification {
   completedAtMs: number;
 }
 
+/** thread/status/changed（对齐 protocol/ts/v2/ThreadStatusChangedNotification.ts）。
+ *  status 为 tagged union（ThreadStatus）：notLoaded | idle | systemError |
+ *  active（含 activeFlags）——此处放宽为 type 子集，消费端只读 .type。 */
+export interface ThreadStatusChangedNotification {
+  threadId: string;
+  status: { type: string; [k: string]: unknown };
+}
+
+/** 单次/累计 token 计数明细（对齐 protocol/ts/v2/TokenUsageBreakdown.ts）。 */
+export interface TokenUsageBreakdown {
+  totalTokens: number;
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  reasoningOutputTokens: number;
+}
+
+/** 线程 token 用量（对齐 protocol/ts/v2/ThreadTokenUsage.ts）。
+ *  total=线程累计；last=最近一次模型调用的增量（billing/usage_records 的累加数据源）。 */
+export interface ThreadTokenUsage {
+  total: TokenUsageBreakdown;
+  last: TokenUsageBreakdown;
+  modelContextWindow: number | null;
+}
+
+/** thread/tokenUsage/updated（对齐 protocol/ts/v2/ThreadTokenUsageUpdatedNotification.ts）。 */
 export interface ThreadTokenUsageUpdatedNotification {
   threadId: string;
-  [k: string]: unknown;
+  turnId: string;
+  tokenUsage: ThreadTokenUsage;
 }
 
 // ───────────────────────── B1：上下文压缩（context compaction）─────────────────────────

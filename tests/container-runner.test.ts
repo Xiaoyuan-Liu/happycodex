@@ -280,6 +280,76 @@ describe('runHostAgent（host 模式 spawn，fake runner）', () => {
   });
 });
 
+// ─── context-resolver 接线（host spawn 路径） ────────────────────────
+
+describe('context-resolver 接线（runHostAgent）', () => {
+  test('AGENTS.md 物化 + config.toml fallback 键 + developerInstructions 注入', async () => {
+    const folder = 'hg-ctx';
+    // user-global 记忆源（makeGroup created_by=u1, is_home=true → 注入 AGENTS.md）
+    const userGlobalMd = path.join(GROUPS_DIR, 'user-global', 'u1', 'CLAUDE.md');
+    fs.mkdirSync(path.dirname(userGlobalMd), { recursive: true });
+    fs.writeFileSync(userGlobalMd, '# u1 全局记忆\n偏好X\n');
+
+    const { dump } = await runHostWithDump(makeGroup(folder), makeInput(folder));
+
+    // ③ 会话动态上下文经 ContainerInput.developerInstructions 透传链到达 runner stdin
+    const devIns = dump.stdin?.developerInstructions;
+    expect(typeof devIns).toBe('string');
+    expect(devIns).toContain('<happycodex-session-context>');
+    expect(devIns).toContain(`folder: ${folder}`);
+
+    // ① 用户/全局维度 → per-folder CODEX_HOME/AGENTS.md（marker + 内容）
+    const codexHome = path.join(DATA_DIR, 'sessions', folder, '.codex');
+    const agentsMd = fs.readFileSync(path.join(codexHome, 'AGENTS.md'), 'utf8');
+    expect(agentsMd).toContain('happycodex:generated');
+    expect(agentsMd).toContain('# u1 全局记忆');
+
+    // ② 项目维度 → config.toml 顶层 project_doc_fallback_filenames=["CLAUDE.md"]
+    const configToml = fs.readFileSync(path.join(codexHome, 'config.toml'), 'utf8');
+    expect(configToml).toMatch(/^project_doc_fallback_filenames = \["CLAUDE\.md"\]/m);
+
+    // 红线：群组工作区 CLAUDE.md 本体不被生成/改写（源文件原样）
+    expect(fs.readFileSync(userGlobalMd, 'utf8')).toBe('# u1 全局记忆\n偏好X\n');
+    expect(fs.existsSync(path.join(GROUPS_DIR, folder, 'CLAUDE.md'))).toBe(false);
+  });
+
+  test('调用方预置 developerInstructions：保留并前置，动态会话段追加在后', async () => {
+    const folder = 'hg-ctx-preset';
+    const input = makeInput(folder, { developerInstructions: '调用方预置段' });
+    const { dump } = await runHostWithDump(makeGroup(folder), input);
+
+    const devIns = dump.stdin?.developerInstructions as string;
+    expect(devIns.startsWith('调用方预置段')).toBe(true);
+    const presetIdx = devIns.indexOf('调用方预置段');
+    const dynamicIdx = devIns.indexOf('<happycodex-session-context>');
+    expect(dynamicIdx).toBeGreaterThan(presetIdx);
+  });
+
+  test('mcpServers 接线点：loadUserMcpServers(ownerId) → per-folder config.toml [mcp_servers.*]', async () => {
+    const folder = 'hg-ctx-mcp';
+    const serversFile = path.join(DATA_DIR, 'mcp-servers', 'u1', 'servers.json');
+    fs.mkdirSync(path.dirname(serversFile), { recursive: true });
+    fs.writeFileSync(
+      serversFile,
+      JSON.stringify({
+        servers: {
+          echo: { enabled: true, command: 'echo', args: ['hi'] },
+          off: { enabled: false, command: 'never' },
+        },
+      }),
+    );
+
+    await runHostWithDump(makeGroup(folder), makeInput(folder));
+
+    const configToml = fs.readFileSync(
+      path.join(DATA_DIR, 'sessions', folder, '.codex', 'config.toml'),
+      'utf8',
+    );
+    expect(configToml).toContain('[mcp_servers.echo]');
+    expect(configToml).not.toContain('[mcp_servers.off]');
+  });
+});
+
 // ─── provisionCodexHome ──────────────────────────────────────────────
 
 describe('provisionCodexHome', () => {

@@ -19,6 +19,9 @@
  *   eventType 取值（对照上游 StreamEventType 的实际取值集合）：
  *     对齐上游：init / text_delta / thinking_delta / tool_use_start / tool_use_end /
  *               tool_progress / task_start / status / usage
+ *     （task_start 语义=上游 SDK Task（子代理）启动；codex 侧当前**无生产者**——
+ *       turn/started 只是轮次边界、不映射成 task_start（W2 线报①），子代理生命周期走
+ *       tool_use_start/end(collabAgentToolCall)。成员保留供上游消费端兼容。）
  *     happycodex 扩展（上游无）：result（turn 终态）、compact_partial（压缩局部摘要；
  *               上游的 compact_boundary 语义不同——只标边界、不携带 flush 文本，故不映射）
  *
@@ -66,7 +69,10 @@ export interface StreamEvent {
   /** status 事件：线程/turn 状态文本（对齐上游 statusText）。 */
   statusText?: string;
 
-  /** usage 事件：token 用量（结构透传，不强约束；上游为结构化 usage，此处保持宽松）。 */
+  /** usage 事件：token 用量。mapper 已归一化为上游结构化形状（W2 线报③）：
+   *  { inputTokens, outputTokens, cacheReadInputTokens, cacheCreationInputTokens,
+   *    costUSD, durationMs, numTurns }——token 取 codex tokenUsage.last 增量、
+   *  costUSD 恒 0（billing token-only）。类型保持宽松 Record 以兼容防御性消费端。 */
   usage?: Record<string, unknown>;
 
   /** 关联标识，便于前端按 turn 聚合。 */

@@ -249,7 +249,18 @@ export function parseRunnerInput(raw: string): CodexRunnerInput {
     pick('resumeThreadId', isStr) ?? (isStr(obj.sessionId) ? obj.sessionId : undefined);
   if (resumeThreadId) session.resumeThreadId = resumeThreadId;
 
-  return { prompt, groupFolder, session };
+  // IPC 工具路由上下文（主仓 ContainerInput 字段，IpcToolBridge 写盘时 stamp）。
+  const chatJid = isStr(obj.chatJid) && obj.chatJid ? obj.chatJid : undefined;
+  const messageTaskId = isStr(obj.messageTaskId) && obj.messageTaskId ? obj.messageTaskId : undefined;
+
+  return {
+    prompt,
+    groupFolder,
+    session,
+    ...(chatJid ? { chatJid } : {}),
+    ...(obj.isScheduledTask === true ? { isScheduledTask: true } : {}),
+    ...(messageTaskId ? { messageTaskId } : {}),
+  };
 }
 
 // ───────────────────────── 主流程 ─────────────────────────
@@ -289,7 +300,14 @@ async function main(): Promise<void> {
       if (disableMemoryLayer && def.spec.name.startsWith('memory_')) continue;
       registry.register(def);
     }
-    const inner = new IpcToolBridge({ ipcDir: ws.bridgeIpcRoot, memoryDir: ws.bridgeMemoryRoot });
+    const inner = new IpcToolBridge({
+      ipcDir: ws.bridgeIpcRoot,
+      memoryDir: ws.bridgeMemoryRoot,
+      // 路由上下文：send_message/schedule_task 的 chatJid/targetJid 来源（主进程 IPC 消费契约）。
+      ...(input.chatJid ? { chatJid: input.chatJid } : {}),
+      ...(input.isScheduledTask ? { isScheduledTask: true } : {}),
+      ...(input.messageTaskId ? { currentTaskId: input.messageTaskId } : {}),
+    });
     const bridge = new FixedFolderToolBridge(inner, ws.bridgeIpcFolder, ws.bridgeMemoryFolder);
     tools = { registry, bridge };
     log(

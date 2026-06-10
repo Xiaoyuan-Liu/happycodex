@@ -12,7 +12,7 @@ import path from 'path';
 
 import { describe, expect, test } from 'vitest';
 
-import { FixedFolderToolBridge, resolveWorkspacePaths } from '../src/agent-runner.js';
+import { FixedFolderToolBridge, parseRunnerInput, resolveWorkspacePaths } from '../src/agent-runner.js';
 import { FakeToolBridge } from './helpers/fake-tool-bridge.js';
 
 const DATA = '/data-root';
@@ -151,5 +151,31 @@ describe('FixedFolderToolBridge', () => {
       schedule: { kind: 'once', at: 'now' },
     });
     expect(taskId).toBe(fake.nextTaskId);
+  });
+});
+
+describe('parseRunnerInput — IPC 工具路由上下文（ContainerInput.chatJid 等）', () => {
+  test('chatJid / isScheduledTask / messageTaskId 透传（IpcToolBridge 路由来源）', () => {
+    const input = parseRunnerInput(
+      JSON.stringify({
+        prompt: 'hi',
+        groupFolder: 'g1',
+        chatJid: 'web:g1',
+        isScheduledTask: true,
+        messageTaskId: 'task-9',
+      }),
+    );
+    expect(input.chatJid).toBe('web:g1');
+    expect(input.isScheduledTask).toBe(true);
+    expect(input.messageTaskId).toBe('task-9');
+  });
+
+  test('缺省/非法时不产字段（空串 chatJid 视为缺失；isScheduledTask 仅接受 true）', () => {
+    const input = parseRunnerInput(
+      JSON.stringify({ prompt: 'hi', groupFolder: 'g1', chatJid: '', isScheduledTask: 'yes' }),
+    );
+    expect(input.chatJid).toBeUndefined();
+    expect(input.isScheduledTask).toBeUndefined();
+    expect(input.messageTaskId).toBeUndefined();
   });
 });

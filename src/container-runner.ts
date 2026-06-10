@@ -41,6 +41,7 @@ import {
 import {
   buildContainerEnvLines,
   getContainerEnvConfig,
+  getEffectiveExternalDir,
   getSystemSettings,
   shellQuoteEnvLines,
   type ClaudeProviderConfig,
@@ -49,9 +50,17 @@ import {
 // tombstone（happycodex）：上游 providerPool / db 的 deleteSession+getSessionProviderId+
 // setSessionProviderId / isApiError（pool 健康上报用途）/ resolveProviderById 等 provider
 // failover 触点随 provider pool 作废删除（provider-pool.ts 本体不搬）。
-// tombstone（happycodex）：上游 mcp-utils（loadUserMcpServers）/ plugin-utils / plugin-materializer /
-// plugin-command-index / agent-capabilities（checkHostCapabilities）/ claude-context-resolver
-// （buildClaudeContextPlan / syncHostClaudeContext）均为 Claude 引擎面，未搬迁、对应逻辑删除。
+// tombstone（happycodex）：上游 plugin-utils / plugin-materializer / plugin-command-index /
+// agent-capabilities（checkHostCapabilities）为 Claude 引擎面，未搬迁、对应逻辑删除。
+// claude-context-resolver 已接 codex 版（buildClaudeContextPlan/syncHostClaudeContext →
+// buildCodexContextPlan/buildSessionDeveloperInstructions：AGENTS.md + config.toml fallback +
+// developerInstructions 三通道）；mcp-utils（loadUserMcpServers）经 provisionCodexHome 的
+// mcpServers 接线点渲染进 per-folder config.toml（替代上游写 Claude settings.json）。
+import { loadUserMcpServers } from './mcp-utils.js';
+import {
+  buildCodexContextPlan,
+  buildSessionDeveloperInstructions,
+} from './claude-context-resolver.js';
 import { FsCodexHomeProvisioner } from './runtime/multitenant/codex-home.js';
 import type { RegisteredGroup } from './types.js';
 import type { ContainerOutput } from './container-output.js';
@@ -101,6 +110,13 @@ export interface ContainerInput {
   images?: Array<{ data: string; mimeType?: string }>;
   agentId?: string;
   agentName?: string;
+  /**
+   * codex 通道：会话动态上下文，agent-runner 透传到 ThreadSessionConfig.developerInstructions
+   * （thread/start.developerInstructions，与静态 AGENTS.md 叠加且冲突时胜出）。
+   * 两处 spawn 前由 context-resolver 就地派生注入（buildSessionDeveloperInstructions），
+   * 调用方也可预置（追加在前）。
+   */
+  developerInstructions?: string;
   // tombstone（happycodex）：上游 plugins?: SdkPluginConfig[]（Claude Code plugins，
   // 两处 spawn 前 loadUserPlugins 就地派生注入）与 contextAudit?: ClaudeContextAudit
   // （claude-context-resolver 审计）随 Claude 引擎面删除。
@@ -145,23 +161,94 @@ function sharedCodexHomeDir(): string {
   );
 }
 
+/** context-resolver / MCP 接线产物（provision 时一并物化进 per-folder CODEX_HOME）。 */
+export interface CodexHomeContextOptions {
+  /** AGENTS.md 内容（null=清除旧投影；undefined=不触碰），见 FsCodexHomeProvisioner。 */
+  agentsMd?: string | null;
+  /** config.toml 顶层 project_doc_fallback_filenames（幂等写入）。 */
+  projectDocFallbackFilenames?: readonly string[];
+  /** loadUserMcpServers(ownerId) 的结果（渲染为 [mcp_servers.*] TOML 段幂等合并）。 */
+  mcpServers?: Record<string, Record<string, unknown>>;
+}
+
 /**
  * Provision per-folder CODEX_HOME（`{DATA_DIR}/sessions/{folder}/.codex`，sub-agent 走
  * `{folder}/agents/{agentId}/.codex`——路径形状对齐上游 per-group `.claude` 会话目录）。
- * auth.json 从共享 codex home 复制（幂等），预定义子代理 TOML 一并物化。
+ * auth.json 从共享 codex home 复制（幂等），预定义子代理 TOML 一并物化；
+ * context 提供时再物化 AGENTS.md（用户/全局维度）+ config.toml 的
+ * project_doc_fallback_filenames（项目维度）+ [mcp_servers.*]（MCP 接线点）。
  */
 export async function provisionCodexHome(
   groupFolder: string,
   agentId?: string,
+  context?: CodexHomeContextOptions,
 ): Promise<string> {
   const provisioner = new FsCodexHomeProvisioner({
     dataDir: DATA_DIR,
     sharedCodexHome: sharedCodexHomeDir(),
+    ...(context && context.agentsMd !== undefined
+      ? { agentsMd: context.agentsMd }
+      : {}),
+    ...(context?.projectDocFallbackFilenames
+      ? { projectDocFallbackFilenames: context.projectDocFallbackFilenames }
+      : {}),
+    ...(context?.mcpServers ? { mcpServers: context.mcpServers } : {}),
   });
   const folder = agentId
     ? path.join(groupFolder, 'agents', agentId)
     : groupFolder;
   return provisioner.provision(folder);
+}
+
+/**
+ * 两处 spawn 共用：构建 context-resolver 接线产物。
+ * - 用户/全局维度 → AGENTS.md 内容（admin 全局 CLAUDE.md + user-global 记忆，只读源）；
+ * - 项目维度 → project_doc_fallback_filenames=["CLAUDE.md"]；
+ * - MCP servers → loadUserMcpServers(ownerId)（对应上游注入 Claude settings.json 的位置）。
+ */
+function buildCodexHomeContext(
+  executionMode: 'host' | 'container',
+  group: RegisteredGroup,
+  ownerHomeFolder?: string,
+): CodexHomeContextOptions {
+  const plan = buildCodexContextPlan({
+    executionMode,
+    group,
+    ownerHomeFolder,
+    externalClaudeDir: getEffectiveExternalDir(),
+    groupsDir: GROUPS_DIR,
+  });
+  const ownerId = group.created_by;
+  const mcpServers = ownerId ? loadUserMcpServers(ownerId) : {};
+  return {
+    agentsMd: plan.agentsMd,
+    projectDocFallbackFilenames: plan.projectDocFallbackFilenames,
+    ...(Object.keys(mcpServers).length > 0 ? { mcpServers } : {}),
+  };
+}
+
+/**
+ * 两处 spawn 共用：就地派生注入会话动态上下文的 ContainerInput（不 mutate 调用方
+ * input——队列/日志/重试路径共享同一引用，对齐上游 dockerInput/hostInput 派生范式）。
+ * 调用方预置的 developerInstructions 追加在前（动态会话段殿后，便于"后者胜出"语义）。
+ */
+function deriveInputWithSessionContext(
+  executionMode: 'host' | 'container',
+  group: RegisteredGroup,
+  input: ContainerInput,
+): ContainerInput {
+  const sessionContext = buildSessionDeveloperInstructions({
+    executionMode,
+    group,
+    input,
+    timezone: TIMEZONE,
+  });
+  return {
+    ...input,
+    developerInstructions: input.developerInstructions
+      ? `${input.developerInstructions}\n\n${sessionContext}`
+      : sessionContext,
+  };
 }
 
 /** 空 provider 配置：复用 runtime-config 的 env 行构建/净化管线但不产生任何 ANTHROPIC_* 行。 */
@@ -285,12 +372,13 @@ export function buildVolumeMounts(
     readonly: false,
   });
 
-  // tombstone（happycodex）：上游此处的 settings.json 合并写入（ensureSettingsJson +
-  // loadUserMcpServers）、SDK 遗留 .claude.json 清理、精简版 ~/.claude.json 只读挂载
-  // （upstream container-runner.ts:600-637）均为 Claude 配置面，删除。
+  // tombstone（happycodex）：上游此处的 settings.json 合并写入（ensureSettingsJson）、
+  // SDK 遗留 .claude.json 清理、精简版 ~/.claude.json 只读挂载
+  // （upstream container-runner.ts:600-637）均为 Claude 配置面，删除；
+  // loadUserMcpServers 的注入改在 provisionCodexHome（mcpServers → config.toml）完成。
   // tombstone（happycodex）：上游 Skills 双目录只读挂载（/workspace/project-skills +
   // /workspace/user-skills，claude-context-resolver 提供路径）删除；codex 侧 context 注入
-  // 走 AGENTS.md 路线（per-folder CODEX_HOME/AGENTS.md + config.toml），留待 context-resolver 阶段。
+  // 已走 AGENTS.md 路线（per-folder CODEX_HOME/AGENTS.md + config.toml，随 provision 物化）。
 
   // Per-user feishu-cli OAuth state (token.json + config.yaml).
   // Without this mount, every container restart loses the user's feishu OAuth
@@ -375,7 +463,8 @@ export function buildVolumeMounts(
   // 代码变更需重建镜像（见 container/Dockerfile）。
   // tombstone（happycodex）：上游 admin 工作区的 CLAUDE.md / rules / external-skills 只读挂载
   // （claudeContextPlan.isAdminOwned 分支，upstream container-runner.ts:827-852）删除；
-  // CLAUDE.md 是只读数据源，codex 侧注入走 AGENTS.md 路线（留待 context-resolver 阶段）。
+  // CLAUDE.md 是只读数据源，codex 侧注入已走 AGENTS.md 路线（buildCodexContextPlan 把
+  // admin 全局 CLAUDE.md 内容物化进 per-folder CODEX_HOME/AGENTS.md，经 .codex 挂载进容器）。
 
   // Per-group persistent extra directory: provides a durable /workspace/extra/ even when
   // no additionalMounts are configured. User-configured additionalMounts from the allowlist
@@ -442,10 +531,15 @@ export async function runContainerAgent(
   // tombstone（happycodex）：上游此处的 Provider Pool selection（trySelectPoolProvider +
   // resetSession 清会话重绑，upstream container-runner.ts:914-938）随 provider failover 删除。
 
-  // ─── codex 引擎面：per-folder CODEX_HOME provision（auth 复制 + agents/hooks 物化） ───
+  // ─── codex 引擎面：per-folder CODEX_HOME provision（auth 复制 + agents/hooks 物化
+  //     + context-resolver：AGENTS.md / config.toml fallback / mcp_servers 接线） ───
   let codexHome: string;
   try {
-    codexHome = await provisionCodexHome(group.folder, input.agentId);
+    codexHome = await provisionCodexHome(
+      group.folder,
+      input.agentId,
+      buildCodexHomeContext('container', group, ownerHomeFolder),
+    );
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     logger.error(
@@ -520,10 +614,11 @@ export async function runContainerAgent(
       );
       container.kill();
     });
-    // tombstone（happycodex）：上游此处就地派生 dockerInput（注入 docker-runtime plugins +
-    // contextAudit，upstream container-runner.ts:1005-1024）随 plugins/context 面删除——
-    // 直接写调用方的 input（不 mutate）。
-    container.stdin.write(JSON.stringify(input));
+    // 对齐上游就地派生 dockerInput 范式（upstream container-runner.ts:1005-1024）：
+    // plugins/contextAudit 注入随 Claude 面删除（tombstone），codex 版派生注入
+    // 会话动态上下文 developerInstructions（不 mutate 调用方 input）。
+    const dockerInput = deriveInputWithSessionContext('container', group, input);
+    container.stdin.write(JSON.stringify(dockerInput));
     container.stdin.end();
 
     let timedOut = false;
@@ -875,10 +970,15 @@ export async function runHostAgent(
   // codex 替换：上游此处建 per-group `.claude` 会话目录 + symlink ~/.claude.json +
   // ensureSettingsJson + claude-context 三件套同步（buildClaudeContextPlan/syncHostClaudeContext，
   // upstream container-runner.ts:1413-1450）。codex 侧由 FsCodexHomeProvisioner 完成
-  // per-folder CODEX_HOME 隔离（auth 复制 + agents/hooks 物化）。
+  // per-folder CODEX_HOME 隔离（auth 复制 + agents/hooks 物化），context-resolver 三通道
+  // （AGENTS.md / config.toml fallback / mcp_servers）随 provision 一并物化。
   let codexHome: string;
   try {
-    codexHome = await provisionCodexHome(group.folder, input.agentId);
+    codexHome = await provisionCodexHome(
+      group.folder,
+      input.agentId,
+      buildCodexHomeContext('host', group, ownerHomeFolder),
+    );
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     logger.error(
@@ -1107,10 +1207,11 @@ export async function runHostAgent(
       );
       killProcessTree(proc);
     });
-    // tombstone（happycodex）：上游此处就地派生 hostInput（prepareHostPlugins 注入 +
-    // contextAudit，upstream container-runner.ts:1776-1780）随 plugins/context 面删除——
-    // 直接写调用方的 input（不 mutate）。
-    proc.stdin.write(JSON.stringify(input));
+    // 对齐上游就地派生 hostInput 范式（upstream container-runner.ts:1776-1780）：
+    // prepareHostPlugins/contextAudit 注入随 Claude 面删除（tombstone），codex 版派生注入
+    // 会话动态上下文 developerInstructions（不 mutate 调用方 input）。
+    const hostInput = deriveInputWithSessionContext('host', group, input);
+    proc.stdin.write(JSON.stringify(hostInput));
     proc.stdin.end();
 
     // 9. 超时管理

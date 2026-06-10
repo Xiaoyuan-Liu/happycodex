@@ -117,7 +117,14 @@ export class ThreadSession implements IThreadSession {
 
   async start(): Promise<void> {
     if (this.config.resumeThreadId) {
-      const params: ThreadResumeParams = { threadId: this.config.resumeThreadId };
+      const params: ThreadResumeParams = {
+        threadId: this.config.resumeThreadId,
+        // 会话动态上下文（context-resolver 每次会话重新生成）在 resume 时也要刷新：
+        // ThreadResumeParams 支持配置覆盖；不传则沿用 thread/start 时的陈旧值。
+        ...(this.config.developerInstructions !== undefined
+          ? { developerInstructions: this.config.developerInstructions }
+          : {}),
+      };
       const res = await this.client.request<ThreadEnvelopeResponse>(Method.threadResume, params);
       this.adoptThread(res?.thread);
       return;

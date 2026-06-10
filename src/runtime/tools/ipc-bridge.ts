@@ -6,12 +6,20 @@
  * 由主进程消费。记忆类工具（memoryAppend / memorySearch / memoryGet）直接对
  * `{memoryDir}/{folder}/` 下的 .md 文件做读写。
  *
- * IPC 布局（对齐 HappyClaw `data/ipc/{folder}/`）：
- *   {ipcDir}/{folder}/messages/{uuid}.json   —— send_message / register / skill 控制请求
- *   {ipcDir}/{folder}/tasks/{uuid}.json      —— schedule 任务请求（create / pause / resume / cancel）
+ * IPC 布局与**线格式**对齐主进程消费端（src/index.ts processTaskIpc / messages 分支，
+ * 即上游 container/agent-runner/src/mcp-tools.ts 的写出格式）：
+ *   {ipcDir}/{folder}/messages/{uuid}.json   —— `{type:'message', chatJid, groupFolder, text, …}`
+ *   {ipcDir}/{folder}/tasks/{uuid}.json      —— `{type:'schedule_task'|'pause_task'|'resume_task'|
+ *                                                 'cancel_task'|'register_group'|'install_skill'|
+ *                                                 'uninstall_skill', …}`（字段名跟上游 flat 格式）
  *
- * Stage 4 注：listTasks 当前只返回本进程已排队的请求摘要；真实任务列表在主进程，
- * 接主进程后改为查询主进程状态。
+ * chatJid/isScheduledTask/currentTaskId 由构造方（agent-runner ← ContainerInput）注入；
+ * 缺 chatJid 时 send_message / schedule_task 抛错（主进程会静默丢弃无路由的请求，
+ * 抛错让模型得到诚实失败而非假成功）。
+ *
+ * Stage 4 注：listTasks 当前只返回本进程已排队的请求摘要（主进程消费后即删文件，集成态
+ * 下快照基本为空）；权威任务列表在主进程，A4 的 pollIpcResult（list_tasks_result_*）接通后
+ * 改为查询主进程状态。
  */
 
 import { randomUUID } from 'node:crypto';
@@ -33,34 +41,85 @@ export interface IpcToolBridgeOptions {
   ipcDir: string;
   /** 记忆根目录（对齐 HappyClaw `data/groups/`，per-folder 下挂 .md）。 */
   memoryDir: string;
+  /** 当前会话 chat JID（ContainerInput.chatJid）：message 的 chatJid / schedule_task 的 targetJid。 */
+  chatJid?: string;
+  /** 定时任务运行标记（ContainerInput.isScheduledTask）：message 上条件 stamp。 */
+  isScheduledTask?: boolean;
+  /** 触发本轮的任务 id（ContainerInput.messageTaskId）：message 上条件 stamp 为 taskId。 */
+  currentTaskId?: string;
 }
 
 export class IpcToolBridge implements ToolBridge {
   private readonly ipcDir: string;
   private readonly memoryDir: string;
+  private readonly chatJid: string;
+  private readonly isScheduledTask: boolean;
+  private readonly currentTaskId: string;
 
   constructor(opts: IpcToolBridgeOptions) {
     this.ipcDir = opts.ipcDir;
     this.memoryDir = opts.memoryDir;
+    this.chatJid = opts.chatJid ?? '';
+    this.isScheduledTask = opts.isScheduledTask ?? false;
+    this.currentTaskId = opts.currentTaskId ?? '';
+  }
+
+  /** 取路由 chatJid；未绑定 → 抛错（对应工具诚实失败，绝不写主进程会静默丢弃的请求）。 */
+  private requireChatJid(tool: string): string {
+    if (!this.chatJid) {
+      throw new Error(`${tool}: no chatJid bound for this run (cannot route IPC request)`);
+    }
+    return this.chatJid;
   }
 
   // ───────────────────────── IPC 动作类 ─────────────────────────
 
   async sendMessage(folder: string, message: string): Promise<void> {
+    // 线格式对齐上游 buildSendMessageData（mcp-tools.ts）：chatJid/groupFolder/timestamp 恒 stamp，
+    // isScheduledTask/taskId 条件 stamp（taskId 存在与否决定主进程的任务广播分支）。
+    const chatJid = this.requireChatJid('send_message');
     await this.writeIpc(folder, 'messages', {
-      type: 'send_message',
+      chatJid,
+      groupFolder: folder,
+      timestamp: new Date().toISOString(),
+      type: 'message',
       text: message,
-      ts: Date.now(),
+      ...(this.isScheduledTask ? { isScheduledTask: true } : {}),
+      ...(this.currentTaskId ? { taskId: this.currentTaskId } : {}),
     });
   }
 
   async scheduleTask(folder: string, input: ScheduleTaskInput): Promise<{ taskId: string }> {
+    const targetJid = this.requireChatJid('schedule_task');
+    // ScheduleSpec → 上游 flat 格式：cron→expr；interval 秒→毫秒字符串；once→本地时间戳。
+    let scheduleType: 'cron' | 'interval' | 'once';
+    let scheduleValue: string;
+    const s = input.schedule;
+    if (s.kind === 'cron') {
+      scheduleType = 'cron';
+      scheduleValue = s.expr;
+    } else if (s.kind === 'interval') {
+      scheduleType = 'interval';
+      scheduleValue = String(Math.round(s.seconds * 1000));
+    } else {
+      scheduleType = 'once';
+      scheduleValue = s.at;
+    }
+    // taskId 是本进程请求 id（listTasks 快照聚合用）；权威任务 id 由主进程生成，
+    // 线上的 taskId/name 字段主进程忽略（processTaskIpc 只在 pause/resume/cancel 读 taskId）。
     const taskId = `task_${randomUUID().slice(0, 8)}`;
     await this.writeIpc(folder, 'tasks', {
-      type: 'schedule',
-      action: 'create',
-      task: input,
+      type: 'schedule_task',
       taskId,
+      name: input.name,
+      prompt: input.prompt,
+      schedule_type: scheduleType,
+      schedule_value: scheduleValue,
+      context_mode: 'group', // 对齐上游工具默认（zod default 'group'）
+      execution_type: 'agent',
+      targetJid,
+      createdBy: folder,
+      timestamp: new Date().toISOString(),
       ts: Date.now(), // 单调序：listTasks 据此让"最后动作"胜出（文件名是随机 UUID，无法据此定序）。
     });
     return { taskId };
@@ -104,19 +163,25 @@ export class IpcToolBridge implements ToolBridge {
       }
       const rec = parsed as {
         type?: unknown;
-        action?: unknown;
         taskId?: unknown;
-        task?: { name?: unknown };
+        name?: unknown;
         ts?: unknown;
       };
-      if (rec.type !== 'schedule' || typeof rec.taskId !== 'string') continue;
-      const action = typeof rec.action === 'string' ? rec.action : '';
-      if (!['create', 'pause', 'resume', 'cancel'].includes(action)) continue;
+      // 线格式（上游 flat）：type 即动作。schedule_task=create，{pause,resume,cancel}_task 同名动作。
+      const TYPE_TO_ACTION: Record<string, string> = {
+        schedule_task: 'create',
+        pause_task: 'pause',
+        resume_task: 'resume',
+        cancel_task: 'cancel',
+      };
+      if (typeof rec.type !== 'string' || typeof rec.taskId !== 'string') continue;
+      const action = TYPE_TO_ACTION[rec.type];
+      if (!action) continue;
       const id = rec.taskId;
       const ts = typeof rec.ts === 'number' ? rec.ts : fallbackSeq;
       fallbackSeq += 1;
       if (action === 'create') {
-        meta.set(id, { name: typeof rec.task?.name === 'string' ? rec.task.name : id });
+        meta.set(id, { name: typeof rec.name === 'string' ? rec.name : id });
       }
       const prev = last.get(id);
       // 较新 ts 胜；ts 相同（同毫秒写入）时按动作"终态优先级"决胜，确保 cancel 绝不被 create 盖回。
@@ -152,26 +217,38 @@ export class IpcToolBridge implements ToolBridge {
   }
 
   async registerGroup(folder: string, jid: string, name?: string): Promise<void> {
-    await this.writeIpc(folder, 'messages', {
+    // 上游走 tasks 通道（processTaskIpc case 'register_group'）。
+    // 已知缺口（A4/A5）：主进程还要求 data.folder（新群组目录名），冻结的 12 工具 schema
+    // 没有该参数 → 集成态下主进程会以 missing required fields 拒绝。这里先对齐通道与字段名。
+    await this.writeIpc(folder, 'tasks', {
       type: 'register_group',
       jid,
       name: name ?? null,
+      timestamp: new Date().toISOString(),
       ts: Date.now(),
     });
   }
 
   async installSkill(folder: string, name: string): Promise<void> {
-    await this.writeIpc(folder, 'messages', {
+    // 上游走 tasks 通道 + pollIpcResult 等待 install_skill_result_{requestId}.json；
+    // poll 回执是 A4 项，当前 fire-and-forget（requestId 仍按主进程契约必填）。
+    await this.writeIpc(folder, 'tasks', {
       type: 'install_skill',
-      name,
+      package: name,
+      requestId: randomUUID(),
+      groupFolder: folder,
+      timestamp: new Date().toISOString(),
       ts: Date.now(),
     });
   }
 
   async uninstallSkill(folder: string, name: string): Promise<void> {
-    await this.writeIpc(folder, 'messages', {
+    await this.writeIpc(folder, 'tasks', {
       type: 'uninstall_skill',
-      name,
+      skillId: name,
+      requestId: randomUUID(),
+      groupFolder: folder,
+      timestamp: new Date().toISOString(),
       ts: Date.now(),
     });
   }
@@ -280,13 +357,19 @@ export class IpcToolBridge implements ToolBridge {
     await rename(tmp, target);
   }
 
-  /** 写一条 schedule pause/resume/cancel 请求。 */
+  /** 写一条 pause/resume/cancel 请求（上游 flat 格式：type 即动作，taskId 为权威任务 id）。 */
   private async writeScheduleAction(
     folder: string,
     action: 'pause' | 'resume' | 'cancel',
     taskId: string,
   ): Promise<void> {
-    await this.writeIpc(folder, 'tasks', { type: 'schedule', action, taskId, ts: Date.now() });
+    await this.writeIpc(folder, 'tasks', {
+      type: `${action}_task`,
+      taskId,
+      groupFolder: folder,
+      timestamp: new Date().toISOString(),
+      ts: Date.now(),
+    });
   }
 
   /** memoryAppend 目标文件；scope 不安全（含路径分隔/穿越/控制字符）或 folder 越界 → null。 */
