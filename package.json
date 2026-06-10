@@ -9,6 +9,7 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
+    "build": "tsc -p tsconfig.build.json",
     "test": "vitest run",
     "test:watch": "vitest",
     "start": "node dist/agent-runner.js",
@@ -20,6 +21,7 @@
     "poc:tools": "tsx src/poc/poc-tools.ts",
     "poc:multitenant": "tsx src/poc/poc-multitenant.ts",
     "poc:subagent": "tsx src/poc/poc-subagent.ts",
+    "poc:agentsmd": "tsx src/poc/poc-agentsmd.ts",
     "poc:compact": "tsx src/poc/poc-compact.ts",
     "poc:hooks": "tsx src/poc/poc-hooks.ts",
     "protocol:regen": "codex app-server generate-ts --experimental --out protocol/ts && codex app-server generate-json-schema --experimental --out protocol/schema"

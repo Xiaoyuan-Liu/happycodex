@@ -11,7 +11,7 @@
  *   无协调）。PoC 阶段可容忍；生产应集中一个 refresh owner（留待"接主仓"阶段）。
  */
 
-import { mkdir, copyFile, access, writeFile } from 'node:fs/promises';
+import { mkdir, copyFile, access, readFile, writeFile } from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
 import * as path from 'node:path';
 
@@ -23,6 +23,7 @@ import {
   writeHooksJson,
   type BuildHooksOptions,
 } from './hooks-config.js';
+import { mergeMcpServersIntoToml } from './mcp-toml.js';
 
 /** 必需的共享凭据文件名。 */
 const AUTH_FILE = 'auth.json';
@@ -53,6 +54,13 @@ export interface FsCodexHomeProvisionerOptions {
    * 测试可注入可观测命令；生产可换成真实通知/副作用命令。
    */
   hookCommands?: Partial<Pick<BuildHooksOptions, 'sessionStartCommand' | 'stopCommand' | 'timeoutSec'>>;
+  /**
+   * MCP servers 接线点（可选，对应上游把 loadUserMcpServers() 注入 Claude settings.json）：
+   * 提供时 provision 把每个 server 渲染为 config.toml 的 `[mcp_servers.<name>]` TOML 段，
+   * 幂等合并（段头已存在则跳过，不覆盖 per-folder 本地修改）。调用方（container-runner）
+   * 可传 loadUserMcpServers(ownerId) 的结果；不传则完全不触碰 mcp_servers 配置。
+   */
+  mcpServers?: Record<string, Record<string, unknown>>;
 }
 
 export class FsCodexHomeProvisioner implements ICodexHomeProvisioner {
@@ -62,6 +70,7 @@ export class FsCodexHomeProvisioner implements ICodexHomeProvisioner {
   private readonly sessionsBase: string;
   private readonly enableHooks: boolean;
   private readonly hookCommands: FsCodexHomeProvisionerOptions['hookCommands'];
+  private readonly mcpServers: FsCodexHomeProvisionerOptions['mcpServers'];
 
   constructor(opts: FsCodexHomeProvisionerOptions) {
     this.dataDir = opts.dataDir;
@@ -69,6 +78,7 @@ export class FsCodexHomeProvisioner implements ICodexHomeProvisioner {
     this.sessionsBase = path.resolve(this.dataDir, 'sessions');
     this.enableHooks = opts.enableHooks ?? false;
     this.hookCommands = opts.hookCommands;
+    this.mcpServers = opts.mcpServers;
   }
 
   async provision(folder: string): Promise<string> {
@@ -100,7 +110,30 @@ export class FsCodexHomeProvisioner implements ICodexHomeProvisioner {
       await this.provisionHooks(codexHome);
     }
 
+    // 5. MCP servers 接线点（可选）：渲染 [mcp_servers.*] 段幂等合并进 config.toml。
+    if (this.mcpServers && Object.keys(this.mcpServers).length > 0) {
+      await this.provisionMcpServers(codexHome, this.mcpServers);
+    }
+
     return codexHome;
+  }
+
+  /**
+   * 把 MCP server 配置幂等合并进 per-folder config.toml：
+   * 段头已存在的 server 跳过（保留 per-folder 本地修改），全部已存在则免写盘。
+   */
+  private async provisionMcpServers(
+    codexHome: string,
+    servers: Record<string, Record<string, unknown>>,
+  ): Promise<void> {
+    const configPath = path.join(codexHome, CONFIG_FILE);
+    let content = '';
+    if (await this.exists(configPath)) {
+      content = await readFile(configPath, 'utf8');
+    }
+    const merged = mergeMcpServersIntoToml(content, servers);
+    if (merged.appended === 0) return; // 幂等：无新增段，不写盘。
+    await writeFile(configPath, merged.content, 'utf8');
   }
 
   /**

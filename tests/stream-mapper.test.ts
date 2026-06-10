@@ -228,7 +228,7 @@ describe('StreamMapper — thread / turn lifecycle', () => {
       threadId: 'th',
       turn: { id: 'tn_7', status: 'inProgress' },
     });
-    expect(out).toEqual([{ eventType: 'task_start', turnId: 'tn_7' }]);
+    expect(out).toEqual([{ eventType: 'task_start', turnId: 'tn_7', threadId: 'th' }]);
   });
 
   it('turn/completed status=completed → result completed', () => {
@@ -236,7 +236,7 @@ describe('StreamMapper — thread / turn lifecycle', () => {
       threadId: 'th',
       turn: { id: 'tn_1', status: 'completed' },
     });
-    expect(out).toEqual([{ eventType: 'result', subtype: 'completed', turnId: 'tn_1' }]);
+    expect(out).toEqual([{ eventType: 'result', subtype: 'completed', turnId: 'tn_1', threadId: 'th' }]);
   });
 
   it('turn/completed status=interrupted → result interrupted', () => {

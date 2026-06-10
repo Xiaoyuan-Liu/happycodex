@@ -147,6 +147,9 @@ export class StreamMapper implements IStreamMapper {
           {
             eventType: 'task_start',
             turnId: n.turn?.id,
+            // threadId 透传：子代理 thread 的 turn 事件靠它被 decorateScope 标为 subagent，
+            // 否则信封层会把子代理 turn 误判为主线程终态（过早 success + 清累积正文）。
+            ...(n.threadId ? { threadId: n.threadId } : {}),
           },
         ];
       }
@@ -158,6 +161,7 @@ export class StreamMapper implements IStreamMapper {
             eventType: 'result',
             subtype: mapTurnStatus(n.turn?.status),
             turnId: n.turn?.id,
+            ...(n.threadId ? { threadId: n.threadId } : {}),
           },
         ];
       }

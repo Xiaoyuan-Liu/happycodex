@@ -3,12 +3,13 @@
  *
  * 仿 poc-multitenant.ts 的 ask() 模式，但走真正的「进程式入口」：
  *   spawn `tsx src/agent-runner.ts`（子进程）→ stdin 喂 CodexRunnerInput → 解析 stdout 的
- *   OUTPUT_MARKER StreamEvent → 通过 IPC input/ 注入一条后续消息 → 写 _close sentinel 收尾。
+ *   OUTPUT_MARKER ContainerOutput 信封（拆信封取 streamEvent，对齐上游 agent-output-parser
+ *   协议）→ 通过 IPC input/ 注入一条后续消息 → 写 _close sentinel 收尾。
  *
  * 证明入口能真跑：初始 prompt 的回复 + 注入消息的回复都从 stdout 流出，最后干净退出。
  *
  * 运行前置：codex 已登录、CODEX_HOME 指向有效配置目录（与其它 poc 一致）。
- * 无登录态时子进程会以 result/failed 收尾，本脚本据此报 UNCERTAIN 而非 FAIL（区分"入口逻辑 OK 但无凭据"）。
+ * 无登录态时子进程会以 error 信封收尾，本脚本据此报 UNCERTAIN 而非 FAIL（区分"入口逻辑 OK 但无凭据"）。
  * 跑：npm run poc:entry
  */
 
@@ -23,13 +24,14 @@ import {
   OUTPUT_END_MARKER,
   type StreamEvent,
 } from '../shared/stream-event.js';
+import type { ContainerOutput } from '../container-output.js';
 
 const FOLDER = 'home-entry-poc';
 
-/** 解析 stdout 流里的 OUTPUT_MARKER 事件（容忍跨 chunk 半行）。 */
+/** 解析 stdout 流里的 OUTPUT_MARKER 信封（容忍跨 chunk 半行）。 */
 class OutputMarkerParser {
   private buf = '';
-  feed(chunk: string, onEvent: (ev: StreamEvent) => void): void {
+  feed(chunk: string, onOutput: (out: ContainerOutput) => void): void {
     this.buf += chunk;
     let start: number;
     while ((start = this.buf.indexOf(OUTPUT_START_MARKER)) !== -1) {
@@ -38,7 +40,7 @@ class OutputMarkerParser {
       const json = this.buf.slice(start + OUTPUT_START_MARKER.length, end);
       this.buf = this.buf.slice(end + OUTPUT_END_MARKER.length);
       try {
-        onEvent(JSON.parse(json) as StreamEvent);
+        onOutput(JSON.parse(json) as ContainerOutput);
       } catch {
         /* ignore malformed */
       }
@@ -83,6 +85,7 @@ async function main(): Promise<void> {
   let closed = false;
   let resultCount = 0;
   let failed = false;
+  let sawClosedOutput = false;
 
   // 注入时机：standalone 入口在初始 turn 完成且无待注入时即 resolve run() 退出。
   // 因此后续消息必须在初始 turn **在飞期间**注入（→ turn/steer 或排队进第二轮），
@@ -107,13 +110,18 @@ async function main(): Promise<void> {
 
   child.stdout.setEncoding('utf8');
   child.stdout.on('data', (chunk: string) => {
-    parser.feed(chunk, (ev) => {
-      events.push(ev);
-      if (ev.eventType === 'text_delta') textOut += ev.text ?? '';
-      if (ev.eventType === 'init') maybeInject();
-      if (ev.eventType === 'result') {
-        if (ev.subtype === 'failed') failed = true;
+    parser.feed(chunk, (out) => {
+      // 拆信封：stream 信封取 streamEvent；success/error 是 turn 终态；closed 是 _close 收尾标记。
+      if (out.status === 'stream' && out.streamEvent) {
+        const ev = out.streamEvent;
+        events.push(ev);
+        if (ev.eventType === 'text_delta') textOut += ev.text ?? '';
+        if (ev.eventType === 'init') maybeInject();
+      } else if (out.status === 'success' || out.status === 'error') {
+        if (out.status === 'error') failed = true;
         resultCount += 1;
+      } else if (out.status === 'closed') {
+        sawClosedOutput = true;
       }
       maybeClose();
     });
@@ -148,6 +156,7 @@ async function main(): Promise<void> {
   console.error(`[poc-entry] init event      : ${sawInit}`);
   console.error(`[poc-entry] result count    : ${resultCount}`);
   console.error(`[poc-entry] any failed      : ${failed}`);
+  console.error(`[poc-entry] closed envelope : ${sawClosedOutput}`);
   console.error(`[poc-entry] text out        : ${textOut.trim().slice(0, 80)}`);
 
   if (failed && resultCount > 0 && !sawInit) {
@@ -157,12 +166,14 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
-  // 成功判据：thread 建立（init）+ 初始 prompt 回复（ALPHA）+ IPC 注入消息回复（BETA）都流出，且干净退出。
-  // 注入消息可能被 codex 以 turn/steer 并入同一 turn（→ 1 个 result）或开新 turn（→ 2 个 result），
-  // 故只校验"两段文本均到达"，不强约束 result 个数。
-  const ok = sawInit && /ALPHA/i.test(textOut) && /BETA/i.test(textOut) && exitCode === 0;
+  // 成功判据：thread 建立（init）+ 初始 prompt 回复（ALPHA）+ IPC 注入消息回复（BETA）都流出，
+  // _close 收尾产出 closed 信封，且干净退出。
+  // 注入消息可能被 codex 以 turn/steer 并入同一 turn（→ 1 个 success）或开新 turn（→ 2 个 success），
+  // 故只校验"两段文本均到达"，不强约束 success 个数。
+  const ok =
+    sawInit && /ALPHA/i.test(textOut) && /BETA/i.test(textOut) && sawClosedOutput && exitCode === 0;
   if (ok) {
-    console.error('[poc-entry] RESULT: OK —— 入口端到端：初始回复 + IPC 注入回复 + _close 干净退出');
+    console.error('[poc-entry] RESULT: OK —— 入口端到端：初始回复 + IPC 注入回复 + _close 干净退出（closed 信封）');
     process.exit(0);
   }
   console.error('[poc-entry] RESULT: FAIL —— 未达成端到端预期（见上方观测）');
