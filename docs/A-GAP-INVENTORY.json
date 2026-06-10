@@ -1,0 +1,1496 @@
+{
+  "summary": "A 阶段差距盘点：对照 happyclaw 原项目，列 happycodex 已有/缺失/需改造模块 + 分阶段搬迁路线图（只读）",
+  "agentCount": 6,
+  "logs": [
+    "Inventory 完成：5 切片，共 112 模块"
+  ],
+  "result": {
+    "inventory": [
+      {
+        "slice": "主进程 & 编排核心（index.ts / group-queue / task-scheduler / container-runner / agent-output-parser 及周边基础设施）",
+        "modules": [
+          {
+            "path": "upstream-happyclaw/src/index.ts",
+            "role": "主进程入口（10129 行）：启动序列（migrateDataDirectories→initDatabase→loadState→main()，index.ts:8868）、2s 消息轮询 + 游标管理（setCursors/advanceCursors，index.ts:485-541）、IpcWatcherManager 事件驱动消费容器侧 messages/tasks IPC（index.ts:541-686）、IM 回复路由与重试/auto-unbind（resolveImRoute/sendImWithRetry，index.ts:746/1117）、斜杠命令分发 handleCommand（index.ts:1332-2354）、群组注册/loadState/saveState（index.ts:2459-2693）、onNewChat/线程 agent/Feishu owner 学习（index.ts:7705-8338）、优雅关闭与 IM 健康检查（index.ts:10031）",
+            "classification": "adapt-codex",
+            "complexity": "XL",
+            "codexNotes": "主体是引擎无关编排，可大块搬，但散布 Claude 触点必须逐处改：(1) getSessionClaudeDir 指向 data/sessions/{folder}/.claude（index.ts:1278）→ 改为 per-folder CODEX_HOME（happycodex multitenant/codex-home.ts 已有）；(2) summarizeWithClaude 用 execFile('claude',['--print']) 做 /recall 摘要与 LLM 标题（index.ts:2079/2090）→ 改 codex exec；(3) feedStreamEventToCard 消费 StreamEvent 字段（index.ts:256）→ 以 happycodex src/shared/stream-event.ts 冻结契约为准对齐字段；(4) OOM_EXIT_RE code 137 / consecutiveOomExits 自动重置（index.ts:241/698）逻辑可保留但语义针对容器；(5) clearSessionRuntimeFiles（index.ts:1284）改清 CODEX_HOME rollout/threadId（happycodex SessionStore + rollout-archive 已有等价能力）。建议拆文件而非整搬 350KB 单体",
+            "dependsOn": [
+              "db.ts",
+              "group-queue.ts",
+              "container-runner.ts(替换版)",
+              "task-scheduler.ts",
+              "im-manager.ts(IM 切片)",
+              "web.ts(Web 切片)",
+              "commands.ts",
+              "logger.ts",
+              "load-env.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/group-queue.ts",
+            "role": "并发编排（1616 行）：GroupState 状态机（active/pendingMessages/pendingTasks/retry，group-queue.ts:21-62）、最大 20 容器 + 5 宿主进程双计数（group-queue.ts:64-67）、任务优先、指数退避重试（MAX_RETRIES=5/BASE_RETRY_MS=5000，group-queue.ts:18-19）、_drain sentinel、recentlyStoppedFolders 防 user-stop 误判 OOM（group-queue.ts:69-76）、hasIpcInjectedMessages 防消息丢失（group-queue.ts:44-50）",
+            "classification": "adapt-codex",
+            "complexity": "L",
+            "codexNotes": "引擎无关的编排核心，逻辑基本原样搬。需改：(1) GroupState.selectedProviderId（group-queue.ts:41）及相关 provider 释放逻辑随 provider-pool 一起删除；(2) import killProcessTree from './container-runner.js'（group-queue.ts:6）指向替换后的 codex 版 runner；(3) sentinel 协议 _close/_interrupt/_drain 与 happycodex src/agent-runner.ts 已对齐（agent-runner.ts 头注释明示三 sentinel），无协议改造。注意 happycodex multitenant/SessionManager（长驻单进程模型）与 GroupQueue（spawn-per-session 模型）是两套并存模型——接主仓走 spawn 模型时 GroupQueue 保留，SessionManager 不替代它",
+            "dependsOn": [
+              "container-runner.ts(替换版)",
+              "db.ts",
+              "runtime-config.ts",
+              "logger.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/task-scheduler.ts",
+            "role": "定时调度（1227 行）：60s 轮询、cron/interval/once 三模式（computeNextRun，task-scheduler.ts:232）、group/isolated 上下文（runGroupModeTask/runTaskInner，task-scheduler.ts:916/332）、script 任务（runScriptTask，task-scheduler.ts:685）、停机积压跳过 shouldSkipBackfill（task-scheduler.ts:222）、依赖注入 SchedulerDependencies（task-scheduler.ts:166）",
+            "classification": "port-asis",
+            "complexity": "M",
+            "codexNotes": "对引擎只通过 SchedulerDependencies 间接调用 runContainerAgent/GroupQueue，自身无 ANTHROPIC/claude 引用（grep 仅 task-scheduler.ts:521 一处注释提到 CLAUDE.md 挂载）。搬迁主要是 import 路径与外围依赖（billing.ts/owner-gate.ts 可裁剪或留待对应切片），StreamEvent 类型 import 改指 happycodex shared/stream-event.ts",
+            "dependsOn": [
+              "db.ts",
+              "group-queue.ts",
+              "container-runner.ts(替换版)",
+              "runtime-config.ts",
+              "script-runner.ts",
+              "billing.ts(可选)",
+              "file-manager.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/container-runner.ts",
+            "role": "执行引擎宿主（1925 行）：Docker run + 宿主机进程两模式（runContainerAgent/runHostAgent，container-runner.ts:902/1285）、卷挂载构建 buildVolumeMounts（container-runner.ts:518）、ContainerInput/Output 协议（container-runner.ts:201/235）、provider 选择与健康上报（trySelectPoolProvider，container-runner.ts:358）、~/.claude.json 精简与 settings.json 注入（container-runner.ts:80-199）、plugins 预构建（prepareHostPlugins，container-runner.ts:500）、tasks/groups 快照写入（container-runner.ts:1182/1226）、killProcessTree（container-runner.ts:1261）",
+            "classification": "replace-codex",
+            "complexity": "XL",
+            "codexNotes": "全文件 85 处 claude/ANTHROPIC/providerPool 引用，是 Claude 耦合最重的模块。引擎面（spawn 什么、注入什么 env、会话目录）整体换成 happycodex 已建件：spawn `node dist/agent-runner.js`（src/agent-runner.ts，stdin=CodexRunnerInput、stdout=OUTPUT_MARKER、IPC 三 sentinel 同构）+ FsCodexHomeProvisioner（multitenant/codex-home.ts：auth.json/config.toml/agents 取代 .claude.json/settings.json 那套，container-runner.ts:80-199 全删）。providerPool 集成（container-runner.ts:340-474/1066-1177）全删。需新写/保留的编排面：Docker 卷挂载（挂 CODEX_HOME 而非 /home/node/.claude）、超时/输出上限、writeTasksSnapshot/writeGroupsSnapshot、killProcessTree、env 文件注入（ANTHROPIC_* → OPENAI/CODEX 凭据）。注意 happycodex OUTPUT_MARKER 是 <<<HAPPYCODEX_OUTPUT_START>>>（shared/stream-event.ts:81-82），与主仓 ---HAPPYCLAW_OUTPUT_START--- 不同，解析端必须用 happycodex 常量",
+            "dependsOn": [
+              "happycodex src/agent-runner.ts(已有)",
+              "happycodex src/runtime/multitenant/codex-home.ts(已有)",
+              "happycodex src/shared/stream-event.ts(已有)",
+              "agent-output-parser.ts(适配版)",
+              "mount-security.ts",
+              "runtime-config.ts",
+              "db.ts",
+              "mcp-utils.ts(适配版)"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/agent-output-parser.ts",
+            "role": "Agent 输出解析（697 行）：OUTPUT_MARKER 流式解析 attachStdoutHandler（agent-output-parser.ts:56）、stderr 处理、超时/非零退出/成功关闭三类 close handler（agent-output-parser.ts:233/382/501）、run log 写入（agent-output-parser.ts:278）、isApiError/isProviderFailureResult Claude 限额文案识别（agent-output-parser.ts:594-697）",
+            "classification": "adapt-codex",
+            "complexity": "M",
+            "codexNotes": "解析骨架（marker 配对、parse buffer 防溢出、outputChain 串行、close 生命周期）引擎无关可搬；必改三点：(1) marker 常量改用 happycodex 的 <<<HAPPYCODEX_OUTPUT_START/END>>>（shared/stream-event.ts:81-82），happycodex 侧 wrap 端已存在，本文件是消费端对应物；(2) CLAUDE_LIMIT_PHRASE_PATTERNS / CLAUDE_LIMIT_RESET_PATTERN / isProviderFailureResult（agent-output-parser.ts:642-697）是 Claude 账号限额专属——随 provider-pool 一起删或换成 codex/OpenAI 限额文案；(3) API_ERROR_PATTERNS 里 ANTHROPIC_API_KEY/AUTH_TOKEN 两条（agent-output-parser.ts:603-604）换成 OPENAI/CODEX 对应 env 名。hasProviderFailureOutput 状态位（agent-output-parser.ts:30）联动删除",
+            "dependsOn": [
+              "happycodex src/shared/stream-event.ts(marker 来源)",
+              "container-runner.ts(替换版,ContainerOutput 类型)",
+              "runtime-config.ts",
+              "logger.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/agent-capabilities.ts",
+            "role": "宿主机能力预检（232 行）：检测 claude/feishu-cli/agent-browser/uv 二进制（AGENT_CAPABILITIES，agent-capabilities.ts:39-75）、SDK 内置 claude 二进制定位 resolveSdkBundledClaude（agent-capabilities.ts:98-127）、缺失工具告警（agent-capabilities.ts:217）",
+            "classification": "adapt-codex",
+            "complexity": "S",
+            "codexNotes": "框架（which 探测 + envVars 注入 + 缓存 + preflight 日志）原样可用。改动：把 required 的 claude 条目换成 codex 二进制（codex CLI 0.137.0+），删除 resolveSdkBundledClaude 整段（agent-capabilities.ts:98-127，@anthropic-ai/claude-agent-sdk-平台包路径专属）及 isBinaryAvailable 中的 claude 特判（agent-capabilities.ts:78）",
+            "dependsOn": [
+              "logger.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/mcp-utils.ts",
+            "role": "用户 MCP server 配置加载（74 行）：读 data/mcp-servers/{userId}/servers.json，过滤 enabled，支持 stdio + http/sse 两类（mcp-utils.ts:15-62）",
+            "classification": "adapt-codex",
+            "complexity": "S",
+            "codexNotes": "读取/过滤逻辑原样搬；下游注入格式变——主仓产出喂给 Claude settings.json 的 mcpServers JSON（mcp-utils.ts:13 注释），codex 侧要渲染成 CODEX_HOME/config.toml 的 [mcp_servers.x] TOML 段（happycodex multitenant/codex-home.ts 写 config.toml 的位置即注入点），需补 JSON→TOML 渲染函数",
+            "dependsOn": [
+              "config.ts(DATA_DIR)",
+              "happycodex src/runtime/multitenant/codex-home.ts(注入点)"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/commands.ts",
+            "role": "Web 端 /clear 会话重置（108 行）：stopGroup 全 folder 兄弟 JID → clearSessionFiles 清 .claude 会话文件 → deleteSession 删 DB 映射 → 插 context_reset 分隔消息 + 推进游标（commands.ts:36-108）",
+            "classification": "adapt-codex",
+            "complexity": "S",
+            "codexNotes": "编排流程（stop→清文件→删 DB→divider→游标）原样保留；唯一引擎触点 clearSessionFiles（commands.ts:13 import session-files.js，清 .claude/）改为：删 SessionStore 的 folder→threadId 映射 + 清 CODEX_HOME 下 rollout（happycodex session-store.ts/rollout-archive.ts 已有原语）。codex 没有 thinking-block 签名问题，重置语义更简单",
+            "dependsOn": [
+              "db.ts",
+              "group-queue.ts",
+              "happycodex src/runtime/multitenant/session-store.ts(已有)",
+              "happycodex src/runtime/rollout-archive.ts(已有)"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/conversation-history.ts",
+            "role": "新 session 恢复上下文（61 行）：从 DB 取最近 30 条消息构造 <system_context> 块，孤立 surrogate 清洗 + 闭合标签防逃逸（conversation-history.ts:16-61）",
+            "classification": "port-asis",
+            "complexity": "S",
+            "codexNotes": "纯文本构造，引擎无关。注释提到与 agent-runner extractSessionHistory 字节级对齐（conversation-history.ts:40-44）——codex 侧若 agent-runner 不做对称清洗则该约束放松；'Claude SDK session is fresh' 等注释措辞顺手改。codex resume 走 thread/resume（ThreadResumeParams.threadId），fresh-session 注入场景依然存在（threadId 丢失/重置后），保留价值不变",
+            "dependsOn": [
+              "db.ts(getMessagesPage)"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/claude-context-resolver.ts",
+            "role": "CLAUDE.md/rules/skills 上下文挂载计划（274 行）：buildClaudeContextPlan 按 admin/member + host/container 算 CLAUDE.md、rules、四源 skills 的 source/runtime 路径与 audit（claude-context-resolver.ts:100-212）；syncHostClaudeContext 宿主机模式符号链接同步（claude-context-resolver.ts:214-274）",
+            "classification": "adapt-codex",
+            "complexity": "M",
+            "codexNotes": "结构（plan→audit→host 符号链接同步）保留，全部目标物换语义：CLAUDE.md → AGENTS.md（codex 的工程记忆文件）；.claude/rules → 并入 AGENTS.md 或 CODEX_HOME/AGENTS 链；skills 四源（builtin/external/project/user）→ codex 无原生 skills 目录协议，须决策走 CODEX_HOME/agents/*.toml（happycodex multitenant/agent-defs.ts 已有 sub-agent TOML 渲染）或纯 prompt 注入。'/home/node/.claude' 容器路径全部换 CODEX_HOME 挂载点。ClaudeContextAudit 类型属 StreamEvent 契约（claude-context-resolver.ts:4），改字段须同步 happycodex shared/stream-event.ts 冻结契约评审",
+            "dependsOn": [
+              "happycodex src/runtime/multitenant/codex-home.ts(已有)",
+              "happycodex src/runtime/multitenant/agent-defs.ts(已有)",
+              "shared/stream-event.ts 契约决策",
+              "types.ts(RegisteredGroup)"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/provider-pool.ts",
+            "role": "多 Anthropic provider 负载均衡（264 行）：round-robin/weighted/failover 三策略（provider-pool.ts:135-171）、连续失败标记不健康 + 5min 自动恢复（provider-pool.ts:193-215/91-109）、会话计数、单例 providerPool（provider-pool.ts:264）",
+            "classification": "drop-claude-only",
+            "complexity": "S",
+            "codexNotes": "整体作废：为多 ANTHROPIC OAuth/API-key profile 轮换 + thinking-block 签名 sticky（sessions.provider_id）设计，codex 单 auth.json 模型不需要。连带删除面：container-runner 的 trySelectPoolProvider/reportSuccess/reportFailure 调用（container-runner.ts:340-474 等 20 处）、group-queue.GroupState.selectedProviderId、agent-output-parser.isProviderFailureResult、db sessions.provider_id 列、runtime-config BalancingConfig、相关 routes/前端面板",
+            "dependsOn": []
+          },
+          {
+            "path": "upstream-happyclaw/src/node-resolver.ts",
+            "role": "node 二进制绝对路径解析（106 行）：pm2/launchd 最小 PATH 下定位 nvm/fnm/volta/homebrew 的 node，spawn 宿主机 agent-runner 用（node-resolver.ts:56-106）",
+            "classification": "port-asis",
+            "complexity": "S",
+            "codexNotes": "纯工具，零引擎引用，零改动。codex 宿主模式 spawn `node dist/agent-runner.js` 同样需要它",
+            "dependsOn": []
+          },
+          {
+            "path": "upstream-happyclaw/src/load-env.ts",
+            "role": ".env 预加载（10 行）：process.loadEnvFile() 在一切模块求值前注入环境变量（load-env.ts:5-10）",
+            "classification": "port-asis",
+            "complexity": "S",
+            "codexNotes": "零改动。happycodex 现无等价物（agent-runner.ts 直接读 process.env），主进程入口建立时首 import 即可",
+            "dependsOn": []
+          },
+          {
+            "path": "upstream-happyclaw/src/logger.ts",
+            "role": "pino 日志单例（37 行）：脱敏 redact 清单 + uncaughtException/unhandledRejection 全局兜底（logger.ts:3-37）",
+            "classification": "port-asis",
+            "complexity": "S",
+            "codexNotes": "原样搬；redact 清单把 *.anthropicApiKey/*.anthropicAuthToken（logger.ts:12）换/增 codex 侧凭据键名（如 *.openaiApiKey、auth.json token 字段名）即可，属一行级调整",
+            "dependsOn": []
+          }
+        ],
+        "sliceSummary": "本切片 14 个模块：引擎宿主 container-runner.ts 是唯一 replace-codex（spawn/凭据/会话目录全换 happycodex 已建的 agent-runner.ts + FsCodexHomeProvisioner，但 Docker 挂载/超时/快照等编排面仍要从主仓重建，XL）；provider-pool.ts 整体 drop-claude-only 并连带清理 group-queue/agent-output-parser/db 中的 provider 触点；五个纯基础设施/纯编排模块 port-asis（task-scheduler、conversation-history、node-resolver、load-env、logger，约 36%）；七个 adapt-codex（约 50%），其中 index.ts（XL，claude CLI 摘要、.claude 会话目录、StreamEvent 消费三类触点）和 claude-context-resolver（CLAUDE.md→AGENTS.md / skills 协议需架构决策）是改造重头，group-queue/agent-output-parser/commands/mcp-utils/agent-capabilities 为局部小改。整体判断：编排骨架（队列、调度、IPC 消费、轮询、游标）与 codex 引擎天然解耦、搬迁可行性高；最大风险点是 index.ts 350KB 单体的触点散布与 OUTPUT_MARKER 字符串差异（HAPPYCLAW--- vs <<<HAPPYCODEX>>>）这类一字之差的契约错配。",
+        "keyDependencies": [
+          "db.ts（数据层切片）——index.ts/group-queue/task-scheduler/commands 全部依赖，须最先到位",
+          "runtime-config.ts + config.ts（配置切片）——getSystemSettings/DATA_DIR 被本切片 6+ 模块引用",
+          "happycodex 已建件（无需等待）：src/agent-runner.ts、src/runtime/multitenant/{codex-home,session-store}.ts、src/runtime/rollout-archive.ts、src/shared/stream-event.ts（OUTPUT_MARKER 常量唯一真相源）",
+          "IM 切片（im-manager/feishu/telegram 等）——index.ts 的回复路由/onNewChat 依赖其接口，但可先以 stub 接通 Web-only 路径",
+          "Web 切片（web.ts/web-context/routes）——index.ts 的 broadcast 与 main() 启动序列依赖",
+          "shared/stream-event 契约决策——ClaudeContextAudit 等字段改名须与 happycodex 冻结契约评审联动"
+        ],
+        "evidence": [
+          "upstream-happyclaw/src/index.ts:8868 main() 启动序列（migrateDataDirectories→initDatabase→loadState→plugin scan→shutdown handler）",
+          "upstream-happyclaw/src/index.ts:541-686 IpcWatcherManager：fs.watch messages/+tasks/ 事件驱动 + 5s 后备轮询",
+          "upstream-happyclaw/src/index.ts:1278 getSessionClaudeDir → data/sessions/{folder}/.claude；index.ts:2079 summarizeWithClaude 走 execFile claude --print",
+          "upstream-happyclaw/src/group-queue.ts:41 GroupState.selectedProviderId（provider 触点）；group-queue.ts:6 import killProcessTree from container-runner",
+          "upstream-happyclaw/src/container-runner.ts grep -c 'ANTHROPIC|CLAUDE_CONFIG_DIR|providerPool|claude' = 85 处；container-runner.ts:340-474 trySelectPoolProvider、:80-199 .claude.json/settings.json 处理",
+          "upstream-happyclaw/src/agent-output-parser.ts:14-15 OUTPUT_MARKER='---HAPPYCLAW_OUTPUT_START/END---' vs happycodex src/shared/stream-event.ts:81-82 '<<<HAPPYCODEX_OUTPUT_START/END>>>'（字符串不同，解析端须改）",
+          "upstream-happyclaw/src/agent-output-parser.ts:642-697 CLAUDE_LIMIT_PHRASE_PATTERNS/isProviderFailureResult（Claude 限额专属识别）",
+          "upstream-happyclaw/src/task-scheduler.ts imports（:40-49）无任何 ANTHROPIC/claude 引用，仅经 SchedulerDependencies 间接调引擎",
+          "upstream-happyclaw/src/provider-pool.ts:1-6 模块头注释：多提供商负载均衡 round-robin/weighted/failover——codex 单 auth 无需",
+          "upstream-happyclaw/src/agent-capabilities.ts:98-127 resolveSdkBundledClaude 定位 @anthropic-ai/claude-agent-sdk-<plat>-<arch>/claude（SDK 专属，删）",
+          "upstream-happyclaw/src/claude-context-resolver.ts:100-212 buildClaudeContextPlan：CLAUDE.md/rules/skills 四源挂载计划 + ClaudeContextAudit（StreamEvent 契约字段）",
+          "happycodex/src/agent-runner.ts:1-16 头注释：与主仓 container-runner spawn 产物同构（stdin=ContainerInput 超集、OUTPUT_MARKER stdout、IPC 三 sentinel _close/_interrupt/_drain）",
+          "happycodex/src/runtime/multitenant/session-manager.ts:1-23 SessionManager 为长驻多租户模型，与主仓 GroupQueue spawn-per-session 模型并存而非替代",
+          "happycodex/src/runtime/multitenant/codex-home.ts:28-39 AUTH_FILE/config.toml/agents 目录 provision（取代 .claude.json 那套的已建件）"
+        ]
+      },
+      {
+        "evidence": [
+          "upstream-happyclaw/container/agent-runner/src/index.ts:20 — `import { query, HookCallback, PreCompactHookInput, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk'`：主循环深度绑定 Claude SDK，整体由 happycodex codex 引擎替换",
+          "upstream-happyclaw/container/agent-runner/src/index.ts:55 — `const CLAUDE_MODEL = process.env.ANTHROPIC_MODEL || 'opus[1m]'`；index.ts:1386 `systemPrompt: { type:'preset', preset:'claude_code', append: systemPromptAppend }`：模型/提示词注入均 Claude 专属，codex 路径走 baseInstructions/developerInstructions（happycodex src/runtime/session.ts:131-132 已有挂点）",
+          "happycodex src/agent-runner.ts:1-16 — standalone 入口与主仓 container-runner spawn 产物同构（stdin=输入、stdout=OUTPUT_MARKER StreamEvent、IPC input/ 三 sentinel），即 index.ts 主循环的 codex 替换物",
+          "happycodex src/agent-runner.ts:204 — 'standalone 入口只桥接文本（图片/sourceJid 透传给主仓阶段再接；inject 契约只吃 text)'：图片附件注入是已知缺口",
+          "工具 parity：upstream mcp-tools.ts 共 17 个 tool()（send_message/send_image/send_file/schedule_task/list_tasks/pause/resume/cancel_task/register_group/discord_get_history/discord_get_channel_info/discord_get_server_info/install_skill/uninstall_skill/memory_append/memory_search/memory_get，行 205-1466）；happycodex src/runtime/tools/builtin.ts 只有 12 个（行 181-427），缺 send_image/send_file/discord_*×3，且 list_tasks→list_task 命名不一致",
+          "请求-响应语义差异：upstream mcp-tools.ts:60 `pollIpcResult()` 对 list_tasks/install_skill/discord_* 等待主进程回写 *_result（120s 超时）；happycodex src/runtime/tools/ipc-bridge.ts:163-177 的 installSkill/uninstallSkill 是 fire-and-forget 写 messages/，无结果回查",
+          "记忆 flush 机制：upstream index.ts:62/736/2116 — PreCompact 后置位 needsMemoryFlush，用 MEMORY_FLUSH_ALLOWED_TOOLS/disallowedTools（index.ts:82-107）跑受限轮；happycodex src/runtime 全树 grep 'memoryFlush' 无命中，codex 无 allowedTools/disallowedTools 等价物，需重设计",
+          "压缩归档已替换：happycodex src/runtime/codex-runner.ts:143-146 onCompacted → flush compact_partial + rollout 归档 + trim（对齐 upstream createPreCompactHook index.ts:660-737）",
+          "预定义子代理已替换：happycodex src/runtime/multitenant/agent-defs.ts:1-43 — 'PREDEFINED_AGENTS 移植自 happyclaw agent-definitions.ts:15-37'，渲染为 {CODEX_HOME}/agents/<name>.toml（codex 不走 SDK agents 选项）",
+          "容器化完全缺失：grep docker happycodex/src 仅 ipc-input.ts:16,154 注释提及 bind mount；Makefile/package.json 无任何 docker/entrypoint 目标。upstream Dockerfile:4 `FROM node:22-slim`、109-116 `COPY agent-runner/package.json` + `npm install`（装 claude-agent-sdk \"*\"）需换装 codex CLI",
+          "entrypoint.sh Claude 专属段：行 42 `export CLAUDE_CONFIG_DIR=/home/node/.claude`、行 46 `export IS_SANDBOX=1`、行 69-85 skills 符号链接到 /home/node/.claude/skills（codex 无 SKILL.md 机制）；行 7-64 umask/chown/npm-global 持久化为引擎无关可保留",
+          "happycodex 已有 per-folder CODEX_HOME 隔离（src/runtime/multitenant/codex-home.ts，184 行）+ hooks-config + session-manager resume + 单写者 serial-queue，覆盖 upstream 容器内会话目录隔离语义"
+        ],
+        "keyDependencies": [
+          "主进程 container-runner / agent-output-parser 切片（src/container-runner.ts、src/agent-output-parser.ts）：本切片的 Docker 打包、ContainerInput 字段（plugins/agentId/isHome/isAdminHome/attachments）、OUTPUT_MARKER 解析端都由它消费/注入，工具结果回写（*_result）也由主进程 IPC 处理器产生",
+          "IPC 任务处理器（主进程 src/index.ts 的 messages/ tasks/ 消费逻辑，属编排切片）：install_skill/schedule_task/discord_* 的真正执行端；没有它，本切片 5 个缺失工具补齐后也只是写文件无人接",
+          "shared/ 类型切片：stream-event.ts 与 image-detector.ts 的单一真相源及 sync-types 机制（本切片内的 stream-event.types.ts / image-detector.ts 只是构建期副本）",
+          "Skills 管理切片（src/routes/skills.ts + data/skills/）：容器 skills 挂载目录与 install_skill 安装落盘位置由它定义；codex 侧 skills 注入方案需与其联合设计",
+          "配置/env 注入切片（runtime-config.ts → data/env/{folder}/env）：entrypoint.sh source 的 env 文件与 codex 认证变量（OPENAI_API_KEY 等替代 ANTHROPIC_*）由它产出"
+        ],
+        "modules": [
+          {
+            "path": "upstream-happyclaw/container/agent-runner/src/index.ts",
+            "role": "Claude SDK 引擎主入口（2375 行）：stdin→query() 会话循环、IPC 轮询、session resume/recovery、图片多模态消息构造、PreCompact hook、memory flush 受限轮、系统提示词拼装、plugins/mcpServers/settingSources 注入",
+            "classification": "replace-codex",
+            "complexity": "L",
+            "codexNotes": "核心循环已被 happycodex src/agent-runner.ts(271行)+runtime/codex-runner.ts+session.ts+ipc-input.ts 替换（同构 stdin/OUTPUT_MARKER/IPC 协议，src/agent-runner.ts:1-16）。残留缺口需补：(1) 图片附件注入——inject 契约只吃 text（agent-runner.ts:204），codex turn input 的 image 支持需新通路；(2) memory flush——Claude allowedTools/disallowedTools 机制无 codex 等价物，需用专用 turn+developerInstructions 重设计；(3) ContainerInput 完整字段消化（agentId/isHome/isAdminHome/plugins/attachments，目前 parseRunnerInput 宽松忽略）；(4) API error 识别/重试（image media type 错误等 Claude 专属正则可丢）",
+            "dependsOn": [
+              "src/runtime/codex-runner.ts（已有）",
+              "主进程 container-runner 切片",
+              "prompts/ 迁移"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/container/agent-runner/src/mcp-tools.ts",
+            "role": "17 个进程内 MCP 工具（SDK tool()+zod）：send_message/send_image/send_file、schedule_task+4 任务管理、register_group、discord_*×3、install/uninstall_skill、memory_*×3；经 IPC 文件与主进程通信，部分用 pollIpcResult 等待 *_result 回执",
+            "classification": "replace-codex",
+            "complexity": "M",
+            "codexNotes": "happycodex src/runtime/tools/{registry,dispatcher,builtin,ipc-bridge} 已用 codex dynamicTools 实现 12 个（builtin.ts:181-427）。补齐项：(1) 缺 send_image/send_file/discord_get_history/discord_get_channel_info/discord_get_server_info 共 5 个；(2) list_tasks→list_task 命名对齐主仓；(3) pollIpcResult 请求-响应语义（ipc-bridge 目前 install/uninstall_skill/register_group 为 fire-and-forget，模型拿不到安装成败）；(4) isHome/isAdminHome 工具可见性门控（upstream mcp-tools.ts:1085 起 skill/memory 工具仅 home 容器注册）",
+            "dependsOn": [
+              "src/runtime/tools/*（已有）",
+              "主进程 IPC 任务处理器切片（*_result 回写端）"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/container/agent-runner/src/stream-processor.ts",
+            "role": "StreamEventProcessor（1434 行）：Claude SDK 流式消息→StreamEvent 转换、text/thinking 缓冲（200 字符/100ms）、嵌套工具/Skill/Task/AskUserQuestion input_json_delta 追踪、子代理消息转换",
+            "classification": "have",
+            "complexity": "S",
+            "codexNotes": "happycodex src/runtime/stream-mapper.ts（338 行，纯无状态）+ session.ts（有状态缓冲/scope 打标）已是 codex 等价物，且为冻结契约。注意 upstream 多出的事件类型（hook_started/progress/response、task_notification、agent_error、context audit）未进 happycodex StreamEvent（shared/stream-event.ts:10-22 仅 12 类）——接 Web 前端切片时需决策是补类型还是前端降级",
+            "dependsOn": [
+              "src/shared/stream-event.ts（冻结契约）"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/container/agent-runner/src/session-history.ts",
+            "role": "会话恢复纯函数：解析 Claude transcript JSONL 提取最近 20 条对话（崩溃恢复时注入新 session）、孤立代理项清洗（LONE_SURROGATE_RE）",
+            "classification": "adapt-codex",
+            "complexity": "M",
+            "codexNotes": "解析目标从 Claude .claude/projects transcript JSONL 换成 codex CODEX_HOME/sessions rollout JSONL（格式不同：response_item/event_msg）。happycodex src/runtime/rollout-archive.ts 已会读写 rollout 做归档/trim，可复用其解析基建；LONE_SURROGATE_RE 等纯函数原样保留",
+            "dependsOn": [
+              "src/runtime/rollout-archive.ts（已有）",
+              "src/runtime/multitenant/codex-home.ts（已有）"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/container/agent-runner/src/history-image-prune.ts",
+            "role": "Claude transcript 内已处理 base64 图片剪除（411 行）：定位 last assistant 之前的 image block 替换为 marker，省 token",
+            "classification": "drop-claude-only",
+            "complexity": "S",
+            "codexNotes": "逐字段绑定 Claude transcript JSONL 结构，无移植价值。codex 侧若未来落地图片输入，应针对 rollout 格式重写等价优化（且 codex 的 compact 机制可能已部分覆盖该需求），不作为 A 阶段范围",
+            "dependsOn": [
+              "图片附件输入支持（index.ts 残留缺口 1）"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/container/agent-runner/src/image-detector.ts",
+            "role": "magic bytes 图片 MIME 检测（shared/image-detector.ts 构建期副本，勿直接编辑）",
+            "classification": "port-asis",
+            "complexity": "S",
+            "codexNotes": "引擎无关纯函数。真相源在 shared/ 切片；本副本随 sync-types 机制走，等图片输入通路落地时一并引入",
+            "dependsOn": [
+              "shared/ 类型切片（sync-types）"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/container/agent-runner/src/stream-event.types.ts",
+            "role": "StreamEvent 类型构建期副本（真相源 shared/stream-event.ts）",
+            "classification": "have",
+            "complexity": "S",
+            "codexNotes": "happycodex src/shared/stream-event.ts 已是单一真相源（85 行冻结契约）。不需要副本同步机制，除非恢复三项目结构（后端/前端/runner 分仓）时再引入 sync-types",
+            "dependsOn": []
+          },
+          {
+            "path": "upstream-happyclaw/container/agent-runner/src/types.ts",
+            "role": "ContainerInput/ContainerOutput/SessionsIndex/ParsedMessage 等容器协议类型",
+            "classification": "adapt-codex",
+            "complexity": "S",
+            "codexNotes": "happycodex src/contracts.ts 的 CodexRunnerInput 已宽松兼容 ContainerInput（parseRunnerInput，agent-runner.ts:75-119）。需补：images attachments、agentId、isHome/isAdminHome、chatJid、plugins 字段的正式声明与消化；sessionId→resumeThreadId 映射已有",
+            "dependsOn": [
+              "src/contracts.ts（冻结契约，扩展需走变更流程）"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/container/agent-runner/src/utils.ts",
+            "role": "纯工具函数（204 行）：shorten/redactSensitive（含 ANTHROPIC_API_KEY 等敏感键脱敏）/sanitizeFilename/extractSkillName/summarizeToolInput",
+            "classification": "port-asis",
+            "complexity": "S",
+            "codexNotes": "基本引擎无关。happycodex stream-mapper 已有自己的 toolInputSummary 脱敏；搬迁时去重合并，敏感键正则把 ANTHROPIC 扩成 OPENAI/CODEX 系",
+            "dependsOn": []
+          },
+          {
+            "path": "upstream-happyclaw/container/agent-runner/src/agent-definitions.ts",
+            "role": "预定义 SubAgent（code-reviewer/web-researcher），经 SDK agents 选项注册为 Task 目标",
+            "classification": "have",
+            "complexity": "S",
+            "codexNotes": "已移植：src/runtime/multitenant/agent-defs.ts:27-43 渲染为 {CODEX_HOME}/agents/<name>.toml（codex spawnAgent 路径，PoC 实测）。SDK 专属字段 tools/model/maxTurns 无 codex 对应，web-researcher 搜索能力改由 web_search='live' 提供——已在注释中决策",
+            "dependsOn": []
+          },
+          {
+            "path": "upstream-happyclaw/container/agent-runner/src/channel-prefixes.ts",
+            "role": "IM channel→JID prefix 映射 + getChannelFromJid（与主进程共享，18 行）",
+            "classification": "port-asis",
+            "complexity": "S",
+            "codexNotes": "纯映射零适配。供 prompts/channels/*.md 选择与回复路由用；随 IM 切片一起到位即可",
+            "dependsOn": [
+              "IM/主进程切片（消费方）"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/container/agent-runner/prompts/",
+            "role": "系统提示词分片（9 个 md + channels/4 个）：security-rules/interaction/skill-routing/output/web-fetch/background-tasks/agent-override/memory-system.{home,guest} + 飞书/钉钉/QQ/Telegram 渠道规范",
+            "classification": "adapt-codex",
+            "complexity": "M",
+            "codexNotes": "内容大体引擎无关可搬，但注入方式从 systemPrompt preset 'claude_code' append（index.ts:1386）改为 codex baseInstructions/developerInstructions（session.ts:131-132 挂点已有）；需通读改写 Claude 工具名引用（Task/TodoWrite/WebFetch/Skill 等→codex 等价行为描述），background-tasks/skill-routing 两篇与 Claude agent teams/Skill 机制耦合最深",
+            "dependsOn": [
+              "src/runtime/session.ts（已有挂点）",
+              "工具 parity 补齐（提示词描述的工具要真实存在）"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/container/skills/",
+            "role": "项目级 Skills（agent-browser/install-skill/post-test-cleanup 三个 SKILL.md），entrypoint 符号链接到容器 ~/.claude/skills/ 被 Claude Code skills 机制发现",
+            "classification": "adapt-codex",
+            "complexity": "M",
+            "codexNotes": "codex CLI 无 SKILL.md/skills 发现机制。三篇内容是行为指南，可改注入为 developerInstructions 片段或 AGENTS.md 段落；install-skill 引用的 install_skill 工具在 happycodex dynamicTools 已有。'skills 安装' 全链路（registry 下载→落盘→下会话生效）需与 Skills 管理切片联合重设计 codex 版承载方式",
+            "dependsOn": [
+              "prompts/ 迁移方案",
+              "Skills 管理切片（src/routes/skills.ts）"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/container/Dockerfile",
+            "role": "容器镜像（174 行）：node:22-slim + Chromium/构建链/Python/多媒体/DB 客户端 + uv + agent-browser + feishu-cli(latest via 302) + builtin skills + npm install claude-agent-sdk \"*\"",
+            "classification": "adapt-codex",
+            "complexity": "M",
+            "codexNotes": "happycodex 目前零容器化（grep 无任何 docker 产物）。系统工具链层（行 10-104）引擎无关原样保留；改造点：行 109-116 的 claude-agent-sdk/claude-code 安装→pin 版 @openai/codex CLI（codex 0.137 行为已实测，不宜 \"*\" 追 latest——上游 SDK 永远最新的策略对 codex 风险高）；行 133-139 builtin-skills 层按 skills 方案取舍；agent-runner 构建产物换成 happycodex dist",
+            "dependsOn": [
+              "happycodex 构建产物（已有）",
+              "container/entrypoint.sh 改造",
+              "skills 方案"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/container/entrypoint.sh",
+            "role": "容器入口（107 行）：umask/chown 卷权限、git safe.directory、source env 文件、CLAUDE_CONFIG_DIR/IS_SANDBOX、npm-global 持久化、skills 符号链接发现、容器内 tsc、runuser 降权执行",
+            "classification": "adapt-codex",
+            "complexity": "M",
+            "codexNotes": "权限/umask/env-source/npm-global 持久化/降权段（行 4-64、93-107）引擎无关保留。改造：行 42 CLAUDE_CONFIG_DIR→CODEX_HOME（happycodex codex-home.ts 的 per-folder 隔离语义要映射到容器内固定挂载点）；行 46 IS_SANDBOX 删除（codex 用自身 sandbox/approvalPolicy，happycodex session config 已带）；行 69-85 skills 符号链接段随 skills 方案重写或删除；行 88 容器内 tsc 热编译可改为直接跑预构建 dist",
+            "dependsOn": [
+              "src/runtime/multitenant/codex-home.ts（已有，语义对齐）",
+              "container/Dockerfile"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/container/build.sh",
+            "role": "docker build 包装（CACHEBUST + 镜像 tag + sentinel touch）",
+            "classification": "port-asis",
+            "complexity": "S",
+            "codexNotes": "改镜像名 happyclaw-agent→happycodex-agent；若 Dockerfile 取消 \"*\" 追 latest 策略，CACHEBUST 可弱化为可选参数",
+            "dependsOn": [
+              "container/Dockerfile"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/container/agent-runner/package.json",
+            "role": "agent-runner 独立 Node 项目声明：claude-agent-sdk/claude-code \"*\"、cron-parser、zod；无 lockfile 策略",
+            "classification": "replace-codex",
+            "complexity": "S",
+            "codexNotes": "happycodex 的 runner 在主 src 树内（ESM/.js 约束、已有 package.json），无需独立子项目；容器内只需打包 dist + node_modules。cron-parser 在补 schedule_task 校验时按需引入",
+            "dependsOn": [
+              "happycodex package.json（已有）"
+            ]
+          }
+        ],
+        "slice": "执行引擎本体 & 容器（container/agent-runner + container/skills + Docker 打包）",
+        "sliceSummary": "本切片是 have/replace 核心区，结论成立但有明确尾巴：upstream container/ 约 6.85k 行中，引擎主体（index.ts 主循环、stream-processor、agent-definitions、stream-event 副本、package.json）≈4.2k 行已被 happycodex 的 codex 引擎实质替换/覆盖（have+replace ≈ 5/16 模块、约 60% 行数）；adapt-codex ≈ 7/16（prompts、skills、Dockerfile、entrypoint、types、session-history、mcp-tools 残差），port-asis ≈ 3/16（utils、channel-prefixes、image-detector、build.sh 等小件），drop-claude-only 仅 history-image-prune 1 件。三大硬缺口：(1) 工具 parity——12/17，缺 send_image/send_file/discord_*×3，且缺 pollIpcResult 请求-响应回执语义和 isHome 门控；(2) 提示词/skills 体系——prompts/*.md 未迁移、codex 无 SKILL.md 机制需重设计承载（developerInstructions 挂点已就绪）；(3) 容器化为零——happycodex 无任何 Dockerfile/entrypoint，Docker 打包是全新 adapt 工作（工具链层可原样抄，Claude SDK 安装层换 pin 版 codex CLI）。另有图片附件输入与 memory-flush 受限轮两个引擎级残留缺口挂在 replace 项下。"
+      },
+      {
+        "slice": "IM 渠道层（feishu/dingtalk/discord/qq/wechat 适配器 + 流式卡片 + im-* 辅助 + im-safety）",
+        "modules": [
+          {
+            "path": "upstream-happyclaw/src/im-channel.ts",
+            "role": "统一 IMChannel 接口 + 各渠道 factory 包装 + StreamingSession 联合类型 + CHANNEL_REGISTRY；index.ts 通过回调（onMessage/onCommand/onAgentMessage 等）驱动，本身不触执行链",
+            "classification": "port-asis",
+            "complexity": "M",
+            "codexNotes": "完全引擎无关。注意它 import telegram/whatsapp 渠道（im-channel.ts:17,47）——若那两个渠道属其他切片或暂缓，需同步裁剪。StreamingSession 是四个卡片控制器的联合类型，签名不含 StreamEvent",
+            "dependsOn": [
+              "各渠道适配器(feishu/dingtalk/qq/wechat/discord/telegram/whatsapp)",
+              "channel-prefixes.ts",
+              "types.ts",
+              "logger.ts",
+              "四个 streaming 控制器"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/im-manager.ts",
+            "role": "多租户 IM 连接生命周期管理（per-user 连接、配置持久化到 DATA_DIR、热重连、ignoreMessagesBefore）",
+            "classification": "port-asis",
+            "complexity": "M",
+            "codexNotes": "引擎无关。依赖 db.getRegisteredGroup/getJidsByFolder 与 runtime-config 的 per-user IM 配置，这些属 DB/主进程切片，须先到位",
+            "dependsOn": [
+              "im-channel.ts",
+              "db.ts",
+              "config.ts(DATA_DIR)",
+              "runtime-config.ts",
+              "types.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/feishu.ts",
+            "role": "飞书 WS 长连接适配器：收消息归一化（图片 marker、文件下载、引用消息）、发消息/卡片、群同步、去重、ack 表情、P2P owner 探测",
+            "classification": "port-asis",
+            "complexity": "L",
+            "codexNotes": "feishu.ts:2079 的 getFeishuProviderConfigWithSource 是飞书 appId/appSecret（IM provider），与 LLM provider-pool 无关，不要误删。storeMessageDirect/broadcastNewMessage（feishu.ts:1305,1315）依赖 db/web 切片",
+            "dependsOn": [
+              "db.ts",
+              "web.ts(broadcastNewMessage)",
+              "runtime-config.ts",
+              "im-utils.ts",
+              "im-safety/",
+              "image-detector.ts",
+              "feishu-cards/",
+              "feishu-markdown-style.ts",
+              "message-notifier.ts",
+              "types.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/feishu-streaming-card.ts",
+            "role": "飞书流式卡片控制器（三级降级：streaming_mode→CardKit v1→legacy patch），暴露命令式 API：append/appendThinking/startTool/endTool/setHook/setTodos/pushRecentEvent/patchUsageNote",
+            "classification": "port-asis",
+            "complexity": "L",
+            "codexNotes": "本文件不直接消费 StreamEvent——StreamEvent→卡片映射在 index.ts:256 feedStreamEventToCard（主进程切片，那里才是 adapt-codex 点）。注意两点：(1) patchUsageNote 契约假设 usage 在 result 之后到达（feishu-streaming-card.ts:1724 注释），happycodex shared/stream-event.ts 有 'usage' 事件，需核对 stream-mapper 时序；(2) setHook/setTodos 对应的 hook_*/todo_update 事件 happycodex 事件集没有，搬过来后这些面板天然不被驱动，可保留为 no-op 或后续在 stream-mapper 扩展",
+            "dependsOn": [
+              "feishu-cards/",
+              "feishu-markdown-style.ts",
+              "logger.ts",
+              "@larksuiteoapi/node-sdk"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/feishu-cards/ (builder/sections/status-theme/length/types)",
+            "role": "纯函数飞书 v2 卡片 JSON 构造器（静态终态卡 + 流式骨架卡）、状态主题、长度预算、meta 渲染",
+            "classification": "adapt-codex",
+            "complexity": "S",
+            "codexNotes": "99% 可原样搬；唯二 Claude 痕迹是 sections.ts:99 shortModel() 只识别 opus|sonnet|haiku 命名（codex 的 gpt-5-* 会走 20 字符截断兜底，需加 gpt 分支），以及 types.ts:18 CardMeta.model 文档示例。CardMeta.costUSD/cache tokens 为可选字段，codex usage 不提供则不渲染，无需改",
+            "dependsOn": [
+              "feishu-markdown-style.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/feishu-markdown-style.ts",
+            "role": "Markdown → 飞书富文本渲染风格优化（纯函数）",
+            "classification": "port-asis",
+            "complexity": "S",
+            "codexNotes": "无引擎接触点",
+            "dependsOn": []
+          },
+          {
+            "path": "upstream-happyclaw/src/feishu-mention-gate.ts",
+            "role": "飞书群聊 @mention 守卫纯函数（botOpenId 未知时 fail-closed，有单测锁语义）",
+            "classification": "port-asis",
+            "complexity": "S",
+            "codexNotes": "纯函数零依赖，连同其测试一起搬",
+            "dependsOn": []
+          },
+          {
+            "path": "upstream-happyclaw/src/dingtalk.ts",
+            "role": "钉钉 Stream 模式适配器：收发消息、文件/图片 downloadCode 下载、引用消息解析、AI 卡片、内联文件文本注入",
+            "classification": "port-asis",
+            "complexity": "L",
+            "codexNotes": "dingtalk.ts:237 提到 'MiniMax through Anthropic protocol' 仅是注释里的动机说明；内联文件文本 + 防注入 nonce fence 的行为本身引擎无关且对 codex 同样有用。产出的 prompt content block 最终进入消息文本，需确认与 happycodex ipc-input 的输入格式兼容",
+            "dependsOn": [
+              "db.ts",
+              "web.ts",
+              "im-downloader.ts",
+              "file-text-extractor.ts",
+              "image-detector.ts",
+              "im-utils.ts",
+              "im-safety/",
+              "dingtalk-reply-parser.ts",
+              "config.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/dingtalk-reply-parser.ts",
+            "role": "钉钉引用/回复消息纯解析器（file/picture/text 多形态 repliedMsg）",
+            "classification": "port-asis",
+            "complexity": "S",
+            "codexNotes": "纯函数",
+            "dependsOn": []
+          },
+          {
+            "path": "upstream-happyclaw/src/dingtalk-streaming-card.ts",
+            "role": "钉钉 AI 卡片流式控制器，API 与 feishu 卡片控制器签名兼容（dingtalk-streaming-card.ts:5 注明可被 feedStreamEventToCard 无改动驱动）",
+            "classification": "port-asis",
+            "complexity": "M",
+            "codexNotes": "同 feishu-streaming-card：本体不消费 StreamEvent，驱动方在 index.ts",
+            "dependsOn": [
+              "logger.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/discord.ts",
+            "role": "Discord 适配器（bot 网关连接、消息收发、附件下载、群事件）",
+            "classification": "port-asis",
+            "complexity": "M",
+            "codexNotes": "无引擎接触点；discord.ts:186 的 'fence markers' 是 Markdown 代码块围栏，与 compact marker 无关",
+            "dependsOn": [
+              "db.ts",
+              "web.ts",
+              "im-downloader.ts",
+              "image-detector.ts",
+              "im-utils.ts",
+              "im-safety/",
+              "message-notifier.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/discord-streaming-edit.ts",
+            "role": "Discord 基于消息编辑的流式输出控制器（StreamingSession 成员）",
+            "classification": "port-asis",
+            "complexity": "M",
+            "codexNotes": "同上，命令式 API，引擎无关",
+            "dependsOn": [
+              "logger.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/qq.ts",
+            "role": "QQ 适配器（连接、收发、图片/文件处理、群事件）",
+            "classification": "port-asis",
+            "complexity": "L",
+            "codexNotes": "无引擎接触点",
+            "dependsOn": [
+              "db.ts",
+              "web.ts",
+              "im-downloader.ts",
+              "image-detector.ts",
+              "im-utils.ts",
+              "im-safety/",
+              "qq-reconnect.ts",
+              "message-notifier.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/qq-reconnect.ts",
+            "role": "QQ 重连退避策略纯逻辑",
+            "classification": "port-asis",
+            "complexity": "S",
+            "codexNotes": "纯函数",
+            "dependsOn": []
+          },
+          {
+            "path": "upstream-happyclaw/src/qq-streaming-card.ts",
+            "role": "QQ 流式输出控制器（StreamingSession 成员）",
+            "classification": "port-asis",
+            "complexity": "M",
+            "codexNotes": "同卡片控制器家族，引擎无关",
+            "dependsOn": [
+              "logger.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/wechat.ts",
+            "role": "微信（公众号/企微回调）适配器：回调收消息、加解密、发消息",
+            "classification": "port-asis",
+            "complexity": "M",
+            "codexNotes": "无引擎接触点；回调入口可能挂在 web 路由上，与 web 切片有装配耦合",
+            "dependsOn": [
+              "wechat-crypto.ts",
+              "db.ts",
+              "web.ts",
+              "im-downloader.ts",
+              "image-detector.ts",
+              "im-utils.ts",
+              "message-notifier.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/wechat-crypto.ts",
+            "role": "微信消息 AES 加解密 + 签名校验",
+            "classification": "port-asis",
+            "complexity": "S",
+            "codexNotes": "纯 crypto，零引擎依赖",
+            "dependsOn": [
+              "logger.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/im-utils.ts",
+            "role": "渠道共享工具：markdownToPlainText、消息去重缓存（从 qq/dingtalk/wechat 提炼）",
+            "classification": "port-asis",
+            "complexity": "S",
+            "codexNotes": "纯函数零 import",
+            "dependsOn": []
+          },
+          {
+            "path": "upstream-happyclaw/src/im-downloader.ts",
+            "role": "把 IM 收到的文件/图片下载落盘到群组工作区（GROUPS_DIR）",
+            "classification": "port-asis",
+            "complexity": "S",
+            "codexNotes": "落盘路径 GROUPS_DIR 须与 happycodex multitenant 的 per-folder 工作区布局对齐（runtime/multitenant 已建，注意目录约定一致）",
+            "dependsOn": [
+              "config.ts(GROUPS_DIR)"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/im-context-isolation.ts",
+            "role": "per-user IM 自动上下文隔离配置解析（feishu autoIsolateContext，纯函数 + 注入 deps）",
+            "classification": "port-asis",
+            "complexity": "S",
+            "codexNotes": "纯函数；其下游效果（为每个 IM 会话开 conversation agent）由主进程实现，对应 happycodex multitenant 会话隔离能力，本模块只算配置开关",
+            "dependsOn": [
+              "types.ts(RegisteredGroup/SubAgent)",
+              "runtime-config.ts(getUserFeishuConfig，经 deps 注入)"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/im-group-defaults.ts",
+            "role": "IM 群自动注册时的默认字段纯计算（require_mention），有单测锁定",
+            "classification": "port-asis",
+            "complexity": "S",
+            "codexNotes": "纯函数，连同 tests/im-group-defaults.test.ts 一起搬",
+            "dependsOn": []
+          },
+          {
+            "path": "upstream-happyclaw/src/im-command-utils.ts",
+            "role": "IM 斜杠命令的纯格式化工具（工作区/agent 列表渲染、近期消息上下文摘要）",
+            "classification": "port-asis",
+            "complexity": "S",
+            "codexNotes": "纯格式化；'agent' 指 happyclaw 的 conversation sub-agent 概念，与 happycodex multitenant 的 agent 命名对齐即可，不触 codex 协议",
+            "dependsOn": []
+          },
+          {
+            "path": "upstream-happyclaw/src/message-attachments.ts",
+            "role": "图片附件归一化（base64/data URL 解析 + magic-byte MIME 校验），产出喂给 agent 输入的标准 image block",
+            "classification": "port-asis",
+            "complexity": "S",
+            "codexNotes": "模块本身纯；接触点在消费方——归一化结果最终进 agent 输入，需确认 happycodex ipc-input/codex 是否及如何接收图片输入（codex CLI 支持 image input item，但 happycodex runtime/ipc-input.ts 当前协议需扩展才能携带图片）",
+            "dependsOn": [
+              "image-detector.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/message-notifier.ts",
+            "role": "interruptibleSleep + notifyNewImMessage：唤醒 index.ts 2s 轮询循环的轻量通知器",
+            "classification": "port-asis",
+            "complexity": "S",
+            "codexNotes": "零依赖；前提是主进程切片保留轮询消息循环架构（message-notifier.ts:4-10 注释描述的契约）",
+            "dependsOn": [
+              "index.ts 轮询循环（主进程切片）"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/channel-prefixes.ts",
+            "role": "渠道类型 → JID 前缀映射常量（18 行），注明'主服务与 agent-runner 共享'",
+            "classification": "port-asis",
+            "complexity": "S",
+            "codexNotes": "channel-prefixes.ts:1 说与 agent-runner 共享——happyclaw 靠 make sync-types 复制进 container/agent-runner；happycodex 是 standalone 单包 + 自建 agent-runner.ts，应改为直接 import，废弃 sync 机制",
+            "dependsOn": []
+          },
+          {
+            "path": "upstream-happyclaw/src/image-detector.ts",
+            "role": "magic-byte 图片 MIME 探测（PNG/JPEG/GIF/WebP），canonical source 同步到 container/agent-runner",
+            "classification": "port-asis",
+            "complexity": "S",
+            "codexNotes": "image-detector.ts:3 的 'synced to container/agent-runner via make sync-types' 在 happycodex 中失效——container/agent-runner 已被 codex 版 src/agent-runner.ts 整体替换（replace-codex 属其他切片），本文件直接 import 即可",
+            "dependsOn": []
+          },
+          {
+            "path": "upstream-happyclaw/src/file-text-extractor.ts",
+            "role": "从 PDF/DOC/DOCX/RTF/纯文本提取文字用于内联 prompt 注入（pdftotext/textutil/pandoc）",
+            "classification": "port-asis",
+            "complexity": "S",
+            "codexNotes": "动机注释提'弱模型不可靠的 Read 调用'，但内联文本对 codex 同样减少一次工具往返，行为保留；注意运行环境需有 poppler/pandoc（host 模式下是宿主机依赖）",
+            "dependsOn": [
+              "logger.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/im-safety/ (processing-lock.ts + stale-detector.ts + index.ts)",
+            "role": "per-chat 处理锁（防同一会话并发处理）+ 过期消息检测（防重连后处理堆积旧消息）",
+            "classification": "port-asis",
+            "complexity": "S",
+            "codexNotes": "纯逻辑零依赖；与 happycodex multitenant 单写者模型互补不冲突（这是 IM 入口侧防抖，那是会话写入侧串行化）",
+            "dependsOn": []
+          }
+        ],
+        "sliceSummary": "IM 渠道层 ~18.9k 行、27 个模块（happycodex 现 src/ 完全没有对应物）整体判断：几乎纯引擎无关，约 96% port-asis（26/27 模块），1 个 adapt-codex（feishu-cards/sections.ts 的 shortModel 只识别 claude 模型名，S 级一处 regex），0 个 have / replace / drop。关键架构事实：StreamEvent → 流式卡片的映射函数 feedStreamEventToCard 不在本切片——它在 index.ts:256（主进程切片），四个流式卡片控制器（feishu/dingtalk/discord/qq）全部暴露命令式 API（append/startTool/setHook/setTodos/patchUsageNote），自身不 import StreamEvent。因此 codex 事件集差异（happycodex shared/stream-event.ts 缺 tool_result/hook_*/todo_update/task_*，多 result/compact_partial）的适配工作落在主进程映射层，不落在本切片；本切片搬迁后 setHook/setTodos 等面板在 codex 下天然不被驱动（无害 no-op）。三个跨切片注意点：(1) patchUsageNote 假设 usage 在 result 后到达，需核对 happycodex stream-mapper 时序；(2) message-attachments 的图片 block 要求 ipc-input/codex 支持图片输入（协议需扩展）；(3) channel-prefixes/image-detector 的 make sync-types 复制机制随 container/agent-runner 被替换而废弃，改直接 import。",
+        "keyDependencies": [
+          "db.ts（storeMessageDirect/storeChatMetadata/getRegisteredGroup/getJidsByFolder）——所有适配器落库消息，DB 切片须先到位",
+          "web.ts broadcastNewMessage——适配器收消息后推送 Web，Web 切片接口须先定",
+          "config.ts（DATA_DIR/GROUPS_DIR）与 runtime-config.ts（per-user IM 配置如 getFeishuProviderConfigWithSource/getUserDingTalkConfig）",
+          "index.ts 主进程：feedStreamEventToCard（index.ts:256，StreamEvent→卡片映射，真正的 adapt-codex 点）、消息轮询循环（message-notifier 契约）、IMChannelConnectOpts 全部回调的实现（onCommand/onAgentMessage/resolveEffectiveChatJid 等）",
+          "happycodex shared/stream-event.ts 事件集——决定卡片哪些面板（hook/todo/tool_result 时间线）能被驱动",
+          "happycodex runtime/ipc-input.ts——图片附件与内联文件文本进入 codex 输入的协议",
+          "types.ts（FeishuMessageMeta/RegisteredGroup/SubAgent）与 logger.ts",
+          "telegram.ts/whatsapp.ts（其他切片）——im-channel.ts 与 im-manager.ts 直接 import 它们，搬迁顺序或裁剪需协调"
+        ],
+        "evidence": [
+          "/Users/bytedance/Workspace/code_agnet/happycodex/upstream-happyclaw/src/index.ts:256 — feedStreamEventToCard(session, se: StreamEvent, ...) 定义在 index.ts 而非任何卡片控制器，证明卡片层不直接消费 StreamEvent",
+          "/Users/bytedance/Workspace/code_agnet/happycodex/upstream-happyclaw/src/dingtalk-streaming-card.ts:5 与 discord-streaming-edit.ts:5 — 注释明确控制器与 feishu 卡片 API 签名兼容、由 feedStreamEventToCard 统一驱动",
+          "/Users/bytedance/Workspace/code_agnet/happycodex/upstream-happyclaw/src/im-channel.ts:60-64 — StreamingSession 联合类型仅含四个控制器类，签名不含 StreamEvent",
+          "/Users/bytedance/Workspace/code_agnet/happycodex/src/shared/stream-event.ts:11-22 对比 upstream-happyclaw/src/stream-event.types.ts:13-22 — happycodex 事件集缺 tool_result/hook_started/hook_progress/hook_response/todo_update/task_progress 等，多 result/compact_partial；差异在主进程映射层消化",
+          "/Users/bytedance/Workspace/code_agnet/happycodex/upstream-happyclaw/src/feishu-streaming-card.ts:1724 — 'agent-runner emits usage after the final result' 是 patchUsageNote 的时序契约，需对 happycodex stream-mapper 验证",
+          "/Users/bytedance/Workspace/code_agnet/happycodex/upstream-happyclaw/src/feishu-cards/sections.ts:99 — shortModel 正则仅匹配 opus|sonnet|haiku，codex 模型名走 20 字符截断兜底，本切片唯一 Claude 痕迹",
+          "/Users/bytedance/Workspace/code_agnet/happycodex/upstream-happyclaw/src/feishu.ts:2079-2081 — getFeishuProviderConfigWithSource 是飞书 appId/appSecret，'provider' 与 LLM provider-pool 无关",
+          "/Users/bytedance/Workspace/code_agnet/happycodex/upstream-happyclaw/src/image-detector.ts:3 与 channel-prefixes.ts:1 — 'synced to container/agent-runner via make sync-types'，happycodex 替换 agent-runner 后此同步机制废弃",
+          "/Users/bytedance/Workspace/code_agnet/happycodex/upstream-happyclaw/src/dingtalk.ts:237 — 'MiniMax through Anthropic protocol' 仅为内联文件文本的动机注释，行为引擎无关",
+          "happycodex 现状：/Users/bytedance/Workspace/code_agnet/happycodex/src 仅有 agent-runner.ts/appserver/contracts.ts/runtime/shared，无任何 IM 模块（ls 实测）",
+          "切片体量：wc -l 实测 27 个文件合计 18893 行（feishu.ts 2153 / feishu-streaming-card.ts 2652 / dingtalk.ts 2364 / qq.ts 2027 / im-manager.ts 1236 / im-channel.ts 1028 等）"
+        ]
+      },
+      {
+        "slice": "Web 前后端 & 认证/权限",
+        "modules": [
+          {
+            "path": "upstream-happyclaw/src/auth.ts",
+            "role": "密码 bcrypt 哈希/校验、session token 生成与 HMAC 签名、cookie 工具（含 legacy 未签名 cookie 迁移开关）",
+            "classification": "port-asis",
+            "complexity": "S",
+            "codexNotes": "纯认证基础设施，零引擎耦合。仅依赖 config.ts 的 WEB_SESSION_SECRET 常量。",
+            "dependsOn": [
+              "src/config.ts(常量层)",
+              "src/utils.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/middleware/auth.ts",
+            "role": "Cookie session 认证中间件 + requirePermission/requireAnyPermission 权限中间件工厂（170 行）",
+            "classification": "port-asis",
+            "complexity": "S",
+            "codexNotes": "无任何 Claude 引用。依赖 web-context 的 session cache 与 db 的 user_sessions 表。",
+            "dependsOn": [
+              "src/web-context.ts",
+              "src/db.ts",
+              "src/auth.ts",
+              "src/permissions.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/permissions.ts",
+            "role": "RBAC 权限常量（6 权限）、权限模板（admin_full/member_basic/ops_manager/user_admin）、hasPermission 纯函数",
+            "classification": "port-asis",
+            "complexity": "S",
+            "codexNotes": "纯常量+纯函数，原样搬。",
+            "dependsOn": [
+              "src/types.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/owner-gate.ts",
+            "role": "纯函数门控：群组 owner 被禁用/删除后立即停止响应（29 行）",
+            "classification": "port-asis",
+            "complexity": "S",
+            "codexNotes": "纯函数，零依赖，原样搬。",
+            "dependsOn": []
+          },
+          {
+            "path": "upstream-happyclaw/src/cross-group-acl.ts",
+            "role": "纯函数 ACL：跨群组 IPC 消息发送授权（admin home 全通 / 同 folder / 同 created_by / target_main_jid 绑定）",
+            "classification": "port-asis",
+            "complexity": "S",
+            "codexNotes": "纯函数。消费方是 IPC 消息处理（index.ts），与 happycodex runtime/tools/ipc-bridge 的跨组语义对接时需保持判定一致。",
+            "dependsOn": [
+              "src/types.ts(RegisteredGroup)"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/group-owner.ts",
+            "role": "群组 owner 生命周期纯转换（claim/release 不变量集中）+ persistGroupUpdate 绑定 db 写与 cache 更新",
+            "classification": "port-asis",
+            "complexity": "S",
+            "codexNotes": "引擎无关，服务 IM 群聊 owner 模型。",
+            "dependsOn": [
+              "src/db.ts",
+              "src/types.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/mount-security.ts",
+            "role": "容器额外挂载白名单校验 + 黑名单模式（.ssh/.aws/credentials 等）+ 非主会话只读强制（424 行）",
+            "classification": "port-asis",
+            "complexity": "M",
+            "codexNotes": "逻辑引擎无关，原样搬；但消费方从 container-runner 换成 happycodex 的 codex 容器编排，挂载点路径约定需与新 runner 对齐。黑名单宜补 codex 凭据路径（~/.codex/auth.json）。",
+            "dependsOn": [
+              "src/config.ts(MOUNT_ALLOWLIST_PATH)",
+              "src/types.ts",
+              "替换后的 container/codex-runner 编排层"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/billing.ts",
+            "role": "计费核心：套餐/余额/配额检查（cost+token 双维度日/周/月窗口）/兑换码/月度聚合（965 行）",
+            "classification": "adapt-codex",
+            "complexity": "M",
+            "codexNotes": "框架引擎无关，但配额与扣费基于 costUSD（billing.ts:622,647 接收 Claude SDK usage 事件的 costUSD）。codex usage 只给 token 数（happycodex stream-event.ts 的 usage 为 Record<string,unknown> 透传），无 costUSD —— 需自建模型单价表折算成本，或降级为纯 token 配额。",
+            "dependsOn": [
+              "src/db.ts(billing 表族)",
+              "src/runtime-config.ts",
+              "codex usage 事件落库管道（engine 切片）"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/routes/auth.ts",
+            "role": "登录/登出/注册/设置向导/邀请码/RBAC/profile（856 行）；GET /api/auth/status 返回 setupStatus",
+            "classification": "adapt-codex",
+            "complexity": "M",
+            "codexNotes": "主体 port-asis；唯一引擎耦合点是 setupStatus 的 claudeConfigured 判定（routes/auth.ts:101-119 检查 claudeCodeOauthToken/anthropicApiKey/anthropicBaseUrl）→ 改成 codexConfigured（检查 codex auth.json / OPENAI_API_KEY / 自定义 base_url）。注册后 ensureUserHomeGroup 依赖编排层。",
+            "dependsOn": [
+              "src/auth.ts",
+              "src/middleware/auth.ts",
+              "src/db.ts",
+              "codex provider 配置存储（替代 getClaudeProviderConfig）"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/routes/admin.ts",
+            "role": "用户管理/邀请码/审计日志/注册设置（931 行）；禁用用户时断开其 IM 连接",
+            "classification": "port-asis",
+            "complexity": "M",
+            "codexNotes": "无 Claude 引用，依赖 im-manager（IM 切片）做 disconnect-on-disable。",
+            "dependsOn": [
+              "src/im-manager.ts(IM 切片)",
+              "src/db.ts",
+              "src/middleware/auth.ts",
+              "src/permissions.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/routes/billing.ts",
+            "role": "计费 API：套餐 CRUD/订阅/余额/兑换码/审计（747 行）",
+            "classification": "port-asis",
+            "complexity": "M",
+            "codexNotes": "纯 API 层，无引擎耦合；跟随 src/billing.ts 的 cost→token 适配即可。",
+            "dependsOn": [
+              "src/billing.ts",
+              "src/db.ts",
+              "src/schemas.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/routes/usage.ts",
+            "role": "用量统计 API（86 行）：usage_daily_summary 聚合，admin 可看全员",
+            "classification": "port-asis",
+            "complexity": "S",
+            "codexNotes": "路由本身零耦合；数据来源是 usage StreamEvent 落库（engine 切片负责把 codex token_usage 写入 usage_records）。costUSD 列可能恒为 0/估算值。",
+            "dependsOn": [
+              "src/db.ts(usage 表)",
+              "codex usage 落库管道"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/routes/config.ts",
+            "role": "配置路由（3043 行）：/api/config/claude 多 provider CRUD+OAuth+连通性测试+provider-pool 均衡（337-940 行段），外加 appearance/system/external-resources/user-im/*（feishu/telegram/qq/dingtalk/discord/whatsapp）",
+            "classification": "adapt-codex",
+            "complexity": "XL",
+            "codexNotes": "必须拆开：① /claude provider 段 import provider-pool.js（config.ts:16 区域）→ provider-pool/failover 是 Claude 专属，整段 drop，重写为单一 codex 认证配置（ChatGPT OAuth / OPENAI_API_KEY / base_url，写 codex-home config.toml，happycodex 已有 runtime/multitenant/codex-home.ts）；② user-im/* 与 appearance/system 段引擎无关，port-asis（属 IM 切片协作）。",
+            "dependsOn": [
+              "src/provider-pool.ts(drop)",
+              "src/runtime-config.ts",
+              "src/im-manager.ts(IM 切片)",
+              "happycodex src/runtime/multitenant/codex-home.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/routes/groups.ts",
+            "role": "群组 CRUD/消息分页/会话重置/群组级容器环境变量覆盖（1781 行）",
+            "classification": "adapt-codex",
+            "complexity": "L",
+            "codexNotes": "主体 port-asis；两处适配：① 会话重置删除 Claude 会话目录/JSONL（groups.ts:257,1081）→ 改为删除 codex rollout/session（happycodex session-store/rollout-archive 语义）；② per-group env 覆盖字段 anthropicBaseUrl/anthropicAuthToken/anthropicApiKey/claudeCodeOauthToken/anthropicModel（groups.ts:1538-1547）→ 换成 codex 等价字段（model/base_url/api_key）。",
+            "dependsOn": [
+              "src/db.ts",
+              "src/session-files.ts",
+              "src/file-manager.ts",
+              "happycodex src/runtime/multitenant/session-store.ts",
+              "src/web-context.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/routes/files.ts",
+            "role": "文件上传(50MB)/下载/删除/目录管理 + 路径遍历防护（1018 行）",
+            "classification": "port-asis",
+            "complexity": "M",
+            "codexNotes": "无引擎耦合。",
+            "dependsOn": [
+              "src/file-manager.ts",
+              "src/db.ts",
+              "src/billing.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/routes/memory.ts",
+            "role": "记忆文件读写 + 全文检索（599 行）",
+            "classification": "port-asis",
+            "complexity": "S",
+            "codexNotes": "仅一处表层适配：MEMORY_BLOCKED_DIRS 含 '.claude'（memory.ts:232,278）→ 加/换 '.codex'。记忆文件本身（CLAUDE.md 命名）是否改名为 AGENTS.md 属全局决策。",
+            "dependsOn": [
+              "src/db.ts",
+              "src/config.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/routes/tasks.ts",
+            "role": "定时任务 CRUD + 执行日志 + 自然语言解析任务定义（748 行）",
+            "classification": "adapt-codex",
+            "complexity": "M",
+            "codexNotes": "CRUD 主体 port-asis；tasks.ts:8,643,730 用 sdkQuery()（Claude SDK 一次性 query）做 NL→cron 解析 → 需在 happycodex appserver/client 上补一个 one-shot query helper 替代 sdk-query.ts。",
+            "dependsOn": [
+              "src/task-scheduler.ts(主进程切片)",
+              "src/sdk-query.ts 的 codex 替身（appserver/client）",
+              "src/db.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/routes/bug-report.ts",
+            "role": "Bug 报告收集 + 用 LLM 总结诊断信息（476 行）",
+            "classification": "adapt-codex",
+            "complexity": "S",
+            "codexNotes": "bug-report.ts:12,350 依赖 sdkQuery → 同 tasks.ts，换 codex one-shot query。其余 port-asis。",
+            "dependsOn": [
+              "sdk-query 的 codex 替身",
+              "src/db.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/routes/monitor.ts",
+            "role": "系统监控：容器列表/队列状态/健康检查/版本检查（491 行）",
+            "classification": "adapt-codex",
+            "complexity": "M",
+            "codexNotes": "monitor.ts:24-57 缓存并对比 @anthropic-ai/claude-code npm 最新版 → 改为 codex CLI 版本检查；import container-runner.js 取活跃容器 → 对接 happycodex runtime/multitenant/session-manager 的状态视图。/api/health 无认证语义保留。",
+            "dependsOn": [
+              "happycodex src/runtime/multitenant/session-manager.ts",
+              "src/group-queue.ts(主进程切片)",
+              "src/db.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/routes/browse.ts",
+            "role": "目录浏览 API（白名单约束）（257 行）",
+            "classification": "port-asis",
+            "complexity": "S",
+            "codexNotes": "无引擎耦合，依赖 mount-security。",
+            "dependsOn": [
+              "src/mount-security.ts",
+              "src/middleware/auth.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/routes/agents.ts + agent-definitions.ts",
+            "role": "Sub-Agent CRUD（923 行）+ 预定义 SubAgent 定义读取（272 行）",
+            "classification": "adapt-codex",
+            "complexity": "M",
+            "codexNotes": "agents 表/CRUD 引擎无关可搬；但 sub-agent 执行语义换成 codex collab agent（happycodex 实测走 CollabAgentTool，已有 runtime/multitenant/agent-defs.ts）。agent-definitions 路由要改读 codex agent 定义格式而非 Claude SDK agents 选项格式。",
+            "dependsOn": [
+              "happycodex src/runtime/multitenant/agent-defs.ts",
+              "src/db.ts(agents 表)"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/routes/mcp-servers.ts",
+            "role": "per-user MCP Servers 管理 CRUD + sync-host（492 行）",
+            "classification": "adapt-codex",
+            "complexity": "M",
+            "codexNotes": "存储与 API 可搬，但下发格式从 Claude SDK mcpServers 选项改为 codex config.toml [mcp_servers] 注入（经 codex-home 生成）。sync-host 扫描 ~/.claude 的逻辑改为扫 ~/.codex。",
+            "dependsOn": [
+              "happycodex src/runtime/multitenant/codex-home.ts",
+              "src/middleware/auth.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/routes/plugins.ts (+ plugin-* 模块族)",
+            "role": "Claude Code Plugins：catalog 扫描/per-user enable/versioned runtime materialize（537 行路由 + 十余个 plugin-* 模块）",
+            "classification": "drop-claude-only",
+            "complexity": "L",
+            "codexNotes": "整套基于 Claude Code 的 --plugin-dir/SdkPluginConfig 机制，codex 无对应物。第一版直接不搬；前端 PluginsPage/plugins store 同步去掉。",
+            "dependsOn": []
+          },
+          {
+            "path": "upstream-happyclaw/src/routes/skills.ts + workspace-config.ts",
+            "role": "Skills 列表/安装/管理（890 行）+ 工作区级配置（selected_skills/init 源）（674 行）",
+            "classification": "adapt-codex",
+            "complexity": "M",
+            "codexNotes": "Skills 是 Claude Code 的 ~/.claude/skills 符号链接发现机制；codex 无原生 skills。可改造为 AGENTS.md/prompt 注入或 codex-home 内的等价目录约定，也可能降级为 drop——需 engine 切片确认 codex 0.137 的 skill 支持面后定。先按 adapt 预估。",
+            "dependsOn": [
+              "src/skill-utils.ts",
+              "happycodex src/runtime/multitenant/codex-home.ts",
+              "src/db.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/web/src/stream-event.types.ts",
+            "role": "前端 StreamEvent 类型副本（161 行，构建时从 shared/stream-event.ts 同步）",
+            "classification": "replace-codex",
+            "complexity": "M",
+            "codexNotes": "关键契约错位：happycodex StreamEvent 用 type/scope/itemId（src/shared/stream-event.ts:25,68 区域），上游前端消费 eventType/agentScope/toolUseId/parentToolUseId/displayLevel（web stream-event.types.ts:77-98）。且 happycodex 缺 tool_result/task_*/permission_denied/context_audit/todo_update/raw_sdk_event 等成员。必须二选一：扩展 happycodex shared 类型对齐上游字段名（推荐，前端少改），或全前端改字段名。ClaudeContextAudit 块（27-74 行）是 CLAUDE_CONFIG_DIR/CLAUDE.md 审计，需重定义为 codex 上下文审计或删除。",
+            "dependsOn": [
+              "happycodex src/shared/stream-event.ts（单一真相源归属）",
+              "happycodex src/runtime/stream-mapper.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/web/src/stores/chat.ts",
+            "role": "前端核心 store（3049 行）：handleStreamEvent/applyStreamEvent 按 eventType 分发（text/thinking delta、tool_use_*、task_*、hook_*、status、usage、context_audit、todo_update、permission_denied），按 agentScope/parentToolUseId 聚合 trace/timeline/task 运行态，WS 重连 stream_snapshot 恢复",
+            "classification": "adapt-codex",
+            "complexity": "XL",
+            "codexNotes": "本切片最大 adapt 点。chat.ts:722-868,1712-2033 大量 switch(event.eventType) 与 event.agentScope 消费。codex 事件面较窄（无 Task 工具/todo_update/hook UI 流），策略：保留全部分支（向后兼容），让 happycodex mapper 产出对齐字段名的事件子集，未覆盖分支自然不触发优雅降级；itemId→toolUseId、scope('main'|'subagent')→agentScope 映射在 shared 类型统一时一并解决。usage 事件结构（costUSD/modelUsage）需按 codex token_usage 重定义并同步 UsageBars/token KPI。",
+            "dependsOn": [
+              "web/src/stream-event.types.ts(替换后)",
+              "web/src/api/ws.ts",
+              "后端 WS 广播协议（主进程切片 web.ts）"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/web/src/components/chat/StreamingDisplay.tsx",
+            "role": "流式渲染面板（967 行）：text/thinking 尾巴、活跃工具、trace 时间线、context_audit 展示",
+            "classification": "adapt-codex",
+            "complexity": "L",
+            "codexNotes": "StreamingDisplay.tsx:83-138 渲染 ClaudeContextAudit（claudeMd.status、CLAUDE_CONFIG_DIR、externalClaudeDir）→ codex 无此审计事件，该子面板删除或重做为 codex-home 审计。其余渲染随 chat store 适配。",
+            "dependsOn": [
+              "web/src/stores/chat.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/web/src/components/chat/（其余 ~22 个组件）",
+            "role": "ChatView/MessageBubble/MessageList/MessageInput/ToolActivityCard/TodoProgressPanel/TerminalPanel/FilePanel/TopicSidebar/Markdown+Mermaid 渲染等",
+            "classification": "port-asis",
+            "complexity": "L",
+            "codexNotes": "绝大多数引擎无关。小适配：ChatView.tsx:1059-1060 文案提'Claude 会话上下文'；TodoProgressPanel 依赖 todo_update 事件（codex 无→面板隐藏即可）；ToolActivityCard 消费工具名/摘要字段，随类型统一无需改逻辑。ContainerEnvPanel 单列（见下）。",
+            "dependsOn": [
+              "web/src/stores/chat.ts",
+              "web/src/stores/files.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/web/src/components/chat/ContainerEnvPanel.tsx",
+            "role": "工作区级 provider/env 覆盖面板：anthropicBaseUrl/anthropicAuthToken/anthropicApiKey/claudeCodeOauthToken/模型预设",
+            "classification": "adapt-codex",
+            "complexity": "M",
+            "codexNotes": "ContainerEnvPanel.tsx:44-97,205-207 全是 anthropic* 字段与 Claude 模型 datalist → 改成 codex 字段（model/base_url/api_key）与 GPT 模型预设，与 routes/groups.ts:1538-1547 的后端适配配对。",
+            "dependsOn": [
+              "upstream-happyclaw/src/routes/groups.ts(适配后)",
+              "web/src/stores/container-env.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/web/src/pages/SetupProvidersPage.tsx + components/settings/{ClaudeProviderSection,ProviderEditor}.tsx",
+            "role": "Claude provider 设置向导与设置页编辑器（588+346+784 行）：Claude OAuth start/callback、API Key、Setup Token、自定义 baseUrl 多 provider 录入",
+            "classification": "replace-codex",
+            "complexity": "L",
+            "codexNotes": "SetupProvidersPage.tsx:107-235 全是 /api/config/claude/oauth 与 claudeCodeOauthToken/anthropicApiKey 流程 → 整页重写为 codex 认证向导（ChatGPT 登录 / OPENAI_API_KEY / 自定义 base_url），表单结构可参考但内容全换。",
+            "dependsOn": [
+              "routes/config.ts 的 codex provider 段（重写后）",
+              "web/src/stores/auth.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/web/src/components/settings/{ProviderList,BalancingSettings}.tsx + components/monitor/ProviderSwitcher.tsx",
+            "role": "多 provider 池列表/负载均衡设置/运行时 provider 切换 UI（294+129+103 行）",
+            "classification": "drop-claude-only",
+            "complexity": "S",
+            "codexNotes": "对应后端 provider-pool/failover（Claude 多 OAuth 账号 sticky 选择），codex-only 第一版单 provider，整组 UI 不搬。",
+            "dependsOn": []
+          },
+          {
+            "path": "upstream-happyclaw/web/src/stores/（chat 之外的 14 个 store）+ api/{client,ws}.ts",
+            "role": "auth/groups/tasks/monitor/files/users/skills/mcp-servers/billing/usage/plugins/container-env/workspace-config/agent-definitions stores；统一 API 客户端（8s 超时）与 WS 重连管理",
+            "classification": "port-asis",
+            "complexity": "M",
+            "codexNotes": "api/client.ts、ws.ts 零耦合原样搬。小适配点：stores/auth.ts:47 的 claudeConfigured 字段改名；stores/plugins.ts 随 plugins drop；stores/container-env.ts 字段随 anthropic*→codex 改名；usage/billing store 的 costUSD 展示随计费适配。",
+            "dependsOn": [
+              "后端各路由契约"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/web/src/pages/（其余 15 页）+ components/{auth,billing,users,groups,tasks,skills,mcp-servers,monitor其余,settings IM 卡片,shared,ui,common,layout} + hooks/ + lib/",
+            "role": "登录/注册/聊天/任务/监控/记忆/技能/设置/用户/计费/用量等页面与组件库、AuthGuard 路由守卫、IM 通道配置卡片（Feishu/Telegram/QQ/DingTalk/Discord/WeChat/WhatsApp）、12 个通用 hooks",
+            "classification": "port-asis",
+            "complexity": "L",
+            "codexNotes": "体量大但引擎无关，改 import 即可。PluginsPage 随 plugins drop；SettingsPage 的 tab=claude 入口改名；IM 通道卡片依赖 IM 切片的 user-im 路由原样保留。",
+            "dependsOn": [
+              "web/src/stores/*",
+              "routes/*（各对应后端）",
+              "IM 切片 user-im API"
+            ]
+          }
+        ],
+        "sliceSummary": "本切片（Web 前后端 + 认证/权限，后端 routes/middleware/auth/billing/acl ~19k 行 + 前端 204 文件 ~41k 行）整体可迁移性高：认证/权限/ACL/挂载安全核心（auth.ts、middleware/auth.ts、permissions/owner-gate/cross-group-acl/group-owner/mount-security）零 Claude 耦合，纯 port-asis；大部分路由（admin/files/memory/browse/usage/billing）和前端绝大多数页面/组件/store 也是 port-asis。占比估算：port-asis ≈ 60%，adapt-codex ≈ 30%（三大热点：① 前端 chat store 3049 行的 StreamEvent 消费——happycodex 用 type/scope/itemId 而上游前端消费 eventType/agentScope/toolUseId，且 codex 事件面缺 task_*/todo_update/context_audit/permission_denied，必须先在 shared/stream-event.ts 统一契约，推荐扩展 happycodex 类型对齐上游字段名让前端少改；② routes/config.ts 的 Claude provider 段 + routes/groups.ts 的 anthropic* per-group env 覆盖 → 重写为 codex 认证/配置（对接已有 codex-home.ts）；③ billing 的 costUSD 配额与 tasks/bug-report 的 sdkQuery NL 解析 → token 计价折算 + codex one-shot query 替身），replace/drop ≈ 10%（provider-pool 全家：ProviderList/BalancingSettings/ProviderSwitcher 及 config.ts 均衡段 drop；SetupProvidersPage/ClaudeProviderSection/ProviderEditor 重写为 codex 版；plugins 路由+模块族+前端页 Claude Code 专属整体 drop；skills/workspace-config 待 engine 确认 codex 能力后定 adapt 或降级）。",
+        "keyDependencies": [
+          "主进程/基建切片：src/db.ts（users/sessions/billing/usage/agents 全表族）、src/web.ts + src/web-context.ts（Hono 挂载/WS 广播/ session cache——middleware 与全部路由的宿主）、src/types.ts、src/config.ts、src/schemas.ts、src/runtime-config.ts、src/file-manager.ts、src/utils.ts 必须先到位",
+          "引擎切片（happycodex 已有）：shared/stream-event.ts 契约统一（type→eventType、scope→agentScope、itemId→toolUseId 的定名决策）是前端 chat store 迁移的前置承重墙；runtime/multitenant/session-manager+session-store（monitor/groups 路由的容器状态与会话重置）、codex-home.ts（mcp-servers/provider 配置下发）、agent-defs.ts（agents 路由）",
+          "需新建：sdk-query.ts 的 codex 替身（appserver/client 上的 one-shot query helper），tasks/bug-report 路由依赖它",
+          "IM 切片：im-manager/im-channel（admin 禁用用户断连、config.ts user-im 段、前端 IM 通道卡片）",
+          "usage 落库管道：codex usage 事件 → usage_records/usage_daily_summary 的写入（billing/usage 路由的数据源），且 costUSD 需 token 计价方案"
+        ],
+        "evidence": [
+          "契约错位核心证据：happycodex src/shared/stream-event.ts:25 用 `type: StreamEventType`、:68 `scope?: 'main'|'subagent'`、itemId 配对；而上游前端 web/src/stream-event.types.ts:77-79 是 `eventType` + `agentScope`，web/src/stores/chat.ts:722-727,762,1712 全按 event.eventType/agentScope 分发——尽管 happycodex 注释自称'前端 chat store 无需改动'，字段名实际不兼容",
+          "happycodex 现状无任何 web 层：find src 仅 appserver/runtime/poc/shared/agent-runner.ts/contracts.ts，grep hono/websocket 零命中",
+          "认证核心零耦合：src/middleware/auth.ts:1-170、src/auth.ts:1-50（bcrypt+HMAC）、src/permissions.ts:1-84、src/owner-gate.ts:23-29、src/cross-group-acl.ts:13-35 均无 Claude/anthropic 引用",
+          "路由 Claude 耦合点：src/routes/auth.ts:101-119（claudeConfigured 判定）、src/routes/groups.ts:1538-1547（anthropic*/claudeCodeOauthToken per-group 覆盖）+ :257,1081（删 Claude 会话目录/JSONL）、src/routes/monitor.ts:24-57（npm view @anthropic-ai/claude-code + import container-runner.js）、src/routes/tasks.ts:8,643,730 与 src/routes/bug-report.ts:12,350（sdkQuery）、src/routes/config.ts:337（/claude 段起点）且 import ../provider-pool.js",
+          "计费耦合：src/billing.ts:622,647 以 costUSD 入账、:390-455 cost+token 双维配额——codex usage 无 costUSD（happycodex stream-event usage 为 Record<string,unknown> 透传）",
+          "前端 Claude 专属面：pages/SetupProvidersPage.tsx:107-235（Claude OAuth/API Key/Setup Token 三流程）、components/settings/{ClaudeProviderSection 346 行,ProviderEditor 784 行,ProviderList 294 行,BalancingSettings 129 行}、components/monitor/ProviderSwitcher.tsx 103 行（provider-pool UI）、components/chat/ContainerEnvPanel.tsx:44-97（anthropic* 表单）、components/chat/StreamingDisplay.tsx:83-138（ClaudeContextAudit/CLAUDE_CONFIG_DIR 渲染）、stores/auth.ts:47（claudeConfigured）",
+          "体量盘点：src/routes 18 文件 14991 行 + middleware/auth.ts 170 行 + 安全/计费模块 3657 行；web/src 204 个 ts/tsx，其中 stores/chat.ts 3049 行、ChatView 1091、StreamingDisplay 967 行；routes/plugins.ts 537 行 + plugin-* 模块族为 Claude Code plugin 专属"
+        ]
+      },
+      {
+        "evidence": [
+          "upstream-happyclaw/src/db.ts:1362 SCHEMA_VERSION='39'；db.ts:1289-1298 v36→v37 为 sessions 表加 provider_id（ProviderPool sticky 绑定，防 thinking block 签名失效）—— codex 无此问题，作废",
+          "upstream-happyclaw/src/db.ts:2460-2536 getSessionProviderId / setSessionProviderId / deleteSessionsByProviderId 三个 API 仅服务 ProviderPool，drop",
+          "upstream-happyclaw/src/db.ts:3039-3051 用户全局记忆初始化写 CLAUDE.md（global-claude-md.template.md）→ codex 应改 AGENTS.md",
+          "happycodex/src/runtime/multitenant/session-store.ts + types.ts:22 已有 folder→threadId 持久化（'对应 HappyClaw sessions 表'），接 db.ts 时须定单一真相源",
+          "upstream-happyclaw/src/config.ts:25-26 仅 CONTAINER_IMAGE='happyclaw-agent:latest' 需改名，全文件无 ANTHROPIC/Claude 引用",
+          "upstream-happyclaw/shared/stream-event.ts:64-74 ClaudeContextAudit 含 claudeConfigDir/externalClaudeDir 字段（Claude 专属）；happycodex/src/shared/stream-event.ts:10-22 已有 codex 版（字段名 type vs 上游 eventType，:81-82 marker 为 <<<HAPPYCODEX_OUTPUT_*>>>），缺 tool_result/todo_update/permission_denied/context_audit 等成员",
+          "upstream-happyclaw/src/plugin-utils.ts:12-13,40 'results feed options.plugins: SdkPluginConfig[] → --plugin-dir for spawned claude CLI' —— codex 无 --plugin-dir，SDK 注入面 claude-only",
+          "upstream-happyclaw/src/plugin-expander-core.ts:1-30 头注释：只展开 DMI（disable-model-invocation）命令，'Non-DMI commands are left to the SDK's native --plugin-dir handler' —— codex 无原生处理器，须改为全部命令 host 侧展开",
+          "upstream-happyclaw/src/plugin-inline-bash.ts:9,100,312 CLAUDE_PLUGIN_ROOT 注入到 host/docker exec 环境 —— 若继续摄入 Claude 格式插件包应保留该变量名以兼容存量插件脚本",
+          "upstream-happyclaw/src/plugin-importer.ts:6-13,593 扫描源默认 ~/.claude（externalClaudeDir 可覆盖），快照校验 .claude-plugin/plugin.json",
+          "upstream-happyclaw/src/plugin-dependency-check.ts:23 依赖检测白名单含 'claude' 二进制，需换 codex",
+          "upstream-happyclaw/src/plugin-materializer.ts:1-42 头注释：纯 FS 内容寻址 COW 物化（COPYFILE_FICLONE + rename rollback），零引擎依赖",
+          "upstream-happyclaw/src/file-manager.ts:28 SYSTEM_PATHS=['logs','CLAUDE.md','.claude','conversations'] → 改 AGENTS.md/.codex",
+          "happycodex/src/runtime/multitenant/agent-defs.ts + hooks-config.ts 已实现 codex 侧 agents/hooks 物化（插件内 agents/hooks 资产的映射目标）",
+          "upstream-happyclaw/src/db.ts:8-48 imports types.ts/permissions.ts/sqlite-compat.ts/logger.ts —— db 搬迁的前置依赖清单"
+        ],
+        "keyDependencies": [
+          "logger.ts / types.ts / sqlite-compat.ts / permissions.ts（db.ts 直接 import，db.ts:2-48，属基础设施切片，须先到位）",
+          "runtime-config.ts（file-manager.ts:4 import deleteContainerEnvConfig）",
+          "主进程 index.ts 的 handleCommand 内置命令表（plugin-command-index.ts BUILTIN_COMMAND_NAMES 与之镜像）与 routes/plugins.ts（catalog scan / enable API + invalidateUserCommandIndex 调用方）",
+          "container-runner / codex 编排层：plugin runtime 挂载路径（/workspace/plugins）与 materializeUserRuntime 双路径预构建约定；happycodex 侧对应 runtime/multitenant（codex-home.ts/agent-defs.ts/hooks-config.ts）",
+          "happycodex src/shared/stream-event.ts 与 src/runtime/multitenant/session-store.ts —— 分别决定 stream-event 契约和 sessions 表 threadId 语义的单一真相源",
+          "web 前端切片：stream-event 消费端需适配 happycodex 字段名（type vs eventType）与缺失成员"
+        ],
+        "modules": [
+          {
+            "path": "upstream-happyclaw/src/db.ts",
+            "role": "数据层：SQLite WAL，39 版 schema migration，chats/messages/users/sessions/tasks/billing 等全部表与 ~213 个导出函数",
+            "classification": "port-asis",
+            "complexity": "L",
+            "codexNotes": "整体引擎无关可原样搬，三处删改：1) provider_id 列 + getSessionProviderId/setSessionProviderId/deleteSessionsByProviderId（db.ts:1289-1298, 2460-2536）随 ProviderPool 作废；2) sessions 表 session_id 语义改存 codex threadId，并与 happycodex 已有 session-store.ts（sessions/index.json）定单一真相源（建议 DB 为准、废 JSON）；3) ensureUserHomeGroup 的 CLAUDE.md 模板初始化（db.ts:3039-3051）改 AGENTS.md。usage 表的 per-model token 字段按 codex usage 结构核对",
+            "dependsOn": [
+              "types.ts",
+              "permissions.ts",
+              "sqlite-compat.ts",
+              "logger.ts",
+              "config.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/config.ts",
+            "role": "常量：路径（DATA_DIR/GROUPS_DIR）、Web 端口、session secret（env>文件>生成）、WeChat NO_PROXY、Docker 可用性探测",
+            "classification": "port-asis",
+            "complexity": "S",
+            "codexNotes": "无任何 Claude/ANTHROPIC 引用；仅 CONTAINER_IMAGE 默认值 happyclaw-agent:latest（config.ts:25-26）与 cookie 名 happyclaw_session 需改名 happycodex",
+            "dependsOn": []
+          },
+          {
+            "path": "upstream-happyclaw/shared/channel-prefixes.ts",
+            "role": "IM channel → JID prefix 映射 + getChannelFromJid，主进程/agent-runner 共享",
+            "classification": "port-asis",
+            "complexity": "S",
+            "codexNotes": "零引擎耦合，原样搬；连同 make sync-types 同步机制一起搬（src/channel-prefixes.ts 是其副本）",
+            "dependsOn": []
+          },
+          {
+            "path": "upstream-happyclaw/shared/image-detector.ts",
+            "role": "图片 MIME magic-bytes 检测（PNG/JPEG/GIF/WebP），同步到 src/ 与 agent-runner",
+            "classification": "port-asis",
+            "complexity": "S",
+            "codexNotes": "纯函数零耦合；codex 侧消费方变为 ipc-input/codex 输入图片管道",
+            "dependsOn": []
+          },
+          {
+            "path": "upstream-happyclaw/shared/stream-event.ts",
+            "role": "StreamEvent 类型单一真相源（22 个事件类型 + ClaudeContextAudit + OUTPUT_MARKER 契约消费端）",
+            "classification": "have",
+            "complexity": "M",
+            "codexNotes": "happycodex/src/shared/stream-event.ts 已是 codex 版等价物（含 OUTPUT_MARKER/TEXT_FLUSH_CHARS）。差异需在搬 web/container-runner 消费端时消化：字段名 type vs 上游 eventType；缺 tool_result/todo_update/permission_denied/prompt_suggestion/memory_recall/context_audit 等成员（按需补）；ClaudeContextAudit（claudeConfigDir/externalClaudeDir，上游 :64-74）属 Claude 专属直接弃",
+            "dependsOn": []
+          },
+          {
+            "path": "upstream-happyclaw/src/file-manager.ts",
+            "role": "文件安全层：路径遍历防护、符号链接检测、系统路径保护、存储用量缓存（routes/files.ts 后端）",
+            "classification": "port-asis",
+            "complexity": "M",
+            "codexNotes": "唯一 Claude 耦合是 SYSTEM_PATHS=['logs','CLAUDE.md','.claude','conversations']（:28）→ 改为 AGENTS.md/.codex（保护 codex 会话/记忆文件）；大小写不敏感 FS 比较逻辑原样保留",
+            "dependsOn": [
+              "config.ts",
+              "runtime-config.ts",
+              "logger.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/im-downloader.ts",
+            "role": "IM 文件落盘：sanitizeImFilename（prompt 注入防御）+ saveDownloadedFile 写 downloads/{channel}/{date}/，50MB 限制",
+            "classification": "port-asis",
+            "complexity": "S",
+            "codexNotes": "零引擎耦合，文件名清洗的 prompt 注入防御对 codex 同样必要",
+            "dependsOn": [
+              "config.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/message-attachments.ts",
+            "role": "图片附件规范化：data-URL 解析、MIME 声明 vs magic-bytes 校验",
+            "classification": "port-asis",
+            "complexity": "S",
+            "codexNotes": "纯函数原样搬；下游差异在引擎切片——base64 附件喂给 codex 时需经 ipc-input 转 codex 输入格式（codex 接受本地图片路径），非本模块职责",
+            "dependsOn": [
+              "shared/image-detector.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/plugin-catalog.ts",
+            "role": "插件 catalog：index.json + 内容 hash 寻址的 immutable snapshot 树（write-once，路径段白名单防穿越）",
+            "classification": "adapt-codex",
+            "complexity": "M",
+            "codexNotes": "存储机制纯 FS 引擎无关；改造点仅 assetCounts 资产分类（commands/agents/skills/hooks/mcpServers）按 codex 能力面重释义（agents/hooks → codex-home 物化目标）。整个插件子系统判 adapt 而非 drop：价值核心（host 侧斜杠展开 + per-user 隔离分发）发生在 agent 进程之外，codex 的 ~/.codex/prompts 仅交互式 CLI 生效，覆盖不了 server-side per-user 场景",
+            "dependsOn": [
+              "config.ts",
+              "logger.ts",
+              "plugin-manifest.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/plugin-importer.ts",
+            "role": "扫描宿主机 ~/.claude/plugins/marketplaces（known_marketplaces.json）→ 导入 catalog immutable snapshot",
+            "classification": "adapt-codex",
+            "complexity": "L",
+            "codexNotes": "Claude 耦合最重的插件模块：扫描源 ~/.claude、校验 .claude-plugin/plugin.json（:593）。adapt 路线 = 保留 Claude 插件目录格式作为'prompt-pack 包格式'继续摄入（生态存量大、格式只是 md+json）；若 MVP 求快此模块可最后搬或先 drop（catalog 改手动导入）",
+            "dependsOn": [
+              "plugin-manifest.ts",
+              "plugin-catalog.ts",
+              "config.ts",
+              "logger.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/plugin-manifest.ts",
+            "role": "读取/校验 .claude-plugin/{marketplace,plugin}.json + 资产计数扫描 + NAME_SEGMENT_RE 路径段白名单",
+            "classification": "adapt-codex",
+            "complexity": "M",
+            "codexNotes": "codex 无插件 manifest 标准 → 直接沿用 Claude 插件包格式作为 happycodex 的 bundle 格式即可，解析逻辑基本原样；isValidNameSegment 被 catalog/command-index 复用，须随迁",
+            "dependsOn": [
+              "logger.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/plugin-materializer.ts",
+            "role": "catalog → per-user versioned runtime 树物化（COPYFILE_FICLONE COW、rename+backup rollback、独立 inode 保证、GC）",
+            "classification": "port-asis",
+            "complexity": "M",
+            "codexNotes": "纯文件系统机制零引擎依赖（头注释 :1-42）；marker 目录名 @happyclaw-runtime-markers 改名即可。独立 inode 不变量对 codex 同样承重（danger-full-access 模式写穿透不得污染 catalog）",
+            "dependsOn": [
+              "plugin-catalog.ts",
+              "plugin-utils.ts",
+              "logger.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/plugin-utils.ts",
+            "role": "per-user enable refs（plugins.json v2）读写 + runtime 路径解析 + loadUserPlugins → SdkPluginConfig[]",
+            "classification": "adapt-codex",
+            "complexity": "M",
+            "codexNotes": "拆两半：readUserPluginsV2/getUserPluginRuntimePath 等存储 plumbing 原样保留；SdkPluginConfig 类型与 loadUserPlugins 的 SDK 注入面（:12-13,40 → --plugin-dir）claude-only 删除，codex 无对应 CLI 选项，输出改为喂给 host 侧展开器/codex-home 物化",
+            "dependsOn": [
+              "config.ts",
+              "plugin-manifest.ts",
+              "logger.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/plugin-command-index.ts",
+            "role": "per-user 斜杠命令索引：commands/*.md frontmatter 解析、/name 与 /plugin:name 双别名、内置命令冲突让位、缓存失效",
+            "classification": "adapt-codex",
+            "complexity": "M",
+            "codexNotes": "索引机制原样；语义改造：上游只为 DMI 命令建索引意义（非 DMI 走 SDK），codex 无原生 --plugin-dir 处理器 → 所有命令都必须入索引并 host 侧展开。BUILTIN_COMMAND_NAMES 镜像 index.ts handleCommand，主进程切片落地后同步",
+            "dependsOn": [
+              "plugin-utils.ts",
+              "plugin-manifest.ts",
+              "logger.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/plugin-expander-core.ts",
+            "role": "斜杠命令展开核心（721 行）：DMI 命令解析 → inline-bash 执行 → $ARGUMENTS/位置参数替换 → expanded prompt（miss/expanded/reply 三态）",
+            "classification": "adapt-codex",
+            "complexity": "L",
+            "codexNotes": "整个插件系统中最值得保留的能力——产物是 prompt 字符串，引擎中立。核心改造：'miss → SDK 原生处理'分支失效（codex 无 plugin handler），非 DMI 命令也须走展开；CLAUDE_PLUGIN_ROOT 解析与 docker 路径 /workspace/plugins/... 按 happycodex 挂载布局对齐",
+            "dependsOn": [
+              "plugin-command-index.ts",
+              "plugin-inline-bash.ts",
+              "plugin-expander-context.ts",
+              "plugin-expander-sentinel.ts",
+              "config.ts",
+              "logger.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/plugin-expander-context.ts",
+            "role": "ExpandContext 纯类型 + makeExpandContext（host/container cwd 解析，honor customCwd）",
+            "classification": "port-asis",
+            "complexity": "S",
+            "codexNotes": "零依赖纯函数；host/container 双模式概念与 happycodex 编排一致，原样搬",
+            "dependsOn": []
+          },
+          {
+            "path": "upstream-happyclaw/src/plugin-expander-sentinel.ts",
+            "role": "展开崩溃安全 sentinel：attachments JSON 内 type='plugin_expansion' 标记的纯读写 helper",
+            "classification": "port-asis",
+            "complexity": "S",
+            "codexNotes": "零依赖纯 JSON helper，与引擎无关",
+            "dependsOn": []
+          },
+          {
+            "path": "upstream-happyclaw/src/plugin-expander-store.ts",
+            "role": "sentinel 的 DB 持久化（read-modify-write messages.attachments），隔离 db.ts 依赖面",
+            "classification": "port-asis",
+            "complexity": "S",
+            "codexNotes": "31 行薄封装，db.ts 搬到后原样可用",
+            "dependsOn": [
+              "db.ts",
+              "plugin-expander-sentinel.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/plugin-inline-bash.ts",
+            "role": "inline `!`bash`` 执行器：host spawn bash -c / docker exec，$ARGUMENTS 走 env 不走字符串插值（注入防御）",
+            "classification": "port-asis",
+            "complexity": "S",
+            "codexNotes": "执行机制引擎无关。CLAUDE_PLUGIN_ROOT 变量名（:9,100,312）建议保留——存量 Claude 格式插件脚本依赖它；docker exec 的容器名/用户名按 happycodex 容器约定对齐",
+            "dependsOn": [
+              "logger.ts"
+            ]
+          },
+          {
+            "path": "upstream-happyclaw/src/plugin-dependency-check.ts",
+            "role": "插件外部二进制依赖 best-effort 预检：扫 commands/*.md allowed-tools frontmatter + hooks/hooks.json 首 token，override 表优先",
+            "classification": "adapt-codex",
+            "complexity": "S",
+            "codexNotes": "扫描逻辑原样；白名单中 'claude' 二进制（:23）替换为 codex；allowed-tools 是 Claude frontmatter 约定，沿用 Claude 包格式则无需改",
+            "dependsOn": [
+              "plugin-utils.ts",
+              "logger.ts"
+            ]
+          }
+        ],
+        "slice": "数据/配置/插件/文件（db.ts、config.ts、shared/*、plugin-* 全系、file-manager/im-downloader/message-attachments）",
+        "sliceSummary": "本切片以 port-asis 为主：18 个模块中 11 个 port-asis（db/config/shared 两文件/file-manager/im-downloader/message-attachments/materializer/expander-context/sentinel/store/inline-bash，约 60%）、6 个 adapt-codex（插件系统的 catalog/importer/manifest/utils/command-index/expander-core/dependency-check，约 35%）、1 个 have（stream-event，happycodex 已建）。无整模块 drop，但有三处模块内 drop：db.ts 的 provider_id sticky API 三件套、plugin-utils 的 SdkPluginConfig→--plugin-dir SDK 注入面、stream-event 的 ClaudeContextAudit。插件系统核心判定：adapt 而非 drop——其价值核心（IM/Web 斜杠命令 host 侧展开 + inline-bash + per-user 内容寻址 catalog/runtime 隔离）全部发生在 agent 进程之外、产物只是 prompt 字符串，引擎中立；codex 无 --plugin-dir 且 ~/.codex/prompts 仅交互式 CLI 生效，server-side per-user 场景必须靠这套 host 侧机制补位。改造主轴：展开语义从'仅 DMI、非 DMI 交 SDK'改为'全部命令 host 侧展开'，插件内 agents/hooks 资产映射到 happycodex 已建的 codex-home 物化（agent-defs.ts/hooks-config.ts），包格式直接沿用 Claude 插件目录格式作为 prompt-pack 标准。若 MVP 求快，importer/catalog 链可后置（先 drop 后 adapt），但架构上不属 claude-only。最大单体工作量是 db.ts（6060 行 39 版 migration，机械搬 + sessions 表 threadId 语义对齐 happycodex session-store）。"
+      }
+    ],
+    "roadmap": {
+      "overallPicture": "搬迁完全可行，且比\"重写\"便宜得多：happyclaw 的应用层（编排队列、IM 适配、Web/认证、数据层、插件）与 Claude 引擎天然解耦，真正的引擎绑定点集中在 container-runner、container/agent-runner、claude-context-resolver、provider 配置面和 StreamEvent 消费端这几处。全局 ~112 个模块中 port-asis ≈ 57%（64 个，机械搬 + 改 import）、adapt-codex ≈ 30%（34 个，集中在 index.ts/routes-config/前端 chat store/skills-prompts/billing 五个热点）、have+replace ≈ 8%（引擎主体 happycodex 已建成，约 4.2k 行实质覆盖）、drop-claude-only ≈ 5%（provider-pool 全家 + plugins SDK 注入面 + history-image-prune）。最难的三块：(1) index.ts 10,129 行单体——编排骨架可 port 但 claude 触点（CLI 摘要、.claude 会话目录、feedStreamEventToCard、OUTPUT_MARKER）散布全文，是一字之差契约错配的高发区；(2) shared/stream-event.ts 契约统一——happycodex 冻结契约（type/scope/itemId）与上游消费端（eventType/agentScope/toolUseId）字段名冲突，且 codex 事件面缺 tool_result/hook_*/todo_update/task_*，这是前端 chat store(3049 行)、四个 IM 流式卡片、主进程映射层三方共用的承重墙，必须最先拍板；(3) skills/prompts 体系——codex 无 SKILL.md/--plugin-dir 机制，9+4 个提示词分片和四源 skills 需重设计承载（developerInstructions 挂点已就绪但方案未定）。",
+      "scaleSummary": "量化：上游总规模 ~123k 行（src 75.5k + web ~41k + container 6.85k），happycodex 已建 7.8k 行（引擎+多租户+工具）。分类计数（112 模块）：port-asis 64（db 6060 行/39 版 migration、IM 层 18.9k 行 27 模块几乎全 port、认证/ACL/挂载安全全 port）、adapt-codex 34（其中 XL 2 个：index.ts、routes/config.ts 3043 行；L 4 个：group-queue、plugin-importer、routes/groups、前端 chat store）、replace-codex 6（container-runner 1925 行 + agent-runner 主体——happycodex 已建大半，剩 Docker 编排面/图片输入/缺失 5 工具）、drop 5（provider-pool 264 行及连带触点清理）。工作量级粗估：MVP（基建+主进程骨架+引擎接线+单入口）≈ 2-4 人周；+Web 后端认证 ≈ +2 周；+首个 IM 渠道 ≈ +1-2 周；前端全量 + 容器化 + 插件 + 多渠道收尾 ≈ 再 4-6 周；全量约 2.5-3.5 人月。",
+      "migrationStages": [
+        {
+          "stage": "Stage A0 — 契约拍板 + 基建底座",
+          "goal": "stream-event 契约统一定稿；db/config/shared 基础层落地，migration 跑通、单测绿",
+          "includes": [
+            "决策并落地 src/shared/stream-event.ts 扩展（对齐上游 eventType/agentScope/toolUseId 命名或定适配层，ClaudeContextAudit 改名/删除）",
+            "port: src/load-env.ts、logger.ts、config.ts、types.ts、schemas.ts、sqlite-compat、permissions.ts",
+            "port: src/db.ts（6060 行，drop provider_id sticky API 三件套；sessions 表 threadId 语义对齐 happycodex session-store）",
+            "port: runtime-config.ts、shared/channel-prefixes.ts、shared/image-detector.ts（废弃 make sync-types，改直接 import）"
+          ],
+          "rationale": "db.ts 被 index.ts/group-queue/task-scheduler/commands/全部 IM 适配器依赖，必须最先；stream-event 命名决策影响前端+卡片+主进程三方，越晚改越贵",
+          "dependsOn": "无（happycodex 已建件 src/shared/stream-event.ts、runtime/multitenant/session-store.ts 为真相源）",
+          "risk": "M — db migration 机械但量大；契约定名一旦错向，后续三个切片返工"
+        },
+        {
+          "stage": "Stage A1 — 主进程骨架 + codex 引擎接线（MVP 核心）",
+          "goal": "命令行/最小 HTTP 入口跑通一条对话端到端：收消息→入队→codex 执行→流事件落库→OUTPUT_MARKER 解析→回复文本",
+          "includes": [
+            "replace: container-runner.ts → 以 happycodex src/agent-runner.ts + FsCodexHomeProvisioner 重建 host 模式宿主（Docker 模式后置）",
+            "adapt: agent-output-parser.ts（OUTPUT_MARKER 换 <<<HAPPYCODEX>>>，删 isProviderFailureResult/isApiError Claude 文案识别）",
+            "port: group-queue.ts、conversation-history.ts、node-resolver.ts；adapt: commands.ts（.claude 会话清理改 codex session-store）、mcp-utils.ts",
+            "adapt: index.ts 裁剪版——启动序列、2s 轮询+游标、IpcWatcherManager、handleCommand 核心、群组注册/loadState；IM/Web 触点先打 stub",
+            "adapt: claude-context-resolver → AGENTS.md/developerInstructions 方案（按 A0 决策）",
+            "引擎残差: 补 pollIpcResult 回执语义 + isHome 门控；send_image/send_file 等 5 工具可挂占位"
+          ],
+          "rationale": "这是引擎与应用层的接缝阶段，所有 replace-codex 项在此闭合；先 host 模式回避 Docker 全新工作",
+          "dependsOn": "Stage A0（db/config/stream-event）；happycodex 已建 agent-runner/multitenant/rollout-archive 无需等待",
+          "risk": "H — index.ts 触点散布 + marker/协议一字之差错配是全项目最大风险点，需对拍测试覆盖"
+        },
+        {
+          "stage": "Stage A2 — Web 后端 + 认证/权限",
+          "goal": "浏览器登录、注册向导、Web chat 发消息并看到 codex 流式回复",
+          "includes": [
+            "port: auth.ts、middleware/auth.ts、permissions.ts、owner-gate、cross-group-acl、group-owner、mount-security、file-manager、im-downloader、message-attachments",
+            "port: web.ts/web-context（Hono 挂载/WS broadcast）+ routes: admin/files/memory/browse/usage 等 port 类路由",
+            "adapt: routes/auth.ts、routes/groups.ts（anthropic* per-group env → codex env）；routes/config.ts 重写——删 provider-pool 均衡段，Claude provider 段换 codex 认证（对接 codex-home.ts）",
+            "新建: sdk-query.ts 的 codex one-shot query 替身（appserver/client 上），tasks/bug-report 路由依赖"
+          ],
+          "rationale": "Web 是验证回路最短的人机入口，且 index.ts 的 broadcast/main() 启动序列依赖 web-context 接口定型",
+          "dependsOn": "Stage A1（主进程骨架、消息管道）",
+          "risk": "M — routes/config.ts 3043 行重写量大但逻辑清晰；usage 落库管道（codex usage 事件→usage_records）需新建"
+        },
+        {
+          "stage": "Stage A3 — 首个 IM 渠道（建议飞书）+ 流式卡片映射",
+          "goal": "飞书群 @bot 对话，流式卡片实时更新，会话 resume 正常",
+          "includes": [
+            "port: im-channel.ts、im-manager.ts（裁剪/stub 掉 telegram/whatsapp import）、im-safety、im-* 辅助件",
+            "port: feishu.ts、feishu-streaming-card.ts、feishu-markdown-style、feishu-mention-gate；adapt: feishu-cards/sections.ts shortModel 正则（S 级一处）",
+            "adapt: index.ts 的 feedStreamEventToCard（index.ts:256）——codex 事件集映射，setHook/setTodos 面板降级为 no-op，核对 patchUsageNote 的 usage 时序与 happycodex stream-mapper 对齐"
+          ],
+          "rationale": "卡片控制器全是命令式 API 不 import StreamEvent，适配点只在主进程映射层一处；飞书是上游最完善渠道且用户环境有 feishu-cli 生态",
+          "dependsOn": "Stage A1（消息轮询/路由）+ A2（db broadcast/runtime-config 的 per-user IM 配置）",
+          "risk": "M — codex 事件面缺失导致卡片面板部分失效是预期降级而非 bug，需在验收口径里写清"
+        },
+        {
+          "stage": "Stage A4 — 调度 + 工具补齐 + skills/prompts 体系",
+          "goal": "schedule_task 定时任务全链路跑通；12→17 工具 parity；系统提示词/skills 在 codex 下生效",
+          "includes": [
+            "port: task-scheduler.ts（1227 行，依赖注入已隔离）",
+            "补齐 5 个缺失工具：send_image/send_file/discord_*×3，接通主进程 IPC 处理端（*_result 回执）",
+            "adapt: prompts/ 9+4 个 md 分片→codex developerInstructions 拼装；container/skills 三个 SKILL.md→codex 承载方案落地",
+            "引擎残留：图片附件输入（ipc-input 协议扩展）、memory-flush 受限轮等价物"
+          ],
+          "rationale": "调度和工具完整性不阻塞对话主链路，但阻塞'生产可用'判定；skills 方案需 A1 的 context-resolver 决策先行",
+          "dependsOn": "Stage A1（IPC 处理器）+ A3（discord_* 工具的渠道侧可先 stub）",
+          "risk": "M — codex 无 skills 机制，注入方案是设计题不是搬运题"
+        },
+        {
+          "stage": "Stage A5 — Web 前端全量 + billing",
+          "goal": "前端 204 文件完整可用：chat 流式渲染、群组/用户/用量管理；配额生效",
+          "includes": [
+            "port: 前端绝大多数页面/组件/store（~60%）",
+            "adapt: chat store 3049 行 StreamEvent 消费（按 A0 契约决策，推荐 happycodex 类型对齐上游字段名让前端少改）；缺失事件（task_*/todo_update/context_audit/permission_denied）的 UI 降级",
+            "replace: SetupProvidersPage/ClaudeProviderSection/ProviderEditor → codex 配置页；drop: ProviderList/BalancingSettings/ProviderSwitcher、plugins 前端页",
+            "adapt: billing.ts（965 行）costUSD 配额→token 计价折算 + 兑换码/套餐 port"
+          ],
+          "rationale": "前端体量大（41k 行）但 port 占六成，且依赖 A0 契约和 A2 路由全部定型后才不返工",
+          "dependsOn": "Stage A0（契约）+ A2（routes）+ A3/A4（事件面定型）",
+          "risk": "M — chat store 是前端唯一硬骨头；billing 计价方案需用户拍板"
+        },
+        {
+          "stage": "Stage A6 — 容器化 + 多渠道 + 插件系统",
+          "goal": "Docker 模式与 host 模式双轨可用；钉钉/Discord/QQ 上线；插件 prompt-pack 链路打通",
+          "includes": [
+            "adapt: container/Dockerfile（工具链层原样抄，Claude SDK 层换 pin 版 codex CLI）+ entrypoint.sh（env source + codex 认证变量）+ container-runner Docker 分支（卷挂载/超时/快照/killProcessTree）",
+            "port: dingtalk/discord/qq 适配器 + 各流式卡片控制器（API 与飞书签名兼容，映射层零改动）",
+            "adapt: 插件系统——展开语义改'全部命令 host 侧展开'，agents/hooks 资产映射 codex-home 物化（agent-defs.ts/hooks-config.ts），沿用 Claude 插件目录格式作 prompt-pack 标准；importer/catalog 链此时补齐"
+          ],
+          "rationale": "三块都不阻塞核心价值，且容器化是全新工作（happycodex 零 Docker 资产）适合最后做；插件价值核心引擎中立，adapt 而非 drop",
+          "dependsOn": "Stage A4（skills/工具定型）+ A5（插件前端页如保留）",
+          "risk": "L-M — 工作量大但路径清晰；mount-security 已在 A2 port 完"
+        }
+      ],
+      "mvpDefinition": "MVP = Stage A0 + A1 + A2 最小子集：db.ts/config/logger/types 基建 + index.ts 裁剪版主进程（启动序列、2s 轮询+游标、IpcWatcherManager、group-queue、handleCommand 核心命令）+ agent-runner host 模式宿主（replace container-runner，Docker 后置）+ agent-output-parser（<<<HAPPYCODEX>>> marker）+ conversation-history/commands 会话管理 + 最小 Web 入口（auth 登录 + 一条 chat 路由 + WS broadcast，不要完整前端）。验收口径：浏览器（或 curl + WS）发一条消息 → 入库 → group-queue 调度 → codex 执行（含 12 个 dynamicTools、session resume、多轮上下文）→ StreamEvent 流式落库与推送 → 最终回复展示；重启进程后同一会话能 resume 继续。IM、定时任务、skills/prompts、计费、插件、容器化、前端全量均不在 MVP 内。",
+      "biggestRisks": [
+        "stream-event 契约错配是全局承重墙：happycodex 冻结契约（type/scope/itemId）vs 上游消费端（eventType/agentScope/toolUseId），且 codex 事件面缺 tool_result/hook_*/todo_update/task_*/context_audit——前端 chat store(3049 行)、四个 IM 卡片映射、主进程 IPC 消费三方共用，A0 定错方向则三个切片返工",
+        "index.ts 10,129 行（350KB）单体的触点散布：claude CLI 摘要、.claude 会话目录、OUTPUT_MARKER（HAPPYCLAW--- vs <<<HAPPYCODEX>>>）等一字之差的字符串契约散落全文，靠人工搬迁极易漏改且无编译期保护，需要端到端对拍测试兜底",
+        "skills/prompts 体系无 codex 等价机制：codex 没有 SKILL.md/--plugin-dir/settingSources，9+4 个提示词分片与四源 skills 的承载方案是设计题；方案不定则 A1 的 claude-context-resolver 改造和 A4/A6 全部悬空",
+        "引擎级残留缺口被低估：图片附件输入（ipc-input 协议需扩展支持多模态）、pollIpcResult 请求-响应回执语义、isHome 门控、memory-flush 受限轮——这些挂在'replace 已完成'的项下容易被当成已做完",
+        "容器化为零资产：happycodex 无任何 Dockerfile/entrypoint，Docker 编排面（卷挂载/超时/快照/killProcessTree）全部要从 container-runner 重建，若用户预期首版就要容器隔离，工期会显著拉长",
+        "db.ts 39 版 migration + sessions 表 threadId 语义对齐 happycodex session-store：机械但体量大，sessions 语义对不齐会让 resume 链路静默坏掉",
+        "billing 的 costUSD 配额与 usage 落库管道：codex usage 事件→usage_records 的写入和 token 计价折算都是新建件，没有上游可抄"
+      ],
+      "decisionsNeeded": [
+        "stream-event 契约定名（A0 即需）：推荐扩展 happycodex 类型对齐上游字段名（eventType/agentScope/toolUseId），让前端/卡片少改；代价是修改 happycodex 已冻结契约，需评审解冻",
+        "首个 IM 渠道：建议飞书（上游最完善 + 用户生态匹配）；同时拍板 telegram/whatsapp 是裁剪 drop 还是保留 stub（im-manager/im-channel 直接 import 它们，影响搬迁面）",
+        "Web 前端首版范围：MVP 只带最小 chat 入口（推荐）还是首版就上完整前端？完整前端 41k 行会把 MVP 推迟 4+ 周",
+        "插件系统节奏：架构上判定 adapt（非 claude-only），但 importer/catalog 链是否 MVP 后置（先 drop 后 adapt）？推荐后置到 A6",
+        "容器化 vs host-only 首版：推荐首版 host 模式（happycodex 已建），Docker 放 A6；若多租户安全隔离是硬需求则需提前并接受工期增加",
+        "CLAUDE.md→AGENTS.md / skills 注入方案：developerInstructions 拼装 vs 文件挂载（AGENTS.md + ~/.codex 物化），影响 claude-context-resolver、prompts、container/skills 三处，A1 前必须定",
+        "billing 计价方案：costUSD 按 token 计价折算保留双维度配额，还是首版降级为 token-only 配额？",
+        "index.ts 搬迁策略：忠实裁剪搬迁（风险低、保持与上游可对照）vs 借机拆分成模块（更优雅但偏离'人工迁移可追溯上游'的台账模型）——推荐忠实搬迁 + 仅删除 claude 触点，拆分留给后续重构"
+      ]
+    }
+  }
+}
