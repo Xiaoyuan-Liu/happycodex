@@ -47,8 +47,8 @@ async function main(): Promise<void> {
   });
 
   session.onStreamEvent((ev) => {
-    if (ev.type === 'text_delta') process.stdout.write(ev.text ?? '');
-    else if (ev.type === 'tool_use_start') {
+    if (ev.eventType === 'text_delta') process.stdout.write(ev.text ?? '');
+    else if (ev.eventType === 'tool_use_start') {
       const name = ev.toolName ?? '';
       toolCalls.push(name);
       console.error(`\n[poc-tools] tool_use_start: ${name}`);

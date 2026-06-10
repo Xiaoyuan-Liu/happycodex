@@ -109,9 +109,9 @@ async function main(): Promise<void> {
   child.stdout.on('data', (chunk: string) => {
     parser.feed(chunk, (ev) => {
       events.push(ev);
-      if (ev.type === 'text_delta') textOut += ev.text ?? '';
-      if (ev.type === 'init') maybeInject();
-      if (ev.type === 'result') {
+      if (ev.eventType === 'text_delta') textOut += ev.text ?? '';
+      if (ev.eventType === 'init') maybeInject();
+      if (ev.eventType === 'result') {
         if (ev.subtype === 'failed') failed = true;
         resultCount += 1;
       }
@@ -142,7 +142,7 @@ async function main(): Promise<void> {
 
   rmSync(dataDir, { recursive: true, force: true });
 
-  const sawInit = events.some((e) => e.type === 'init');
+  const sawInit = events.some((e) => e.eventType === 'init');
   console.error('\n' + '─'.repeat(40));
   console.error(`[poc-entry] exitCode        : ${exitCode}`);
   console.error(`[poc-entry] init event      : ${sawInit}`);

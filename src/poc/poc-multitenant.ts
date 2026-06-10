@@ -19,7 +19,7 @@ import type { ManagedSessionHandle } from '../runtime/multitenant/types.js';
 async function ask(handle: ManagedSessionHandle, text: string): Promise<string> {
   let buf = '';
   const offEv = handle.onStreamEvent((ev) => {
-    if (ev.type === 'text_delta') buf += ev.text ?? '';
+    if (ev.eventType === 'text_delta') buf += ev.text ?? '';
   });
   const done = new Promise<void>((resolve) => {
     const offDone = handle.onTurnCompleted(() => {

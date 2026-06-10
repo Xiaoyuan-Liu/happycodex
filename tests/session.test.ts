@@ -125,7 +125,7 @@ class FakeAppServerClient implements IAppServerClient {
 /** 一个简单的假 mapper：把任意通知映射成单个 status StreamEvent，便于断言“通知经 mapper → onStreamEvent”。 */
 class FakeMapper implements IStreamMapper {
   map(method: string, _params: unknown): StreamEvent[] {
-    return [{ type: 'status', status: method }];
+    return [{ eventType: 'status', statusText: method }];
   }
 }
 
@@ -471,7 +471,7 @@ describe('ThreadSession B1 compact', () => {
   });
 });
 
-describe('ThreadSession B2 子代理 scope 注入', () => {
+describe('ThreadSession B2 子代理 agentScope 注入', () => {
   async function startedSession(): Promise<{ client: FakeAppServerClient; session: ThreadSession }> {
     const client = new FakeAppServerClient();
     client.responses['thread/start'] = { thread: { id: 'th_main', sessionId: 's', path: null } };
@@ -502,16 +502,16 @@ describe('ThreadSession B2 子代理 scope 注入', () => {
     const { client, session } = await startedSession();
     client.emit('item/started', collabNote(['th_child']));
 
-    // 子代理 thread 的事件 → scope:'subagent'。
-    const childEv = session.decorateScope({ type: 'text_delta', text: 'x', threadId: 'th_child' });
-    expect(childEv.scope).toBe('subagent');
+    // 子代理 thread 的事件 → agentScope:'subagent'。
+    const childEv = session.decorateScope({ eventType: 'text_delta', text: 'x', threadId: 'th_child' });
+    expect(childEv.agentScope).toBe('subagent');
 
-    // 主线程事件 → scope:'main'。
-    const mainEv = session.decorateScope({ type: 'text_delta', text: 'y', threadId: 'th_main' });
-    expect(mainEv.scope).toBe('main');
+    // 主线程事件 → agentScope:'main'。
+    const mainEv = session.decorateScope({ eventType: 'text_delta', text: 'y', threadId: 'th_main' });
+    expect(mainEv.agentScope).toBe('main');
 
     // 无 threadId 的事件 → 默认 main。
-    expect(session.decorateScope({ type: 'status', status: 's' }).scope).toBe('main');
+    expect(session.decorateScope({ eventType: 'status', statusText: 's' }).agentScope).toBe('main');
   });
 
   it('collabAgentToolCall 也可经 item/completed 登记', async () => {
@@ -529,22 +529,22 @@ describe('ThreadSession B2 子代理 scope 注入', () => {
         receiverThreadIds: ['th_child2'],
       },
     });
-    expect(session.decorateScope({ type: 'text_delta', threadId: 'th_child2' }).scope).toBe('subagent');
+    expect(session.decorateScope({ eventType: 'text_delta', threadId: 'th_child2' }).agentScope).toBe('subagent');
   });
 
-  it('subagentType 从 prompt 解析（命中已知 agent 名）→ 注入到 scope:subagent 事件', async () => {
+  it('subagentType 从 prompt 解析（命中已知 agent 名）→ 注入到 agentScope:subagent 事件', async () => {
     const { client, session } = await startedSession();
     client.emit('item/started', collabNote(['th_cr'], { prompt: 'spawn the predefined agent named code-reviewer' }));
-    const ev = session.decorateScope({ type: 'text_delta', threadId: 'th_cr' });
-    expect(ev.scope).toBe('subagent');
+    const ev = session.decorateScope({ eventType: 'text_delta', threadId: 'th_cr' });
+    expect(ev.agentScope).toBe('subagent');
     expect(ev.subagentType).toBe('code-reviewer');
   });
 
-  it('subagentType 解析不到 → 留空（scope 仍 subagent，无 subagentType 字段）', async () => {
+  it('subagentType 解析不到 → 留空（agentScope 仍 subagent，无 subagentType 字段）', async () => {
     const { client, session } = await startedSession();
     client.emit('item/started', collabNote(['th_anon'], { prompt: 'do something generic' }));
-    const ev = session.decorateScope({ type: 'text_delta', threadId: 'th_anon' });
-    expect(ev.scope).toBe('subagent');
+    const ev = session.decorateScope({ eventType: 'text_delta', threadId: 'th_anon' });
+    expect(ev.agentScope).toBe('subagent');
     expect(ev.subagentType).toBeUndefined();
   });
 
@@ -556,7 +556,7 @@ describe('ThreadSession B2 子代理 scope 注入', () => {
         agentsStates: { th_wr: { status: 'running', message: 'launched web-researcher agent' } },
       }),
     );
-    const ev = session.decorateScope({ type: 'text_delta', threadId: 'th_wr' });
+    const ev = session.decorateScope({ eventType: 'text_delta', threadId: 'th_wr' });
     expect(ev.subagentType).toBe('web-researcher');
   });
 
@@ -568,7 +568,7 @@ describe('ThreadSession B2 子代理 scope 注入', () => {
     client.emit('item/started', collabNote(['th_child'])); // 登记子代理（经 FakeMapper → status 事件也会被 decorate）
     // 一条来自子代理 thread 的增量（FakeMapper 把 method 放 status，但 threadId 不透传；
     // 故直接断言 decorateScope 行为已在上面覆盖。这里验证主线程通知被标 main）。
-    expect(events.every((e) => e.scope === 'main')).toBe(true);
+    expect(events.every((e) => e.agentScope === 'main')).toBe(true);
   });
 
   it('单写者保护：子代理 thread 的 turn/started + turn/completed 不污染主线程在飞集合/activeTurnId', async () => {
@@ -731,10 +731,10 @@ describe('ThreadSession stream mapping', () => {
     client.emit('item/agentMessage/delta', { delta: 'hi' });
     client.emit('turn/started', { threadId: 'th', turn: { id: 't1' } });
 
-    // 每条通知都过 mapper（FakeMapper 把 method 放进 status），出栈前经 decorateScope 注 scope:'main'。
+    // 每条通知都过 mapper（FakeMapper 把 method 放进 status），出栈前经 decorateScope 注 agentScope:'main'。
     expect(events).toEqual([
-      { type: 'status', status: 'item/agentMessage/delta', scope: 'main' },
-      { type: 'status', status: 'turn/started', scope: 'main' },
+      { eventType: 'status', statusText: 'item/agentMessage/delta', agentScope: 'main' },
+      { eventType: 'status', statusText: 'turn/started', agentScope: 'main' },
     ]);
   });
 
@@ -751,7 +751,7 @@ describe('ThreadSession stream mapping', () => {
       delta: 'token',
     });
 
-    const textDeltas = events.filter((e) => e.type === 'text_delta');
+    const textDeltas = events.filter((e) => e.eventType === 'text_delta');
     expect(textDeltas.length).toBeGreaterThan(0);
     expect(textDeltas[0]!.text).toBe('token');
   });
@@ -766,8 +766,8 @@ describe('ThreadSession stream mapping', () => {
     off();
     client.emit('y', {});
 
-    // 出栈前经 decorateScope 注 scope:'main'（事件无 threadId → 默认主线程）。
-    expect(events).toEqual([{ type: 'status', status: 'x', scope: 'main' }]);
+    // 出栈前经 decorateScope 注 agentScope:'main'（事件无 threadId → 默认主线程）。
+    expect(events).toEqual([{ eventType: 'status', statusText: 'x', agentScope: 'main' }]);
   });
 });
 
@@ -786,7 +786,7 @@ describe('deriveTurnSubtype', () => {
 
 describe('wrapStreamEvent', () => {
   it('用 OUTPUT_MARKER 包裹成一行 JSON', () => {
-    const ev: StreamEvent = { type: 'text_delta', text: 'hi' };
+    const ev: StreamEvent = { eventType: 'text_delta', text: 'hi' };
     const line = wrapStreamEvent(ev);
     expect(line.startsWith(OUTPUT_START_MARKER)).toBe(true);
     expect(line.endsWith(`${OUTPUT_END_MARKER}\n`)).toBe(true);
@@ -949,7 +949,7 @@ describe('CodexRunner app-server 崩溃自愈（回归 #12）', () => {
     // sink 收到一条 result+subtype:'failed' 的收尾事件。
     const failed = lines
       .map((l) => JSON.parse(l.slice(OUTPUT_START_MARKER.length, l.length - OUTPUT_END_MARKER.length - 1)) as StreamEvent)
-      .find((ev) => ev.type === 'result' && ev.subtype === 'failed');
+      .find((ev) => ev.eventType === 'result' && ev.subtype === 'failed');
     expect(failed).toBeTruthy();
     expect(failed!.threadId).toBe('th_crash');
   });
@@ -968,7 +968,7 @@ describe('CodexRunner app-server 崩溃自愈（回归 #12）', () => {
 
     const failed = lines
       .map((l) => JSON.parse(l.slice(OUTPUT_START_MARKER.length, l.length - OUTPUT_END_MARKER.length - 1)) as StreamEvent)
-      .find((ev) => ev.type === 'result' && ev.subtype === 'failed');
+      .find((ev) => ev.eventType === 'result' && ev.subtype === 'failed');
     expect(failed).toBeUndefined(); // shutdown 是正常收尾，不伪造 failed
   });
 });
@@ -992,7 +992,7 @@ describe('CodexRunner B1 compact orchestration', () => {
     await vi.waitFor(() => expect(client.methods()).toContain('turn/start'));
   }
 
-  it('contextCompaction item（无主动 compact → auto）→ flush 一条 compact_partial（带缓冲正文 + sourceKind + scope=main + compactReason=auto）', async () => {
+  it('contextCompaction item（无主动 compact → auto）→ flush 一条 compact_partial（带缓冲正文 + sourceKind + agentScope=main + compactReason=auto）', async () => {
     const client = new FakeAppServerClient();
     client.responses['thread/start'] = { thread: { id: 'th_c', sessionId: 's', path: null } };
     client.responses['turn/start'] = { turn: { id: 'turn_1' } };
@@ -1006,12 +1006,12 @@ describe('CodexRunner B1 compact orchestration', () => {
     // contextCompaction item → 触发 flush。
     client.emit('item/started', { threadId: 'th_c', turnId: 'turn_1', startedAtMs: 1, item: { type: 'contextCompaction', id: 'cc_1' } });
 
-    const cp = parseEvents(lines).find((e) => e.type === 'compact_partial');
+    const cp = parseEvents(lines).find((e) => e.eventType === 'compact_partial');
     expect(cp).toBeTruthy();
     expect(cp!.sourceKind).toBe('compact_partial');
-    // 未经主动 compact()（运行时即内核 auto-compact）→ reason=auto；且经出栈装饰带 scope=main。
+    // 未经主动 compact()（运行时即内核 auto-compact）→ reason=auto；且经出栈装饰带 agentScope=main。
     expect(cp!.compactReason).toBe('auto');
-    expect(cp!.scope).toBe('main');
+    expect(cp!.agentScope).toBe('main');
     expect(cp!.text).toBe('in-flight answer');
     expect(cp!.threadId).toBe('th_c');
 
@@ -1028,7 +1028,7 @@ describe('CodexRunner B1 compact orchestration', () => {
     await runUntilTurnStart(client, runner);
     client.emit('item/started', { threadId: 'th_e', turnId: 'turn_1', startedAtMs: 1, item: { type: 'contextCompaction', id: 'cc_1' } });
 
-    const cp = parseEvents(lines).find((e) => e.type === 'compact_partial');
+    const cp = parseEvents(lines).find((e) => e.eventType === 'compact_partial');
     expect(cp).toBeTruthy();
     expect(cp!.text).toBeUndefined(); // 缓冲空 → 无 text 字段
     expect(cp!.sourceKind).toBe('compact_partial');
@@ -1055,7 +1055,7 @@ describe('CodexRunner B1 compact orchestration', () => {
       await runUntilTurnStart(client, runner);
       client.emit('item/started', { threadId: 'th_sub', turnId: 'turn_1', startedAtMs: 1, item: { type: 'contextCompaction', id: 'cc_1' } });
 
-      expect(parseEvents(lines).find((e) => e.type === 'compact_partial')).toBeUndefined();
+      expect(parseEvents(lines).find((e) => e.eventType === 'compact_partial')).toBeUndefined();
       // archiveBaseDir 下不应有任何 conversations 目录写出。
       expect(existsSync(join(dir, 'home-1', 'conversations'))).toBe(false);
       runner.shutdown();

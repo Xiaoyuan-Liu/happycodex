@@ -7,5 +7,8 @@ dist/
 coverage/
 log/
 
+# 运行时数据（db/密钥/会话/IPC，启动自动生成，绝不入库；对齐上游约定）
+/data/
+
 # happyclaw 上游源码快照（gitignored、可刷新；见 docs/UPSTREAM-SYNC.md）
 /upstream-happyclaw/

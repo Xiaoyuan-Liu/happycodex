@@ -50,9 +50,9 @@ export class StreamMapper implements IStreamMapper {
         const n = p as unknown as AgentMessageDeltaNotification;
         return [
           {
-            type: 'text_delta',
+            eventType: 'text_delta',
             text: n.delta ?? '',
-            itemId: n.itemId,
+            toolUseId: n.itemId,
             turnId: n.turnId,
             threadId: n.threadId,
           },
@@ -66,9 +66,9 @@ export class StreamMapper implements IStreamMapper {
           | ReasoningSummaryTextDeltaNotification;
         return [
           {
-            type: 'thinking_delta',
+            eventType: 'thinking_delta',
             text: n.delta ?? '',
-            itemId: n.itemId,
+            toolUseId: n.itemId,
             turnId: n.turnId,
             threadId: n.threadId,
           },
@@ -79,9 +79,9 @@ export class StreamMapper implements IStreamMapper {
         const n = p as unknown as CommandExecutionOutputDeltaNotification;
         return [
           {
-            type: 'tool_progress',
+            eventType: 'tool_progress',
             text: n.delta ?? '',
-            itemId: n.itemId,
+            toolUseId: n.itemId,
             threadId: n.threadId,
           },
         ];
@@ -93,9 +93,9 @@ export class StreamMapper implements IStreamMapper {
         if (!item || !isToolItem(item)) return [];
         return [
           {
-            type: 'tool_use_start',
+            eventType: 'tool_use_start',
             toolName: extractToolName(item),
-            itemId: item.id,
+            toolUseId: item.id,
             toolInputSummary: extractToolInputSummary(item),
             threadId: n.threadId,
           },
@@ -107,12 +107,12 @@ export class StreamMapper implements IStreamMapper {
         const item = n.item;
         if (!item) return [];
         // (b) contextCompaction item —— codex 推荐的压缩完成信号（优于 DEPRECATED 的 thread/compacted）。
-        //     与 (a) 等价：产 status:'compacted'，按 (threadId,turnId) 语义。两来源去重留给第二棒 session 层。
+        //     与 (a) 等价：产 statusText:'compacted'，按 (threadId,turnId) 语义。两来源去重留给第二棒 session 层。
         if (item.type === 'contextCompaction') {
           return [
             {
-              type: 'status',
-              status: 'compacted',
+              eventType: 'status',
+              statusText: 'compacted',
               threadId: n.threadId,
               turnId: n.turnId,
             },
@@ -121,9 +121,9 @@ export class StreamMapper implements IStreamMapper {
         if (!isToolItem(item)) return [];
         return [
           {
-            type: 'tool_use_end',
+            eventType: 'tool_use_end',
             toolName: extractToolName(item),
-            itemId: item.id,
+            toolUseId: item.id,
             ok: extractToolOk(item),
             threadId: n.threadId,
           },
@@ -135,7 +135,7 @@ export class StreamMapper implements IStreamMapper {
         const thread = n.thread;
         return [
           {
-            type: 'init',
+            eventType: 'init',
             threadId: thread?.id,
           },
         ];
@@ -145,7 +145,7 @@ export class StreamMapper implements IStreamMapper {
         const n = p as unknown as TurnStartedNotification;
         return [
           {
-            type: 'task_start',
+            eventType: 'task_start',
             turnId: n.turn?.id,
           },
         ];
@@ -155,7 +155,7 @@ export class StreamMapper implements IStreamMapper {
         const n = p as unknown as TurnCompletedNotification;
         return [
           {
-            type: 'result',
+            eventType: 'result',
             subtype: mapTurnStatus(n.turn?.status),
             turnId: n.turn?.id,
           },
@@ -165,8 +165,8 @@ export class StreamMapper implements IStreamMapper {
       case ServerNotif.threadStatusChanged: {
         return [
           {
-            type: 'status',
-            status: stringifyStatus((p as { status?: unknown }).status),
+            eventType: 'status',
+            statusText: stringifyStatus((p as { status?: unknown }).status),
           },
         ];
       }
@@ -174,7 +174,7 @@ export class StreamMapper implements IStreamMapper {
       case ServerNotif.threadTokenUsageUpdated: {
         return [
           {
-            type: 'usage',
+            eventType: 'usage',
             usage: p,
           },
         ];
@@ -187,8 +187,8 @@ export class StreamMapper implements IStreamMapper {
         const n = p as unknown as ContextCompactedNotification;
         return [
           {
-            type: 'status',
-            status: 'compacted',
+            eventType: 'status',
+            statusText: 'compacted',
             threadId: n.threadId,
             turnId: n.turnId,
           },
@@ -205,8 +205,8 @@ export class StreamMapper implements IStreamMapper {
         if (!isNotableHook(eventName, status)) return [];
         return [
           {
-            type: 'status',
-            status: `hook:${eventName}:${status}`,
+            eventType: 'status',
+            statusText: `hook:${eventName}:${status}`,
           },
         ];
       }

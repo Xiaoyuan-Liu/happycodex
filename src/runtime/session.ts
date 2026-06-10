@@ -84,8 +84,8 @@ export class ThreadSession implements IThreadSession {
 
   /**
    * B2：已登记的子代理 thread（receiverThreadId → 元数据）。来源：collabAgentToolCall item 的
-   * receiverThreadIds。decorateScope 据此把事件标 scope='subagent'（+subagentType）。
-   * 【scope 注入只在 session 层，绝不进 mapper】
+   * receiverThreadIds。decorateScope 据此把事件标 agentScope='subagent'（+subagentType）。
+   * 【agentScope 注入只在 session 层，绝不进 mapper】
    */
   private readonly childThreads = new Map<string, { subagentType?: string }>();
 
@@ -434,8 +434,8 @@ export class ThreadSession implements IThreadSession {
   }
 
   /**
-   * B2：在事件出栈前注入 scope 维度。【scope 注入只在 session 层，不进 mapper】
-   * ev.threadId ∈ childThreads → scope='subagent'(+subagentType)；否则 'main'。
+   * B2：在事件出栈前注入 agentScope 维度。【agentScope 注入只在 session 层，不进 mapper】
+   * ev.threadId ∈ childThreads → agentScope='subagent'(+subagentType)；否则 'main'。
    * threadId 缺省的事件（无 threadId 字段，如部分 status/result）默认归 'main'。
    */
   decorateScope(ev: StreamEvent): StreamEvent {
@@ -443,10 +443,10 @@ export class ThreadSession implements IThreadSession {
     if (tid != null) {
       const child = this.childThreads.get(tid);
       if (child) {
-        return { ...ev, scope: 'subagent', ...(child.subagentType ? { subagentType: child.subagentType } : {}) };
+        return { ...ev, agentScope: 'subagent', ...(child.subagentType ? { subagentType: child.subagentType } : {}) };
       }
     }
-    return { ...ev, scope: 'main' };
+    return { ...ev, agentScope: 'main' };
   }
 
   private emitStreamEvent(ev: StreamEvent): void {

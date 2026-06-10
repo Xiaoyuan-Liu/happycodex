@@ -155,9 +155,9 @@ export class CodexRunner implements ICodexRunner {
       this.shuttingDown = true; // 阻断后续 inject / maybeFinish 误判
       this.sink(
         wrapStreamEvent({
-          type: 'result',
+          eventType: 'result',
           subtype: 'failed',
-          status: `app-server closed (code=${String(info.code)} signal=${String(info.signal)})`,
+          statusText: `app-server closed (code=${String(info.code)} signal=${String(info.signal)})`,
           ...(this.session?.state.threadId ? { threadId: this.session.state.threadId } : {}),
         }),
       );
@@ -251,10 +251,10 @@ export class CodexRunner implements ICodexRunner {
     const threadId = session.state.threadId;
     this.sink(
       wrapStreamEvent({
-        type: 'compact_partial',
+        eventType: 'compact_partial',
         sourceKind: 'compact_partial',
         compactReason: reason,
-        scope: 'main',
+        agentScope: 'main',
         ...(text.trim() ? { text } : {}),
         ...(threadId ? { threadId } : {}),
       }),

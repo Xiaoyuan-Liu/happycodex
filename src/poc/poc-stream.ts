@@ -36,7 +36,7 @@ async function main(): Promise<number> {
     let toolEventCount = 0;
 
     session.onStreamEvent((ev) => {
-      switch (ev.type) {
+      switch (ev.eventType) {
         case 'text_delta':
           if (ev.text) {
             textDeltaCount += 1;

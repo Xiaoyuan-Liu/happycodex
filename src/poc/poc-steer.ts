@@ -57,14 +57,14 @@ async function main(): Promise<number> {
     };
 
     session.onStreamEvent((ev) => {
-      if (ev.type === 'text_delta' && ev.text) {
+      if (ev.eventType === 'text_delta' && ev.text) {
         deltaCount += 1;
         collected += ev.text;
         process.stdout.write(ev.text);
         if (deltaCount >= 1) {
           trySteer();
         }
-      } else if (ev.type === 'thinking_delta' && ev.text) {
+      } else if (ev.eventType === 'thinking_delta' && ev.text) {
         process.stderr.write(ev.text);
       }
     });

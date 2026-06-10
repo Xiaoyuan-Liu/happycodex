@@ -129,9 +129,9 @@ async function main(): Promise<void> {
     input = parseRunnerInput(stdinData);
   } catch (err) {
     writeStreamEvent({
-      type: 'result',
+      eventType: 'result',
       subtype: 'failed',
-      status: `input parse failed: ${err instanceof Error ? err.message : String(err)}`,
+      statusText: `input parse failed: ${err instanceof Error ? err.message : String(err)}`,
     });
     process.exit(1);
   }
@@ -233,9 +233,9 @@ async function main(): Promise<void> {
   } catch (err) {
     log(`fatal: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
     writeStreamEvent({
-      type: 'result',
+      eventType: 'result',
       subtype: 'failed',
-      status: `agent-runner error: ${err instanceof Error ? err.message : String(err)}`,
+      statusText: `agent-runner error: ${err instanceof Error ? err.message : String(err)}`,
     });
     try {
       runner.shutdown();

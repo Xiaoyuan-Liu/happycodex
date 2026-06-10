@@ -30,7 +30,7 @@ const BASE_CONFIG: ThreadSessionConfig = {
 async function ask(session: ThreadSession, text: string): Promise<string> {
   let collected = '';
   const off = session.onStreamEvent((ev) => {
-    if (ev.type === 'text_delta' && ev.text) {
+    if (ev.eventType === 'text_delta' && ev.text) {
       collected += ev.text;
       process.stdout.write(ev.text);
     }
