@@ -353,3 +353,83 @@ describe('buildSessionDeveloperInstructions', () => {
     expect(text).toContain('子代理会话: researcher（id: a1）');
   });
 });
+
+// ─── skillsIndex 通道（skills-materializer 索引并入 AGENTS.md） ──────────
+
+describe('buildCodexContextPlan（skillsIndex 通道）', () => {
+  const SKILLS_SECTION =
+    '## 可用技能（happycodex 物化到工作区 .skills/，勿在此回写）\n\n- **agent-browser**（入口：`/g/.skills/agent-browser/SKILL.md`）：浏览器自动化';
+
+  function planWithSkills(group: RegisteredGroup, ownerHomeFolder?: string, section = SKILLS_SECTION) {
+    return buildCodexContextPlan({
+      executionMode: 'host',
+      group,
+      ownerHomeFolder,
+      externalClaudeDir: external,
+      groupsDir,
+      skillsIndex: { section, skillsDir: '/g/.skills' },
+    });
+  }
+
+  test('索引节追加在用户/全局段之后，源记为 skills-index', () => {
+    writeFile(path.join(groupsDir, 'user-global', 'u1', 'CLAUDE.md'), '# u1 记忆');
+
+    const plan = planWithSkills(fakeGroup('home-u1', 'u1', true), 'home-u1');
+
+    expect(plan.agentsMd).toContain('## 可用技能');
+    expect(plan.agentsMd!.indexOf('# u1 记忆')).toBeLessThan(
+      plan.agentsMd!.indexOf('## 可用技能'),
+    );
+    expect(plan.agentsMdSources.map((s) => s.name)).toEqual([
+      'user-global-claude-md',
+      'skills-index',
+    ]);
+    const skillsSource = plan.agentsMdSources.find((s) => s.name === 'skills-index')!;
+    expect(skillsSource.sourcePath).toBe('/g/.skills');
+    expect(skillsSource.truncated).toBe(false);
+  });
+
+  test('仅有技能索引（非 home 非 admin 群组）：agentsMd 不为 null，只含索引节', () => {
+    const plan = planWithSkills(fakeGroup('ws-x', 'u1', false), 'home-u1');
+
+    expect(plan.agentsMd).not.toBeNull();
+    expect(plan.agentsMd).toContain('agent-browser');
+    expect(plan.agentsMdSources.map((s) => s.name)).toEqual(['skills-index']);
+  });
+
+  test('skillsIndex 缺省/null：行为与未接技能时完全一致（agentsMd null）', () => {
+    const plan = buildCodexContextPlan({
+      executionMode: 'host',
+      group: fakeGroup('ws-x', 'u1', false),
+      ownerHomeFolder: 'home-u1',
+      externalClaudeDir: external,
+      groupsDir,
+      skillsIndex: null,
+    });
+    expect(plan.agentsMd).toBeNull();
+    expect(plan.agentsMdSources).toEqual([]);
+  });
+
+  test('32KiB 预算：索引节超限被裁剪并标记 truncated + warning，总量不破上限', () => {
+    const hugeSection =
+      '## 可用技能\n\n' + '- **技能甲**（入口：`/g/.skills/甲/SKILL.md`）：描述。\n'.repeat(2048);
+    const plan = planWithSkills(fakeGroup('ws-x', 'u1', false), 'home-u1', hugeSection);
+
+    const finalFile = `${AGENTS_MD_GENERATED_MARKER}\n\n${plan.agentsMd!}\n`;
+    expect(Buffer.byteLength(finalFile, 'utf8')).toBeLessThanOrEqual(AGENTS_MD_MAX_BYTES);
+    expect(plan.agentsMd).toContain('已截断');
+    expect(plan.agentsMdSources.find((s) => s.name === 'skills-index')!.truncated).toBe(true);
+    expect(plan.warnings.some((w) => w.includes('skills-index'))).toBe(true);
+    expect(plan.agentsMd).not.toContain('�');
+  });
+
+  test('预算被用户/全局段耗尽时索引节整段放弃并标记 truncated', () => {
+    writeFile(path.join(groupsDir, 'user-global', 'u1', 'CLAUDE.md'), 'A'.repeat(AGENTS_MD_MAX_BYTES));
+
+    const plan = planWithSkills(fakeGroup('home-u1', 'u1', true), 'home-u1');
+
+    expect(plan.agentsMd).not.toContain('## 可用技能');
+    expect(plan.agentsMdSources.find((s) => s.name === 'skills-index')!.truncated).toBe(true);
+    expect(plan.warnings.some((w) => w.includes('整段未注入（skills-index）'))).toBe(true);
+  });
+});
