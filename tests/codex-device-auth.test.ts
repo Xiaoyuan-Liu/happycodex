@@ -109,6 +109,7 @@ import { userCodexHomeDir } from '../src/codex-paths.js';
 
 let killSpy: import('vitest').MockInstance<(...args: never[]) => unknown>;
 let existsSpy: import('vitest').MockInstance<(...args: never[]) => boolean>;
+let mkdirSpy: import('vitest').MockInstance<(...args: never[]) => unknown>;
 
 function lastChild(): InstanceType<typeof h.FakeChild> {
   const c = h.spawned[h.spawned.length - 1];
@@ -125,12 +126,15 @@ beforeEach(() => {
   // authorized 现在以 auth.json 真落盘为准（exit 0 不够）。默认模拟"已写入"，
   // 个别测试覆写为 false 验证"exit 0 但无凭据 → error"。
   existsSpy = vi.spyOn(fs, 'existsSync').mockReturnValue(true);
+  // mkdir 真实会创建 per-user 目录——spy 成 no-op，避免测试在 data/ 下留垃圾。
+  mkdirSpy = vi.spyOn(fs, 'mkdirSync').mockImplementation(() => undefined);
 });
 
 afterEach(() => {
   shutdownAllDeviceAuth();
   killSpy.mockRestore();
   existsSpy.mockRestore();
+  mkdirSpy.mockRestore();
   vi.useRealTimers();
 });
 
@@ -151,6 +155,13 @@ describe('startDeviceAuth — spawn 参数与安全', () => {
   test('detached 启动（便于超时杀进程树）', () => {
     startDeviceAuth('alice', () => {});
     expect((lastChild().options as { detached?: boolean }).detached).toBe(true);
+  });
+
+  test('spawn 前先创建 per-user CODEX_HOME（codex 对不存在目录会退出 1）', () => {
+    startDeviceAuth('alice', () => {});
+    expect(mkdirSpy).toHaveBeenCalledWith(userCodexHomeDir('alice'), {
+      recursive: true,
+    });
   });
 
   test('非法 userId → 透传 userCodexHomeDir 抛错（不 spawn）', () => {

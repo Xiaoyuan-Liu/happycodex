@@ -133,6 +133,16 @@ export function startDeviceAuth(
   const codexHome = userCodexHomeDir(userId);
   const codexBin = opts.codexBin ?? 'codex';
 
+  // 先建目录：codex 对不存在的 CODEX_HOME 直接报 "path does not exist" 退出 1
+  // （api-key/access-token 端点已各自 mkdir，device/start 此前漏了 → 首次登录必失败）。
+  try {
+    fs.mkdirSync(codexHome, { recursive: true });
+  } catch (err) {
+    logger.warn({ err, userId }, 'codex device-auth: failed to create CODEX_HOME');
+    onUpdate({ status: 'error', error: 'Failed to prepare codex home' });
+    return;
+  }
+
   let child: ChildProcess;
   try {
     child = spawn(codexBin, ['login', '--device-auth'], {
