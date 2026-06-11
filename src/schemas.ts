@@ -492,12 +492,12 @@ export const ClaudeCustomEnvSchema = z.object({
   customEnv: z.record(z.string().max(256), z.string().max(4096)),
 });
 
+// tombstone（happycodex）：上游 ContainerEnvSchema 还收 5 个 per-group Claude
+// provider 覆盖字段（anthropicBaseUrl/anthropicAuthToken/anthropicApiKey/
+// claudeCodeOauthToken/anthropicModel），随 provider failover 作废——codex 引擎
+// 没有任何消费路径，写入只会沉淀死配置。schema 收窄为仅 customEnv；zod 默认
+// strip 未知键，旧前端再发这些字段会被剥离而非 400。
 export const ContainerEnvSchema = z.object({
-  anthropicBaseUrl: z.string().max(2000).optional(),
-  anthropicAuthToken: z.string().max(2000).optional(),
-  anthropicApiKey: z.string().max(2000).optional(),
-  claudeCodeOauthToken: z.string().max(2000).optional(),
-  anthropicModel: z.string().max(128).optional(),
   customEnv: z
     .record(z.string().max(256), z.string().max(4096))
     .optional()

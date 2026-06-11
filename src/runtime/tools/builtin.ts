@@ -477,7 +477,9 @@ export function createBuiltinTools(): ToolDefinition[] {
         name: 'register_group',
         description:
           '注册一个新群组/会话，使 Agent 能够响应该群组的消息（仅管理员主容器可用）。' +
-          '需提供群组的 chat JID，可选提供展示名称。',
+          '需提供群组的 chat JID，可选提供展示名称。' +
+          '注意：本构建中该工具暂不可用（缺少主进程必填的 folder 参数，调用必然失败）——' +
+          '请引导管理员在 Web 界面注册群组。',
         inputSchema: {
           type: 'object',
           properties: {

@@ -11,7 +11,8 @@ export interface SystemStatus {
   uptime: number;
   dockerImageExists: boolean;
   dockerBuildInProgress?: boolean;
-  claudeCodeVersions?: { host: string | null; container: string | null; latest: string | null } | null;
+  // happycodex：上游字段名 claudeCodeVersions（claude-code 探测）——引擎换 codex 后同步改名。
+  codexVersions?: { host: string | null; container: string | null; latest: string | null } | null;
   dockerBuildLogs?: string[];
   dockerBuildResult?: { success: boolean; error?: string } | null;
   groups: Array<{
@@ -23,8 +24,8 @@ export interface SystemStatus {
     displayName: string | null;
     groupFolder: string | null;
     ownerUsername: string | null;
-    selectedProviderId: string | null;
-    selectedProviderName: string | null;
+    // tombstone（happycodex）：上游此处还有 selectedProviderId/selectedProviderName
+    // （provider failover 展示）——随 provider failover 作废删除（同 src/routes/monitor.ts 富化段）。
   }>;
 }
 
@@ -38,7 +39,9 @@ interface MonitorState {
   loadStatus: () => Promise<void>;
   buildDockerImage: () => Promise<void>;
   clearBuildResult: () => void;
-  switchProvider: (folder: string, providerId: string) => Promise<{ ok: boolean; restarted: boolean }>;
+  // tombstone（happycodex）：上游此处还有 switchProvider action（POST
+  // /api/status/groups/:folder/switch-provider）——后端端点随 provider failover
+  // 作废删除（见 src/routes/monitor.ts），action 同步移除。
 }
 
 export const useMonitorStore = create<MonitorState>((set) => ({
@@ -93,12 +96,4 @@ export const useMonitorStore = create<MonitorState>((set) => ({
   },
 
   clearBuildResult: () => set({ buildResult: null, buildLogs: [] }),
-
-  switchProvider: async (folder: string, providerId: string) => {
-    const res = await api.post<{ ok: boolean; restarted: boolean }>(
-      `/api/status/groups/${encodeURIComponent(folder)}/switch-provider`,
-      { providerId },
-    );
-    return res;
-  },
 }));

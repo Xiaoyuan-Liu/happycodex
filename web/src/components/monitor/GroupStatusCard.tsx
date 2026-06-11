@@ -1,7 +1,8 @@
 import { Badge } from '@/components/ui/badge';
 import { Card, CardContent } from '@/components/ui/card';
 // Tombstone（happycodex）：上游此处导入 ProviderSwitcher（运行中切换 Claude provider），
-// provider failover 已作废，组件删除，Provider 行随之摘除。
+// provider failover 已作废，组件删除，Provider 行随之摘除；group props 里上游的
+// selectedProviderId/selectedProviderName 两个 provider 字段也一并删除。
 
 interface GroupStatusCardProps {
   group: {
@@ -13,8 +14,6 @@ interface GroupStatusCardProps {
     displayName: string | null;
     groupFolder: string | null;
     ownerUsername: string | null;
-    selectedProviderId: string | null;
-    selectedProviderName: string | null;
   };
 }
 

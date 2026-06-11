@@ -55,6 +55,13 @@ import type { RegisteredGroup } from './types.js';
 const ADMIN_HOME_FOLDER = 'main';
 
 /**
+ * 容器模式下 user-global 记忆的容器内路径（与 container-runner.ts buildVolumeMounts
+ * 的 containerPath '/workspace/global' 挂载点对齐）。AGENTS.md 的记忆写回指引必须
+ * 指向容器内可达路径——宿主机路径在容器内不存在。
+ */
+const CONTAINER_USER_GLOBAL_CLAUDE_MD = '/workspace/global/CLAUDE.md';
+
+/**
  * codex 的 project_doc_max_bytes 默认值（PoC 结论 ④：单文件 32KiB 上限）。
  * 物化的 AGENTS.md（含 generated marker 行）超过该值会被 codex 静默截断，
  * 因此在生成侧预裁剪并日志。
@@ -173,9 +180,12 @@ export function buildCodexContextPlan(args: CodexContextPlanArgs): CodexContextP
         truncated: false,
       };
       const rulesDir = path.join(args.externalClaudeDir, 'rules');
-      const rulesHint = fs.existsSync(rulesDir)
-        ? `\n\n（补充规则目录：${rulesDir}/ —— 涉及对应主题时按需读取其中的 *.md）`
-        : '';
+      // rules 提示仅 host 模式输出：容器未挂载 rules 目录（上游 ro-mount 随
+      // Claude 引擎面 tombstone 删除），容器内给出宿主机死路径有害无益。
+      const rulesHint =
+        args.executionMode === 'host' && fs.existsSync(rulesDir)
+          ? `\n\n（补充规则目录：${rulesDir}/ —— 涉及对应主题时按需读取其中的 *.md）`
+          : '';
       sections.push({
         source,
         text: `## 管理员全局指令（源：${adminClaudeMdPath}，happycodex 物化，勿在此回写）\n\n${adminClaudeMd.trimEnd()}${rulesHint}`,
@@ -197,9 +207,16 @@ export function buildCodexContextPlan(args: CodexContextPlanArgs): CodexContextP
         bytes: Buffer.byteLength(userGlobal, 'utf8'),
         truncated: false,
       };
+      // 展示路径按执行模式切换：容器内宿主机路径不可达，写回指引指向 /workspace/global
+      // 挂载点（②段仅 is_home 群组物化，而 /workspace/global 恰在 is_home 时可写，口径自洽）；
+      // 审计条目 source.sourcePath 保留真实宿主机路径（host 侧读取/追溯用）。
+      const displayPath =
+        args.executionMode === 'container'
+          ? CONTAINER_USER_GLOBAL_CLAUDE_MD
+          : userGlobalPath;
       sections.push({
         source,
-        text: `## 用户全局记忆（源：${userGlobalPath}，happycodex 物化；更新记忆请写回该源文件，勿改本文件）\n\n${userGlobal.trimEnd()}`,
+        text: `## 用户全局记忆（源：${displayPath}，happycodex 物化；更新记忆请写回该源文件，勿改本文件）\n\n${userGlobal.trimEnd()}`,
       });
       sources.push(source);
     }
@@ -257,6 +274,30 @@ export function buildCodexContextPlan(args: CodexContextPlanArgs): CodexContextP
       break;
     }
     agentsMd = assembled.join('\n\n');
+  }
+
+  // ② 项目维度观测：codex 经 project_doc_fallback_filenames 直读工作区 CLAUDE.md，
+  // 超 project_doc_max_bytes（默认 32KiB）时 codex 静默截断尾部——此处只 stat 预警，
+  // 不读不写不裁剪（CLAUDE.md 只读红线）。
+  try {
+    const workspaceClaudeMd = path.join(args.groupsDir, args.group.folder, 'CLAUDE.md');
+    const st = fs.statSync(workspaceClaudeMd);
+    if (st.size > AGENTS_MD_MAX_BYTES) {
+      warnings.push(
+        `工作区 CLAUDE.md 超出 ${AGENTS_MD_MAX_BYTES} 字节（project_doc_max_bytes），codex 将静默截断尾部（${workspaceClaudeMd}）`,
+      );
+      logger.warn(
+        {
+          folder: args.group.folder,
+          sourcePath: workspaceClaudeMd,
+          sourceBytes: st.size,
+          maxBytes: AGENTS_MD_MAX_BYTES,
+        },
+        'workspace CLAUDE.md exceeds project_doc_max_bytes, codex will silently truncate the tail',
+      );
+    }
+  } catch {
+    // 文件不存在/不可读：正常情况，无需告警。
   }
 
   return {

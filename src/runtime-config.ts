@@ -601,73 +601,24 @@ function getOrCreateEncryptionKey(): Buffer {
   return key;
 }
 
+// tombstone（happycodex）：上游 runtime-config.ts:604-671 的 encryptSecrets/decryptSecrets
+// 仅服务 Claude provider payload（claude-provider.json 内的 secrets 字段）。codex-only
+// 运行时不消费 Anthropic 凭据，provider 体系整体惰性化（见 readStoredState /
+// readStoredStateV4 / writeStoredState* 各处 tombstone）——二者门控为抛错，确保任何
+// 残留调用路径都不会触发 getOrCreateEncryptionKey 的加密 key 首次落盘等副作用。
+// Feishu / Telegram / 用户 IM 密文走 encryptChannelSecret / decryptChannelSecret
+// （与上游同一 key 文件 claude-provider.key，文件名不可改），保持活体不动。
+const PROVIDER_SYSTEM_DISABLED =
+  'Claude provider 配置体系在 happycodex（codex-only）已停用';
+
 function encryptSecrets(payload: SecretPayload): EncryptedSecrets {
-  const key = getOrCreateEncryptionKey();
-  const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
-
-  const plaintext = Buffer.from(JSON.stringify(payload), 'utf-8');
-  const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final()]);
-  const tag = cipher.getAuthTag();
-
-  return {
-    iv: iv.toString('base64'),
-    tag: tag.toString('base64'),
-    data: encrypted.toString('base64'),
-  };
+  void payload;
+  throw new Error(PROVIDER_SYSTEM_DISABLED);
 }
 
 function decryptSecrets(secrets: EncryptedSecrets): SecretPayload {
-  const key = getOrCreateEncryptionKey();
-  const iv = Buffer.from(secrets.iv, 'base64');
-  const tag = Buffer.from(secrets.tag, 'base64');
-  const encrypted = Buffer.from(secrets.data, 'base64');
-
-  const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
-  decipher.setAuthTag(tag);
-
-  const decrypted = Buffer.concat([
-    decipher.update(encrypted),
-    decipher.final(),
-  ]).toString('utf-8');
-
-  const parsed = JSON.parse(decrypted) as Record<string, unknown>;
-  const result: SecretPayload = {
-    anthropicAuthToken: normalizeSecret(
-      parsed.anthropicAuthToken ?? '',
-      'anthropicAuthToken',
-    ),
-    anthropicApiKey: normalizeSecret(
-      parsed.anthropicApiKey ?? '',
-      'anthropicApiKey',
-    ),
-    claudeCodeOauthToken: normalizeSecret(
-      parsed.claudeCodeOauthToken ?? '',
-      'claudeCodeOauthToken',
-    ),
-  };
-  // Restore OAuth credentials if present
-  if (
-    parsed.claudeOAuthCredentials &&
-    typeof parsed.claudeOAuthCredentials === 'object'
-  ) {
-    const creds = parsed.claudeOAuthCredentials as Record<string, unknown>;
-    if (
-      typeof creds.accessToken === 'string' &&
-      typeof creds.refreshToken === 'string'
-    ) {
-      result.claudeOAuthCredentials = {
-        accessToken: creds.accessToken,
-        refreshToken: creds.refreshToken,
-        expiresAt: typeof creds.expiresAt === 'number' ? creds.expiresAt : 0,
-        scopes: Array.isArray(creds.scopes) ? (creds.scopes as string[]) : [],
-        ...(typeof creds.subscriptionType === 'string'
-          ? { subscriptionType: creds.subscriptionType }
-          : {}),
-      };
-    }
-  }
-  return result;
+  void secrets;
+  throw new Error(PROVIDER_SYSTEM_DISABLED);
 }
 
 function encryptChannelSecret<T>(payload: T): EncryptedSecrets {
@@ -698,21 +649,9 @@ function decryptChannelSecret<T>(secrets: EncryptedSecrets): T {
   return JSON.parse(decrypted) as T;
 }
 
-function readLegacyConfig(
-  raw: StoredClaudeProviderConfigLegacy,
-): ClaudeProviderConfig {
-  return buildConfig(
-    {
-      anthropicBaseUrl: raw.anthropicBaseUrl ?? '',
-      anthropicAuthToken: raw.anthropicAuthToken ?? '',
-      anthropicApiKey: raw.anthropicApiKey ?? '',
-      claudeCodeOauthToken: raw.claudeCodeOauthToken ?? '',
-      claudeOAuthCredentials: null,
-      anthropicModel: process.env.ANTHROPIC_MODEL || '',
-    },
-    typeof raw.updatedAt === 'string' ? raw.updatedAt : null,
-  );
-}
+// tombstone（happycodex）：上游 runtime-config.ts:701-715 readLegacyConfig（无版本号
+// 旧格式 claude-provider.json 解析）随 readStoredState 惰性化（恒 null）成为不可达，
+// 一并删除。
 
 function toStoredProfile(
   profile: ClaudeThirdPartyProfile,
@@ -812,429 +751,65 @@ function buildOfficialClaudeProviderConfig(
   );
 }
 
-function normalizeStoredState(
-  state: ClaudeStoredStateV3Resolved,
-): ClaudeStoredStateV3Resolved {
-  const normalizedProfiles = state.profiles
-    .map((item) => fromStoredProfile(item))
-    .slice(0, MAX_THIRD_PARTY_PROFILES)
-    .map((profile) => toStoredProfile(profile));
-
-  const officialSecrets = normalizeOfficialSecrets(state.officialSecrets);
-  const officialMode = isOfficialClaudeMode(state.activeProfileId);
-  let officialCustomEnv = sanitizeCustomEnvMap(state.officialCustomEnv || {}, {
-    skipReservedClaudeKeys: true,
-  });
-
-  // Lazy migration: if all profiles have empty customEnv, migrate from legacy global file
-  const allEmpty =
-    Object.keys(officialCustomEnv).length === 0 &&
-    normalizedProfiles.every(
-      (p) => !p.customEnv || Object.keys(p.customEnv).length === 0,
-    );
-  if (allEmpty) {
-    try {
-      if (fs.existsSync(CLAUDE_CUSTOM_ENV_FILE)) {
-        const parsed = JSON.parse(
-          fs.readFileSync(CLAUDE_CUSTOM_ENV_FILE, 'utf-8'),
-        ) as { customEnv?: Record<string, string> };
-        const legacyEnv = sanitizeCustomEnvMap(parsed.customEnv || {}, {
-          skipReservedClaudeKeys: true,
-        });
-        if (Object.keys(legacyEnv).length > 0) {
-          if (officialMode) {
-            officialCustomEnv = legacyEnv;
-          } else {
-            // Assign to the active profile
-            const activeIdx = normalizedProfiles.findIndex(
-              (p) => p.id === state.activeProfileId,
-            );
-            if (activeIdx >= 0) {
-              normalizedProfiles[activeIdx] = {
-                ...normalizedProfiles[activeIdx]!,
-                customEnv: legacyEnv,
-              };
-            }
-          }
-          logger.info('Migrated legacy global customEnv to active profile');
-        }
-      }
-    } catch (err) {
-      logger.warn({ err }, 'Failed to migrate legacy global customEnv');
-    }
-  }
-
-  if (normalizedProfiles.length === 0) {
-    if (officialMode) {
-      return {
-        activeProfileId: OFFICIAL_CLAUDE_PROFILE_ID,
-        profiles: [],
-        officialSecrets,
-        officialUpdatedAt: state.officialUpdatedAt,
-        officialCustomEnv,
-      };
-    }
-
-    const defaultProfile = toStoredProfile(
-      makeDefaultThirdPartyProfile({
-        anthropicBaseUrl: '',
-        anthropicAuthToken: '',
-        anthropicApiKey: '',
-        claudeCodeOauthToken: '',
-        claudeOAuthCredentials: null,
-        anthropicModel: process.env.ANTHROPIC_MODEL || '',
-        updatedAt: null,
-      }),
-    );
-    return {
-      activeProfileId: defaultProfile.id,
-      profiles: [defaultProfile],
-      officialSecrets,
-      officialUpdatedAt: state.officialUpdatedAt,
-      officialCustomEnv,
-    };
-  }
-
-  const hasActive = normalizedProfiles.some(
-    (item) => item.id === state.activeProfileId,
-  );
-  const activeProfileId = officialMode
-    ? OFFICIAL_CLAUDE_PROFILE_ID
-    : hasActive
-      ? state.activeProfileId
-      : normalizedProfiles[0]!.id;
-
-  return {
-    activeProfileId,
-    profiles: normalizedProfiles,
-    officialSecrets,
-    officialUpdatedAt: state.officialUpdatedAt,
-    officialCustomEnv,
-  };
-}
+// tombstone（happycodex）：上游 runtime-config.ts:815-914 normalizeStoredState
+// （V3 状态归一化 + claude-custom-env.json legacy customEnv 惰性迁移读写）随
+// readStoredState / writeStoredState 惰性化成为不可达，一并删除。
 
 function readStoredState(): ClaudeStoredStateV3Resolved | null {
-  if (!fs.existsSync(CLAUDE_CONFIG_FILE)) return null;
-  try {
-    const content = fs.readFileSync(CLAUDE_CONFIG_FILE, 'utf-8');
-    const parsed = JSON.parse(content) as Record<string, unknown>;
-
-    if (parsed.version === 3) {
-      const v3 = parsed as unknown as StoredClaudeProviderConfigV3;
-      const profiles = Array.isArray(v3.profiles) ? v3.profiles : [];
-      const officialSecrets = v3.official
-        ? decryptSecrets(v3.official.secrets)
-        : {
-            anthropicAuthToken: '',
-            anthropicApiKey: '',
-            claudeCodeOauthToken: '',
-            claudeOAuthCredentials: null,
-          };
-      return normalizeStoredState({
-        activeProfileId:
-          typeof v3.activeProfileId === 'string'
-            ? isOfficialClaudeMode(v3.activeProfileId)
-              ? OFFICIAL_CLAUDE_PROFILE_ID
-              : normalizeProfileId(v3.activeProfileId)
-            : DEFAULT_THIRD_PARTY_PROFILE_ID,
-        profiles: profiles as StoredClaudeThirdPartyProfileV1[],
-        officialSecrets,
-        officialUpdatedAt: v3.official?.updatedAt || null,
-        officialCustomEnv: v3.official?.customEnv || {},
-      });
-    }
-
-    if (parsed.version === 2) {
-      const v2 = parsed as unknown as StoredClaudeProviderConfigV2;
-      const secrets = decryptSecrets(v2.secrets);
-      const legacyConfig = buildConfig(
-        {
-          anthropicBaseUrl: v2.anthropicBaseUrl,
-          anthropicAuthToken: secrets.anthropicAuthToken,
-          anthropicApiKey: secrets.anthropicApiKey,
-          claudeCodeOauthToken: secrets.claudeCodeOauthToken,
-          claudeOAuthCredentials: secrets.claudeOAuthCredentials ?? null,
-          anthropicModel: process.env.ANTHROPIC_MODEL || '',
-        },
-        v2.updatedAt || null,
-      );
-      const profile = toStoredProfile(
-        makeDefaultThirdPartyProfile(legacyConfig),
-      );
-      return normalizeStoredState({
-        activeProfileId: profile.id,
-        profiles: [profile],
-        officialSecrets: {
-          anthropicAuthToken: '',
-          anthropicApiKey: legacyConfig.anthropicApiKey,
-          claudeCodeOauthToken: legacyConfig.claudeCodeOauthToken,
-          claudeOAuthCredentials: legacyConfig.claudeOAuthCredentials,
-        },
-        officialUpdatedAt: legacyConfig.updatedAt,
-        officialCustomEnv: {},
-      });
-    }
-
-    const legacy = readLegacyConfig(parsed as StoredClaudeProviderConfigLegacy);
-    const profile = toStoredProfile(makeDefaultThirdPartyProfile(legacy));
-    return normalizeStoredState({
-      activeProfileId: profile.id,
-      profiles: [profile],
-      officialSecrets: {
-        anthropicAuthToken: '',
-        anthropicApiKey: legacy.anthropicApiKey,
-        claudeCodeOauthToken: legacy.claudeCodeOauthToken,
-        claudeOAuthCredentials: legacy.claudeOAuthCredentials,
-      },
-      officialUpdatedAt: legacy.updatedAt,
-      officialCustomEnv: {},
-    });
-  } catch (err) {
-    logger.error(
-      { err, file: CLAUDE_CONFIG_FILE },
-      'Failed to read Claude provider config, falling back to defaults',
-    );
-    return null;
-  }
+  // tombstone（happycodex）：上游 runtime-config.ts:916-999 读取 claude-provider.json
+  // （legacy/V2/V3 全版本解析 + decryptSecrets，读取期会触发加密 key 首次落盘，
+  // normalizeStoredState 还会做 legacy customEnv 的惰性迁移）。codex-only 运行时
+  // 不存在 Claude provider 消费方：恒返回 null（视同「无配置」），不读文件、不解密、
+  // 不迁移，存量文件原样保留。下游读取函数（listClaudeThirdPartyProfiles /
+  // resolveProfileToConfig / getCustomEnvForProfile 等）经各自 null 分支退化为
+  // 空/禁用态，导出签名不变。
+  return null;
 }
 
 function writeStoredState(state: ClaudeStoredStateV3Resolved): void {
-  const normalized = normalizeStoredState(state);
-  const payload: StoredClaudeProviderConfigV3 = {
-    version: CURRENT_CONFIG_VERSION,
-    activeProfileId: normalized.activeProfileId,
-    profiles: normalized.profiles,
-    official: {
-      updatedAt: normalized.officialUpdatedAt || new Date().toISOString(),
-      secrets: encryptSecrets({
-        anthropicAuthToken: '',
-        anthropicApiKey: normalized.officialSecrets.anthropicApiKey,
-        claudeCodeOauthToken: normalized.officialSecrets.claudeCodeOauthToken,
-        claudeOAuthCredentials:
-          normalized.officialSecrets.claudeOAuthCredentials,
-      }),
-      ...(Object.keys(normalized.officialCustomEnv || {}).length > 0
-        ? { customEnv: normalized.officialCustomEnv }
-        : {}),
-    },
-  };
-
-  fs.mkdirSync(CLAUDE_CONFIG_DIR, { recursive: true });
-  writeSecretFile(CLAUDE_CONFIG_FILE, JSON.stringify(payload, null, 2) + '\n');
+  // tombstone（happycodex）：上游 runtime-config.ts:1001-1024 加密回写 claude-provider.json
+  // （V3 格式，encryptSecrets → 加密 key 首次落盘）。provider 体系惰性化后写路径
+  // 整体禁用：saveClaudeProviderConfig / saveClaudeOfficialProviderSecrets /
+  // create|update|activate|delete*ThirdPartyProfile / saveOfficialCustomEnv 等
+  // CRUD 导出经此抛错成为禁用态（签名不变），不再产生配置与 key 落盘。
+  void state;
+  throw new Error(PROVIDER_SYSTEM_DISABLED);
 }
 
 // ─── V4 统一供应商 Read / Write / CRUD ──────────────────────────
 
-function toStoredProviderV4(provider: UnifiedProvider): StoredProviderV4 {
-  const secrets: SecretPayload = {
-    anthropicAuthToken: provider.anthropicAuthToken || '',
-    anthropicApiKey: provider.anthropicApiKey || '',
-    claudeCodeOauthToken: provider.claudeCodeOauthToken || '',
-    claudeOAuthCredentials: provider.claudeOAuthCredentials ?? null,
-  };
-  const sanitizedEnv = sanitizeCustomEnvMap(provider.customEnv || {}, {
-    skipReservedClaudeKeys: true,
-  });
-  return {
-    id: provider.id,
-    name: provider.name,
-    type: provider.type,
-    enabled: provider.enabled,
-    weight: Math.max(1, Math.min(100, provider.weight || 1)),
-    anthropicBaseUrl: provider.anthropicBaseUrl || '',
-    anthropicModel: provider.anthropicModel || '',
-    secrets: encryptSecrets(secrets),
-    ...(Object.keys(sanitizedEnv).length > 0
-      ? { customEnv: sanitizedEnv }
-      : {}),
-    updatedAt: provider.updatedAt || new Date().toISOString(),
-  };
-}
+// tombstone（happycodex）：上游 runtime-config.ts:1028-1174 的 toStoredProviderV4 /
+// fromStoredProviderV4（V4 provider 加解密编解码）与 migrateV3toV4（V3→V4 迁移，
+// 含 provider-pool.json 读取）随 readStoredStateV4 / writeStoredStateV4 惰性化
+// 成为不可达，一并删除。存量 claude-provider.json / provider-pool.json 原样保留。
 
-function fromStoredProviderV4(stored: StoredProviderV4): UnifiedProvider {
-  const secrets = decryptSecrets(stored.secrets);
-  return {
-    id: stored.id,
-    name: stored.name,
-    type: stored.type,
-    enabled: stored.enabled,
-    weight: Math.max(1, Math.min(100, stored.weight || 1)),
-    anthropicBaseUrl: stored.anthropicBaseUrl || '',
-    anthropicAuthToken: secrets.anthropicAuthToken || '',
-    anthropicModel: stored.anthropicModel || '',
-    anthropicApiKey: secrets.anthropicApiKey || '',
-    claudeCodeOauthToken: secrets.claudeCodeOauthToken || '',
-    claudeOAuthCredentials: secrets.claudeOAuthCredentials ?? null,
-    customEnv: sanitizeCustomEnvMap(stored.customEnv || {}, {
-      skipReservedClaudeKeys: true,
-    }),
-    updatedAt: stored.updatedAt || '',
-  };
-}
-
-/** Migrate V3 stored state to V4 unified provider list */
-function migrateV3toV4(v3: ClaudeStoredStateV3Resolved): {
-  providers: UnifiedProvider[];
-  balancing: BalancingConfig;
-} {
-  const providers: UnifiedProvider[] = [];
-  const now = new Date().toISOString();
-
-  // 1. Official credentials → official provider (if any secret present)
-  const hasOfficial =
-    !!v3.officialSecrets.anthropicApiKey ||
-    !!v3.officialSecrets.claudeCodeOauthToken ||
-    !!v3.officialSecrets.claudeOAuthCredentials;
-  if (hasOfficial) {
-    providers.push({
-      id: OFFICIAL_CLAUDE_PROFILE_ID,
-      name: '官方 Claude',
-      type: 'official',
-      enabled: isOfficialClaudeMode(v3.activeProfileId),
-      weight: 1,
-      anthropicBaseUrl: '',
-      anthropicAuthToken: '',
-      anthropicModel: '',
-      anthropicApiKey: v3.officialSecrets.anthropicApiKey,
-      claudeCodeOauthToken: v3.officialSecrets.claudeCodeOauthToken,
-      claudeOAuthCredentials: v3.officialSecrets.claudeOAuthCredentials ?? null,
-      customEnv: v3.officialCustomEnv || {},
-      updatedAt: v3.officialUpdatedAt || now,
-    });
-  }
-
-  // 2. Each third-party profile → third_party provider
-  for (const stored of v3.profiles) {
-    const profile = fromStoredProfile(stored);
-    providers.push({
-      id: profile.id,
-      name: profile.name,
-      type: 'third_party',
-      enabled: profile.id === v3.activeProfileId,
-      weight: 1,
-      anthropicBaseUrl: profile.anthropicBaseUrl,
-      anthropicAuthToken: profile.anthropicAuthToken,
-      anthropicModel: profile.anthropicModel,
-      anthropicApiKey: '',
-      claudeCodeOauthToken: '',
-      claudeOAuthCredentials: null,
-      customEnv: profile.customEnv || {},
-      updatedAt: profile.updatedAt || now,
-    });
-  }
-
-  // 3. If provider-pool.json exists with mode=pool, use its members' enabled/weight
-  let balancing: BalancingConfig = { ...DEFAULT_BALANCING_CONFIG };
-  try {
-    if (fs.existsSync(POOL_CONFIG_FILE)) {
-      const poolContent = fs.readFileSync(POOL_CONFIG_FILE, 'utf-8');
-      const pool = JSON.parse(poolContent) as Record<string, unknown>;
-      if (pool.version === 1 && pool.mode === 'pool') {
-        const members = pool.members as Array<{
-          profileId: string;
-          weight: number;
-          enabled: boolean;
-        }>;
-        if (Array.isArray(members)) {
-          for (const member of members) {
-            const p = providers.find((pv) => pv.id === member.profileId);
-            if (p) {
-              p.enabled = member.enabled;
-              p.weight = Math.max(1, Math.min(100, member.weight || 1));
-            }
-          }
-        }
-        // Migrate strategy and thresholds
-        if (
-          typeof pool.strategy === 'string' &&
-          ['round-robin', 'weighted-round-robin', 'failover'].includes(
-            pool.strategy,
-          )
-        ) {
-          balancing.strategy = pool.strategy as BalancingConfig['strategy'];
-        }
-        if (typeof pool.unhealthyThreshold === 'number') {
-          balancing.unhealthyThreshold = pool.unhealthyThreshold;
-        }
-        if (typeof pool.recoveryIntervalMs === 'number') {
-          balancing.recoveryIntervalMs = pool.recoveryIntervalMs;
-        }
-      }
-    }
-  } catch (err) {
-    logger.warn({ err }, 'Failed to read provider-pool.json during migration');
-  }
-
-  // 4. Ensure at least one provider is enabled
-  if (providers.length > 0 && !providers.some((p) => p.enabled)) {
-    providers[0]!.enabled = true;
-  }
-
-  return { providers, balancing };
-}
-
-/** Read V4 config, with automatic V3→V4 migration */
+/** Read V4 config — happycodex 惰性化：恒返回 null，见下方 tombstone */
 function readStoredStateV4(): {
   providers: UnifiedProvider[];
   balancing: BalancingConfig;
 } | null {
-  if (!fs.existsSync(CLAUDE_CONFIG_FILE)) return null;
-  try {
-    const content = fs.readFileSync(CLAUDE_CONFIG_FILE, 'utf-8');
-    const parsed = JSON.parse(content) as Record<string, unknown>;
-
-    if (parsed.version === 4) {
-      const v4 = parsed as unknown as StoredClaudeProviderConfigV4;
-      return {
-        providers: v4.providers.map(fromStoredProviderV4),
-        balancing: {
-          strategy: v4.balancing?.strategy || DEFAULT_BALANCING_CONFIG.strategy,
-          unhealthyThreshold:
-            v4.balancing?.unhealthyThreshold ??
-            DEFAULT_BALANCING_CONFIG.unhealthyThreshold,
-          recoveryIntervalMs:
-            v4.balancing?.recoveryIntervalMs ??
-            DEFAULT_BALANCING_CONFIG.recoveryIntervalMs,
-        },
-      };
-    }
-
-    // V3 or older → read as V3, then migrate
-    const v3 = readStoredState();
-    if (!v3) return null;
-
-    const migrated = migrateV3toV4(v3);
-
-    // Auto-save as V4 on first read (lazy migration)
-    writeStoredStateV4(migrated.providers, migrated.balancing);
-    logger.info(
-      { providerCount: migrated.providers.length },
-      'Migrated Claude provider config from V3 to V4',
-    );
-
-    return migrated;
-  } catch (err) {
-    logger.error(
-      { err, file: CLAUDE_CONFIG_FILE },
-      'Failed to read Claude provider config V4',
-    );
-    return null;
-  }
+  // tombstone（happycodex）：上游 runtime-config.ts:1177-1223 读取 V4 配置，且对
+  // V3 及更老版本在「读取期」自动迁移回写（migrateV3toV4 + writeStoredStateV4 +
+  // decryptSecrets → 加密 key 首次落盘）。codex-only 运行时无 provider 消费方：
+  // 恒返回 null，读旧文件零副作用（claude-provider.json / provider-pool.json
+  // 原样保留，将来如需可人工迁移）。getProviders / getEnabledProviders /
+  // getClaudeProviderConfig / getBalancingConfig / resolveProviderById /
+  // getActiveProfileCustomEnv 等读取函数经 null 分支退化为空/禁用态，签名不变。
+  return null;
 }
 
 function writeStoredStateV4(
   providers: UnifiedProvider[],
   balancing: BalancingConfig,
 ): void {
-  const payload: StoredClaudeProviderConfigV4 = {
-    version: 4,
-    providers: providers.map(toStoredProviderV4),
-    balancing,
-    updatedAt: new Date().toISOString(),
-  };
-
-  fs.mkdirSync(CLAUDE_CONFIG_DIR, { recursive: true });
-  writeSecretFile(CLAUDE_CONFIG_FILE, JSON.stringify(payload, null, 2) + '\n');
+  // tombstone（happycodex）：上游 runtime-config.ts:1225-1238 加密回写 V4
+  // claude-provider.json（toStoredProviderV4 → encryptSecrets → 加密 key 首次
+  // 落盘）。provider 体系惰性化后写路径整体禁用：createProvider / updateProvider /
+  // updateProviderSecrets / toggleProvider / deleteProvider / saveBalancingConfig
+  // 等 V4 CRUD 导出经此抛错成为禁用态（签名不变）。
+  void providers;
+  void balancing;
+  throw new Error(PROVIDER_SYSTEM_DISABLED);
 }
 
 // ─── V4 公开 API ─────────────────────────────────────────────
@@ -1556,87 +1131,25 @@ export function resolveProviderById(providerId: string): {
 
 // ─── V3 compat layer (used by remaining V3 code paths) ───────────
 
-function resolveActiveProfile(
-  state: ClaudeStoredStateV3Resolved,
-): ClaudeStoredProfileResolved {
-  if (isOfficialClaudeMode(state.activeProfileId)) {
-    return {
-      mode: 'official',
-      profile: null,
-      officialSecrets: state.officialSecrets,
-      officialUpdatedAt: state.officialUpdatedAt,
-    };
-  }
-
-  const active =
-    state.profiles.find((item) => item.id === state.activeProfileId) ||
-    state.profiles[0];
-  if (!active) {
-    return {
-      mode: 'official',
-      profile: null,
-      officialSecrets: state.officialSecrets,
-      officialUpdatedAt: state.officialUpdatedAt,
-    };
-  }
-
-  const profile = fromStoredProfile(active);
-  return {
-    mode: 'third_party',
-    profile,
-    officialSecrets: state.officialSecrets,
-    officialUpdatedAt: state.officialUpdatedAt,
-  };
-}
-
-function readStoredConfig(): ClaudeProviderConfig | null {
-  const state = readStoredState();
-  if (!state) return null;
-  const resolved = resolveActiveProfile(state);
-  if (resolved.mode === 'official' || !resolved.profile) {
-    return buildOfficialClaudeProviderConfig(
-      resolved.officialSecrets,
-      resolved.officialUpdatedAt,
-    );
-  }
-
-  return buildConfig(
-    {
-      anthropicBaseUrl: resolved.profile.anthropicBaseUrl,
-      anthropicAuthToken: resolved.profile.anthropicAuthToken,
-      anthropicApiKey: resolved.officialSecrets.anthropicApiKey,
-      claudeCodeOauthToken: resolved.officialSecrets.claudeCodeOauthToken,
-      claudeOAuthCredentials:
-        resolved.officialSecrets.claudeOAuthCredentials ?? null,
-      anthropicModel: resolved.profile.anthropicModel,
-    },
-    resolved.profile.updatedAt || resolved.officialUpdatedAt,
-  );
-}
+// tombstone（happycodex）：上游 runtime-config.ts:1559-1615 的 resolveActiveProfile /
+// readStoredConfig（V3 active profile 解析为扁平配置）随 readStoredState 惰性化
+// （恒 null）成为不可达，一并删除。
 
 function defaultsFromEnv(): ClaudeProviderConfig {
-  const raw = {
-    anthropicBaseUrl: process.env.ANTHROPIC_BASE_URL || '',
-    anthropicAuthToken: process.env.ANTHROPIC_AUTH_TOKEN || '',
-    anthropicApiKey: process.env.ANTHROPIC_API_KEY || '',
-    claudeCodeOauthToken: process.env.CLAUDE_CODE_OAUTH_TOKEN || '',
+  // tombstone（happycodex）：上游 runtime-config.ts:1617-1640 从 ANTHROPIC_BASE_URL /
+  // ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN /
+  // ANTHROPIC_MODEL 环境变量兜底拼装 provider 配置。codex 引擎不消费这些凭据，
+  // env 兜底一并停用：恒返回全空配置，作为 getClaudeProviderConfig /
+  // resolveProviderById / resolveProfileToConfig 等读取函数的「空态」。
+  return {
+    anthropicBaseUrl: '',
+    anthropicAuthToken: '',
+    anthropicApiKey: '',
+    claudeCodeOauthToken: '',
     claudeOAuthCredentials: null,
-    anthropicModel: process.env.ANTHROPIC_MODEL || '',
+    anthropicModel: '',
+    updatedAt: null,
   };
-
-  try {
-    return buildConfig(raw, null);
-  } catch {
-    return {
-      anthropicBaseUrl: '',
-      anthropicAuthToken: raw.anthropicAuthToken.trim(),
-      anthropicApiKey: raw.anthropicApiKey.trim(),
-      claudeCodeOauthToken: raw.claudeCodeOauthToken.trim(),
-      claudeOAuthCredentials: null,
-      anthropicModel: raw.anthropicModel.trim(),
-      updatedAt: null,
-    };
-  }
 }
 
 function readStoredFeishuConfig(): FeishuProviderConfig | null {
@@ -2773,15 +2286,26 @@ export function saveRegistrationConfig(
 }
 
 /**
- * Build full env lines: merged Claude config + custom env vars.
+ * Build full env lines: custom env vars only（happycodex，见函数内 tombstone）.
  */
 export function buildContainerEnvLines(
   global: ClaudeProviderConfig,
   override: ContainerEnvConfig,
   profileCustomEnv?: Record<string, string>,
 ): string[] {
-  const merged = mergeClaudeEnvConfig(global, override);
-  const lines = buildClaudeEnvLines(merged, profileCustomEnv);
+  // tombstone（happycodex）：上游 runtime-config.ts:2778-2812 先 mergeClaudeEnvConfig(
+  // global, override) 再经 buildClaudeEnvLines 注入 ANTHROPIC_* / CLAUDE_CODE_OAUTH_TOKEN
+  // 行。codex 容器不消费 Anthropic 凭据（container-runner 也恒传空 global 配置），
+  // provider 字段贡献恒为零——不再透传 override 中历史遗留的 anthropic* /
+  // claudeCodeOauthToken 覆盖，仅保留 profileCustomEnv 与 override.customEnv 的
+  // 净化注入。签名保持不变（global 参数仅为兼容 container-runner 既有调用点）。
+  void global;
+  const lines: string[] = [];
+
+  for (const [key, value] of Object.entries(profileCustomEnv ?? {})) {
+    if (RESERVED_CLAUDE_ENV_KEYS.has(key)) continue;
+    lines.push(`${key}=${sanitizeEnvValue(value)}`);
+  }
 
   // Append custom env vars (with safety sanitization as defense-in-depth)
   if (override.customEnv) {
@@ -2815,111 +2339,32 @@ export function buildContainerEnvLines(
 
 /**
  * Write .credentials.json to a Claude session directory.
- * Format matches what Claude Code CLI/Agent SDK natively reads.
+ * happycodex：停用为 no-op，见函数内 tombstone。
  */
 export function writeCredentialsFile(
   sessionDir: string,
   config: ClaudeProviderConfig,
 ): void {
-  const creds = config.claudeOAuthCredentials;
-  if (!creds) return;
-
-  // Claude CLI requires scopes to recognize the token as valid.
-  // Fall back to a sensible default when the stored credentials lack scopes
-  // (e.g. tokens imported before scopes were captured).
-  const scopes = creds.scopes?.length
-    ? creds.scopes
-    : DEFAULT_CREDENTIAL_SCOPES;
-
-  const claudeAiOauth: {
-    accessToken: string;
-    refreshToken: string;
-    expiresAt: number;
-    scopes: string[];
-    subscriptionType?: string;
-  } = {
-    accessToken: creds.accessToken,
-    refreshToken: creds.refreshToken,
-    expiresAt: creds.expiresAt,
-    scopes,
-  };
-  // Only include subscriptionType when explicitly configured — avoids
-  // misleading Claude CLI when the actual subscription tier is unknown.
-  if (creds.subscriptionType) {
-    claudeAiOauth.subscriptionType = creds.subscriptionType;
-  }
-
-  const credentialsData = { claudeAiOauth };
-
-  const filePath = path.join(sessionDir, '.credentials.json');
-  const tmp = `${filePath}.tmp`;
-  // 0o600 — credentials 是 plaintext OAuth access/refresh token，
-  // 不能让同主机其他本地账号读取（旧版用 0o644 是泄漏）。
-  fs.writeFileSync(tmp, JSON.stringify(credentialsData, null, 2) + '\n', {
-    encoding: 'utf-8',
-    mode: 0o600,
-  });
-  fs.renameSync(tmp, filePath);
-  // 防御性 chmod：rename 在 macOS APFS 上有时会保留旧 inode 的 mode；
-  // 显式再 chmod 一次确保最终落地权限严格。
-  try {
-    fs.chmodSync(filePath, 0o600);
-  } catch {
-    /* ignore — best effort */
-  }
+  // tombstone（happycodex）：上游 runtime-config.ts:2820-2870 向 Claude session 目录
+  // 写 .credentials.json（Claude CLI/SDK 原生 OAuth 凭据文件，明文 token 落盘）。
+  // codex 运行时凭据走 CODEX_HOME/auth.json（codex-home.ts 物化），该写入面停用为
+  // no-op；container-runner 侧的旧接线已随 provider 面删除（见其 tombstone）。
+  void sessionDir;
+  void config;
 }
 
 /**
- * Update .credentials.json in all existing session directories + host ~/.claude/
+ * Update .credentials.json in all existing session directories.
+ * happycodex：停用为 no-op，见函数内 tombstone。
  */
 export function updateAllSessionCredentials(
   config: ClaudeProviderConfig,
 ): void {
-  if (!config.claudeOAuthCredentials) return;
-
-  const sessionsDir = path.join(DATA_DIR, 'sessions');
-  try {
-    if (!fs.existsSync(sessionsDir)) return;
-    for (const folder of fs.readdirSync(sessionsDir)) {
-      const claudeDir = path.join(sessionsDir, folder, '.claude');
-      if (fs.existsSync(claudeDir) && fs.statSync(claudeDir).isDirectory()) {
-        try {
-          writeCredentialsFile(claudeDir, config);
-        } catch (err) {
-          logger.warn(
-            { err, folder },
-            'Failed to write .credentials.json for session',
-          );
-        }
-      }
-      // Also update sub-agent session dirs
-      const agentsDir = path.join(sessionsDir, folder, 'agents');
-      if (fs.existsSync(agentsDir) && fs.statSync(agentsDir).isDirectory()) {
-        for (const agentId of fs.readdirSync(agentsDir)) {
-          const agentClaudeDir = path.join(agentsDir, agentId, '.claude');
-          if (
-            fs.existsSync(agentClaudeDir) &&
-            fs.statSync(agentClaudeDir).isDirectory()
-          ) {
-            try {
-              writeCredentialsFile(agentClaudeDir, config);
-            } catch (err) {
-              logger.warn(
-                { err, folder, agentId },
-                'Failed to write .credentials.json for agent session',
-              );
-            }
-          }
-        }
-      }
-    }
-  } catch (err) {
-    logger.warn({ err }, 'Failed to update session credentials');
-  }
-
-  // Host mode uses CLAUDE_CONFIG_DIR=data/sessions/{folder}/.claude for isolation,
-  // so we must NOT touch ~/.claude/.credentials.json to avoid interfering with
-  // the user's local Claude Code installation.
+  // tombstone（happycodex）：上游 runtime-config.ts:2875-2923 遍历 data/sessions/
+  // 下所有 {folder}/.claude 与 {folder}/agents/{agentId}/.claude 目录批量回写
+  // .credentials.json。codex 运行时无任何消费方（src/index.ts:155 仅残留死导入，
+  // 保留导出以维持签名），停用为 no-op，不再扫描/写入任何 session 目录。
+  void config;
 }
 
 // ─── Local Claude Code detection ──────────────────────────────────
@@ -2931,69 +2376,18 @@ export interface LocalClaudeCodeStatus {
   accessTokenMasked: string | null;
 }
 
-/**
- * Read and parse OAuth credentials from ~/.claude/.credentials.json.
- * Returns the raw oauth object with accessToken, refreshToken, expiresAt, scopes,
- * or null if the file is missing / invalid / incomplete.
- */
-function readLocalOAuthCredentials(): {
-  accessToken: string;
-  refreshToken: string;
-  expiresAt?: number;
-  scopes?: string[];
-  subscriptionType?: string;
-} | null {
-  const homeDir = process.env.HOME || '/root';
-  const credFile = path.join(homeDir, '.claude', '.credentials.json');
-
-  try {
-    if (!fs.existsSync(credFile)) return null;
-
-    const content = JSON.parse(fs.readFileSync(credFile, 'utf-8'));
-    const oauth = content?.claudeAiOauth;
-
-    if (oauth?.accessToken && oauth?.refreshToken) {
-      return {
-        accessToken: oauth.accessToken,
-        refreshToken: oauth.refreshToken,
-        expiresAt:
-          typeof oauth.expiresAt === 'number' ? oauth.expiresAt : undefined,
-        scopes: Array.isArray(oauth.scopes) ? oauth.scopes : undefined,
-        subscriptionType:
-          typeof oauth.subscriptionType === 'string'
-            ? oauth.subscriptionType
-            : undefined,
-      };
-    }
-    return null;
-  } catch {
-    return null;
-  }
-}
+// tombstone（happycodex）：上游 runtime-config.ts:2934-2972 readLocalOAuthCredentials
+// 直读宿主机 ~/.claude/.credentials.json（明文 OAuth access/refresh token）。
+// codex-only 运行时不检测/导入 Claude Code 本地凭据，该读取面删除；下方两个导出
+// 保留签名，恒返回「未检测 / 空」。
 
 /**
- * Detect if the host machine has a valid ~/.claude/.credentials.json
- * (i.e. user has logged into Claude Code locally).
+ * Detect if the host machine has a valid ~/.claude/.credentials.json.
+ * happycodex：停用，恒返回未检测态（见上方 tombstone）。
  */
 export function detectLocalClaudeCode(): LocalClaudeCodeStatus {
-  const oauth = readLocalOAuthCredentials();
-
-  if (oauth) {
-    return {
-      detected: true,
-      hasCredentials: true,
-      expiresAt: oauth.expiresAt ?? null,
-      accessTokenMasked: maskSecret(oauth.accessToken),
-    };
-  }
-
-  // Check if the file exists at all (detected but no valid credentials)
-  const homeDir = process.env.HOME || '/root';
-  const credFile = path.join(homeDir, '.claude', '.credentials.json');
-  const fileExists = fs.existsSync(credFile);
-
   return {
-    detected: fileExists,
+    detected: false,
     hasCredentials: false,
     expiresAt: null,
     accessTokenMasked: null,
@@ -3002,21 +2396,10 @@ export function detectLocalClaudeCode(): LocalClaudeCodeStatus {
 
 /**
  * Read local ~/.claude/.credentials.json and return parsed OAuth credentials.
- * Returns null if not found or invalid.
+ * happycodex：停用，恒返回 null（见上方 tombstone）。
  */
 export function importLocalClaudeCredentials(): ClaudeOAuthCredentials | null {
-  const oauth = readLocalOAuthCredentials();
-  if (!oauth) return null;
-
-  return {
-    accessToken: oauth.accessToken,
-    refreshToken: oauth.refreshToken,
-    expiresAt: oauth.expiresAt ?? Date.now() + 8 * 3600_000,
-    scopes: oauth.scopes ?? [],
-    ...(oauth.subscriptionType
-      ? { subscriptionType: oauth.subscriptionType }
-      : {}),
-  };
+  return null;
 }
 
 // ─── Appearance config (plain JSON, no encryption) ────────────────

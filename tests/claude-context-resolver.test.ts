@@ -175,6 +175,63 @@ describe('buildCodexContextPlan（AGENTS.md 内容生成）', () => {
     expect(plan.warnings.some((w) => w.includes('整段未注入'))).toBe(true);
   });
 
+  test('container 模式：用户全局记忆段展示容器内挂载点路径，rules 提示省略', () => {
+    writeFile(path.join(external, 'CLAUDE.md'), '# admin playbook');
+    writeFile(path.join(external, 'rules', 'browser.md'), '# rule');
+    const userGlobalPath = path.join(groupsDir, 'user-global', 'admin', 'CLAUDE.md');
+    writeFile(userGlobalPath, '# 用户记忆');
+
+    const plan = planFor(fakeGroup('main', 'admin', true), 'main', 'container');
+
+    // 记忆写回指引指向容器内可达的挂载点，而非容器内不存在的宿主机路径
+    expect(plan.agentsMd).toContain('/workspace/global/CLAUDE.md');
+    expect(plan.agentsMd).not.toContain(userGlobalPath);
+    // rules 目录未挂载进容器：死路径提示省略
+    expect(plan.agentsMd).not.toContain(path.join(external, 'rules'));
+    expect(plan.agentsMd).not.toContain('补充规则目录');
+    // 审计条目保留真实宿主机路径（host 侧追溯用）
+    expect(
+      plan.agentsMdSources.find((s) => s.name === 'user-global-claude-md')!.sourcePath,
+    ).toBe(userGlobalPath);
+  });
+
+  test('host 模式：用户全局记忆段展示宿主机路径，rules 提示保留（行为不变）', () => {
+    writeFile(path.join(external, 'CLAUDE.md'), '# admin playbook');
+    writeFile(path.join(external, 'rules', 'browser.md'), '# rule');
+    const userGlobalPath = path.join(groupsDir, 'user-global', 'admin', 'CLAUDE.md');
+    writeFile(userGlobalPath, '# 用户记忆');
+
+    const plan = planFor(fakeGroup('main', 'admin', true), 'main', 'host');
+
+    expect(plan.agentsMd).toContain(userGlobalPath);
+    expect(plan.agentsMd).not.toContain('/workspace/global/CLAUDE.md');
+    expect(plan.agentsMd).toContain(path.join(external, 'rules'));
+  });
+
+  test('工作区 CLAUDE.md 超 32KiB：发 warning 预警（codex 直读通道会静默截断），不裁剪源文件', () => {
+    const workspaceClaudeMd = path.join(groupsDir, 'ws-x', 'CLAUDE.md');
+    const big = '# 项目文档\n' + 'A'.repeat(AGENTS_MD_MAX_BYTES);
+    writeFile(workspaceClaudeMd, big);
+
+    const plan = planFor(fakeGroup('ws-x', 'u1', false), 'home-u1');
+
+    expect(
+      plan.warnings.some((w) => w.includes('工作区 CLAUDE.md') && w.includes(workspaceClaudeMd)),
+    ).toBe(true);
+    // 只 stat 预警，不动源文件（CLAUDE.md 只读红线）
+    expect(fs.readFileSync(workspaceClaudeMd, 'utf8')).toBe(big);
+  });
+
+  test('工作区 CLAUDE.md 未超限/不存在：无工作区预警', () => {
+    writeFile(path.join(groupsDir, 'ws-small', 'CLAUDE.md'), '# 小文档');
+
+    const small = planFor(fakeGroup('ws-small', 'u1', false), 'home-u1');
+    const missing = planFor(fakeGroup('ws-none', 'u1', false), 'home-u1');
+
+    expect(small.warnings.some((w) => w.includes('工作区 CLAUDE.md'))).toBe(false);
+    expect(missing.warnings.some((w) => w.includes('工作区 CLAUDE.md'))).toBe(false);
+  });
+
   test('plan 构建是只读的：绝不改写/生成/删除 CLAUDE.md 本体', () => {
     const adminMd = path.join(external, 'CLAUDE.md');
     const userMd = path.join(groupsDir, 'user-global', 'admin', 'CLAUDE.md');
@@ -297,6 +354,42 @@ describe('FsCodexHomeProvisioner（AGENTS.md + project_doc_fallback 物化）', 
     expect(fs.readFileSync(configPath, 'utf8')).toBe(
       'project_doc_fallback_filenames = ["NOTES.md"]\n',
     );
+  });
+
+  test('空 AGENTS.md 残留（崩溃产物）不算用户接管：重新物化（marker 首行）', async () => {
+    const home = await makeProvisioner({}).provision('g-empty');
+    const agentsMdPath = path.join(home, 'AGENTS.md');
+    fs.writeFileSync(agentsMdPath, ''); // 模拟非原子写崩溃留下的空文件
+
+    await makeProvisioner({ agentsMd: '# 投影' }).provision('g-empty');
+    const content = fs.readFileSync(agentsMdPath, 'utf8');
+    expect(content.startsWith(AGENTS_MD_GENERATED_MARKER)).toBe(true);
+    expect(content).toContain('# 投影');
+
+    // agentsMd=null 时空残留同样被清理（视为我们生成的可清除文件）
+    fs.writeFileSync(agentsMdPath, '  \n');
+    await makeProvisioner({ agentsMd: null }).provision('g-empty');
+    expect(fs.existsSync(agentsMdPath)).toBe(false);
+  });
+
+  test('AGENTS.md 原子写：写盘后不残留 .tmp 中间文件', async () => {
+    const home = await makeProvisioner({ agentsMd: '# 投影' }).provision('g-atomic');
+    expect(fs.existsSync(path.join(home, 'AGENTS.md'))).toBe(true);
+    expect(fs.existsSync(path.join(home, 'AGENTS.md.tmp'))).toBe(false);
+  });
+
+  test('表内同名键（如 [profiles.x]）不算顶层键：仍在顶层补写 fallback 键', async () => {
+    const home = await makeProvisioner({}).provision('g-table-key');
+    const configPath = path.join(home, 'config.toml');
+    const profileSection = '[profiles.x]\nproject_doc_fallback_filenames = ["X.md"]\n';
+    fs.writeFileSync(configPath, profileSection);
+
+    await makeProvisioner({ projectDocFallbackFilenames: ['CLAUDE.md'] }).provision(
+      'g-table-key',
+    );
+    const content = fs.readFileSync(configPath, 'utf8');
+    expect(content.startsWith('project_doc_fallback_filenames = ["CLAUDE.md"]\n')).toBe(true);
+    expect(content).toContain(profileSection); // profile 段原样保留
   });
 
   test('物化绝不生成 AGENTS.override.md / CLAUDE.md（PoC 红线）', async () => {

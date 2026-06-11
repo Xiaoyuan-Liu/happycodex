@@ -44,7 +44,9 @@ export interface AppearanceConfig {
 
 export interface SetupStatus {
   needsSetup: boolean;
-  claudeConfigured: boolean;
+  // codex 适配（与上游有意分叉）：上游为 claudeConfigured（provider 池判定）；
+  // happycodex 以共享 CODEX_HOME/auth.json 判定。
+  codexConfigured: boolean;
   feishuConfigured: boolean;
 }
 

@@ -1,5 +1,9 @@
 import { create } from 'zustand';
 import { api } from '../api/client';
+// happycodex 适配：api client 对非 2xx 抛的是 plain ApiError 对象（非 Error 实例），
+// 上游的 `err instanceof Error ? err.message : String(err)` 会把它渲染成
+// "[object Object]"。统一改走 getErrorMessage（优先取 .message）。
+import { getErrorMessage } from '../components/settings/types';
 
 export interface PluginWarnings {
   missing: string[];
@@ -62,7 +66,7 @@ export const usePluginsStore = create<PluginsState>((set, get) => ({
     } catch (err) {
       set({
         loading: false,
-        error: err instanceof Error ? err.message : String(err),
+        error: getErrorMessage(err, '请求失败'),
       });
     }
   },
@@ -79,7 +83,7 @@ export const usePluginsStore = create<PluginsState>((set, get) => ({
     } catch (err) {
       set({
         scanning: false,
-        error: err instanceof Error ? err.message : String(err),
+        error: getErrorMessage(err, '请求失败'),
       });
       throw err;
     }
@@ -91,7 +95,7 @@ export const usePluginsStore = create<PluginsState>((set, get) => ({
       set({ error: null });
       await get().loadPlugins();
     } catch (err) {
-      set({ error: err instanceof Error ? err.message : String(err) });
+      set({ error: getErrorMessage(err, '请求失败') });
       throw err;
     }
   },
@@ -106,7 +110,7 @@ export const usePluginsStore = create<PluginsState>((set, get) => ({
       await get().loadPlugins();
       return { removedEnabled: result.removedEnabled };
     } catch (err) {
-      set({ error: err instanceof Error ? err.message : String(err) });
+      set({ error: getErrorMessage(err, '请求失败') });
       throw err;
     }
   },

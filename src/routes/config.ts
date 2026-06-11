@@ -9,6 +9,11 @@ import { updateWeChatNoProxy } from '../config.js';
 import type { Variables } from '../web-context.js';
 import { canAccessGroup, canModifyGroup, getWebDeps } from '../web-context.js';
 import { getChannelType } from '../im-channel.js';
+// codex 适配：Telegram 渠道当前为 stub（src/telegram.ts），测试连接/配置响应需诚实降级。
+import {
+  TELEGRAM_CHANNEL_STUBBED,
+  STUB_MESSAGE as TELEGRAM_STUB_MESSAGE,
+} from '../telegram.js';
 import {
   deleteRegisteredGroup,
   deleteChatHistory,
@@ -184,7 +189,9 @@ interface CodexAuthStatus {
   loginHint: string;
 }
 
-function readCodexAuthStatus(): CodexAuthStatus {
+// export：routes/auth.ts 的 buildSetupStatus 复用同一判定（codex 单账号引擎，
+// setupStatus 以共享 auth.json 存在性为准）。
+export function readCodexAuthStatus(): CodexAuthStatus {
   const codexHome = sharedCodexHomeDir();
   const authPath = path.join(codexHome, 'auth.json');
   const loginHint =
@@ -385,6 +392,20 @@ configRoutes.put(
 
 // ─── Telegram config ─────────────────────────────────────────────
 
+/**
+ * codex 适配（与上游有意分叉）：Telegram 渠道为 stub 时，配置「已启用 + 有 token
+ * 但永不连接」——在 GET/PUT 配置响应中附加 lastError，前端 TelegramChannelCard
+ * 据此解释灰点。整体搬迁上游 telegram.ts 后随 TELEGRAM_CHANNEL_STUBBED 一并删除。
+ */
+function telegramStubLastError(
+  pub: { enabled: boolean; hasBotToken: boolean },
+  connected: boolean,
+): { lastError?: string } {
+  return TELEGRAM_CHANNEL_STUBBED && pub.enabled && pub.hasBotToken && !connected
+    ? { lastError: TELEGRAM_STUB_MESSAGE }
+    : {};
+}
+
 configRoutes.get('/telegram', authMiddleware, systemConfigMiddleware, (c) => {
   logDeprecationOnce(
     'GET /api/config/telegram',
@@ -448,9 +469,11 @@ configRoutes.put(
         }
       }
 
+      const pub = toPublicTelegramProviderConfig(saved, 'runtime');
       return c.json({
-        ...toPublicTelegramProviderConfig(saved, 'runtime'),
+        ...pub,
         connected,
+        ...telegramStubLastError(pub, connected),
       });
     } catch (err) {
       const message =
@@ -466,6 +489,11 @@ configRoutes.post(
   authMiddleware,
   systemConfigMiddleware,
   async (c) => {
+    // codex 适配：渠道为 stub —— 真 token 校验会制造「测试成功但渠道永不可连」
+    // 的假成功信号，诚实返回 501（复用 routes/plugins.ts 的 501+说明模式）。
+    if (TELEGRAM_CHANNEL_STUBBED) {
+      return c.json({ error: TELEGRAM_STUB_MESSAGE }, 501);
+    }
     const config = getTelegramProviderConfig();
     if (!config.botToken) {
       return c.json({ error: 'Telegram bot token not configured' }, 400);
@@ -649,15 +677,17 @@ configRoutes.put(
     }
 
     // 启用「禁用 HappyClaw 记忆层」开关前必须给 admin 主容器配 customCwd，
-    // 否则 CLAUDE_CONFIG_DIR 仍指向 data/sessions/main/.claude，SDK 读不到 ~/.claude/
-    // 又没有 HappyClaw 记忆层注入，agent 会变成空白沙箱。
+    // 否则 agent 仍跑在 per-folder 工作区：memory 工具与 WORKSPACE_GLOBAL/MEMORY
+    // env 被关掉后，只剩 CODEX_HOME/AGENTS.md 的全局注入、没有自己项目的
+    // AGENTS.md/CLAUDE.md 上下文，近乎空白沙箱。
+    // （文案 codex 化：上游此处描述 CLAUDE_CONFIG_DIR/SDK 读 ~/.claude/ 的语义。）
     if (validation.data.disableMemoryLayerForAdminHost === true) {
       const adminMain = getRegisteredGroup('web:main');
       if (!adminMain || !adminMain.customCwd) {
         return c.json(
           {
             error:
-              '启用前请先给 admin 主容器（web:main）配置 customCwd，否则 SDK 既读不到 HappyClaw 记忆层也读不到 ~/.claude/，会是空白沙箱。',
+              '启用前请先给 admin 主容器（web:main）配置 customCwd，否则关掉记忆层后 codex 既没有 HappyClaw 记忆工具，也读不到你自己项目的 AGENTS.md/CLAUDE.md，会是空白沙箱。',
           },
           400,
         );
@@ -909,11 +939,13 @@ configRoutes.get('/user-im/telegram', authMiddleware, (c) => {
         ...proxy,
       });
     }
+    const pub = toPublicTelegramProviderConfig(config, 'runtime');
     return c.json({
-      ...toPublicTelegramProviderConfig(config, 'runtime'),
+      ...pub,
       connected,
       proxyUrl: userProxy,
       ...proxy,
+      ...telegramStubLastError(pub, connected),
     });
   } catch (err) {
     logger.error({ err }, 'Failed to load user Telegram config');
@@ -995,11 +1027,13 @@ configRoutes.put('/user-im/telegram', authMiddleware, async (c) => {
     const connected = deps?.isUserTelegramConnected?.(user.id) ?? false;
     const userProxy = saved.proxyUrl || '';
     const sysProxy = getTelegramProviderConfig().proxyUrl || '';
+    const pub = toPublicTelegramProviderConfig(saved, 'runtime');
     return c.json({
-      ...toPublicTelegramProviderConfig(saved, 'runtime'),
+      ...pub,
       connected,
       proxyUrl: userProxy,
       ...resolveProxyInfo(userProxy, sysProxy),
+      ...telegramStubLastError(pub, connected),
     });
   } catch (err) {
     const message =
@@ -1010,6 +1044,11 @@ configRoutes.put('/user-im/telegram', authMiddleware, async (c) => {
 });
 
 configRoutes.post('/user-im/telegram/test', authMiddleware, async (c) => {
+  // codex 适配：渠道为 stub —— 真 token 校验会制造「测试成功但渠道永不可连」
+  // 的假成功信号，诚实返回 501（前端 handleTest 经 getErrorMessage toast 该说明）。
+  if (TELEGRAM_CHANNEL_STUBBED) {
+    return c.json({ error: TELEGRAM_STUB_MESSAGE }, 501);
+  }
   const user = c.get('user') as AuthUser;
   const config = getUserTelegramConfig(user.id);
   if (!config?.botToken) {

@@ -10,7 +10,10 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 import { IpcToolBridge } from '../src/runtime/tools/ipc-bridge.js';
-import type { ScheduleTaskInput } from '../src/runtime/tools/types.js';
+import { ToolRegistry } from '../src/runtime/tools/registry.js';
+import { createBuiltinTools } from '../src/runtime/tools/builtin.js';
+import type { ScheduleTaskInput, ToolContext } from '../src/runtime/tools/types.js';
+import type { DynamicToolCallResponse } from '../src/appserver/protocol.js';
 
 const FOLDER = 'home-test';
 const CHAT_JID = 'web:home-test';
@@ -244,18 +247,16 @@ describe('IpcToolBridge — scheduleTask / list / lifecycle', () => {
 });
 
 describe('IpcToolBridge — register / skills', () => {
-  it('registerGroup 写 tasks/ 请求（上游通道；processTaskIpc case register_group）', async () => {
-    await bridge.registerGroup(FOLDER, 'web:new-group', 'My Group');
-    const files = (await listChannel('tasks')).filter((f) => f.endsWith('.json'));
-    expect(files).toHaveLength(1);
-    const p = (await readChannelJson('tasks', files[0]!)) as {
-      type: string;
-      jid: string;
-      name: string;
-    };
-    expect(p.type).toBe('register_group');
-    expect(p.jid).toBe('web:new-group');
-    expect(p.name).toBe('My Group');
+  it('#17/#23 registerGroup 诚实失败：抛错且不写 tasks/ 请求（冻结 schema 缺 folder，主进程必拒且无回执）', async () => {
+    await expect(bridge.registerGroup(FOLDER, 'web:new-group', 'My Group')).rejects.toThrow(
+      /register_group 在当前版本不可用/,
+    );
+    // 错误文案引导走 Web 注册（含 jid，便于管理员定位）。
+    await expect(bridge.registerGroup(FOLDER, 'feishu:oc_xyz')).rejects.toThrow(
+      /Web 界面注册群组（jid=feishu:oc_xyz）/,
+    );
+    // 不写出注定被主进程拒绝的请求文件（仅产生 server warn 噪音）。
+    expect(await listChannel('tasks')).toEqual([]);
   });
 
   it('install/uninstallSkill 写 tasks/ 请求（package/skillId + requestId，主进程契约必填）；无主进程应答 → 超时抛错且请求文件保留', async () => {
@@ -678,6 +679,64 @@ describe('IpcToolBridge — pollIpcResult 请求-响应协议（A4）', () => {
     ]);
     expect(req.skillId).toBe('memory');
     expect(req.groupFolder).toBe(FOLDER);
+  });
+});
+
+// ─────────────── 端到端：registry.dispatch × builtin handler × IpcToolBridge ───────────────
+
+describe('端到端（真 ToolRegistry + builtin handler + IpcToolBridge + 假主进程回执）', () => {
+  /** 真 registry：17 个内置工具全量注册（与 codex-runner / session-manager 同构）。 */
+  function e2e(): { registry: ToolRegistry; ctx: ToolContext } {
+    const registry = new ToolRegistry();
+    for (const def of createBuiltinTools()) registry.register(def);
+    const e2eBridge = new IpcToolBridge({
+      ipcDir,
+      memoryDir,
+      chatJid: CHAT_JID,
+      pollIntervalMs: 5,
+      pollTimeoutMs: 2000,
+    });
+    return { registry, ctx: { groupFolder: FOLDER, threadId: 'th_e2e', bridge: e2eBridge } };
+  }
+
+  function text(r: DynamicToolCallResponse): string {
+    return (r.contentItems[0] as { text: string }).text;
+  }
+
+  it('#20 install_skill：主进程回执 success + installed → 工具结果 success:true 且透传安装列表', async () => {
+    const { registry, ctx } = e2e();
+    const [r] = await Promise.all([
+      registry.dispatch('install_skill', { name: 'anthropic/memory' }, ctx),
+      respondToRequest('install_skill', 'install_skill_result', {
+        success: true,
+        installed: ['memory', 'think'],
+      }),
+    ]);
+    expect(r.success).toBe(true);
+    expect(text(r)).toMatch(/Skill "anthropic\/memory" 已安装：memory, think/);
+  });
+
+  it('#20 install_skill：主进程回执 success:false → 工具结果 success:false 携真实 error（失败路径不再静默）', async () => {
+    const { registry, ctx } = e2e();
+    const [r] = await Promise.all([
+      registry.dispatch('install_skill', { name: 'anthropic/broken' }, ctx),
+      respondToRequest('install_skill', 'install_skill_result', {
+        success: false,
+        error: 'registry unreachable',
+      }),
+    ]);
+    expect(r.success).toBe(false);
+    expect(text(r)).toMatch(/Failed to install skill "anthropic\/broken": registry unreachable/);
+  });
+
+  it('#17/#23 register_group：dispatch → success:false 携诚实文案，且不落任何 IPC 文件', async () => {
+    const { registry, ctx } = e2e();
+    const r = await registry.dispatch('register_group', { jid: 'feishu:oc_e2e' }, ctx);
+    expect(r.success).toBe(false);
+    expect(text(r)).toMatch(/register_group 在当前版本不可用/);
+    expect(text(r)).toMatch(/Web 界面注册群组/);
+    expect(await listChannel('tasks')).toEqual([]);
+    expect(await listChannel('messages')).toEqual([]);
   });
 });
 

@@ -19,10 +19,18 @@ import {
   toolTextResult,
   type DynamicToolCallParams,
 } from '../../appserver/protocol.js';
+import { INSTALL_SKILL_POLL_TIMEOUT_MS } from './types.js';
 import type { IToolDispatcher, IToolRegistry, ToolContext } from './types.js';
 
 /** tool dispatch 看门狗默认值：handler/bridge 永挂时让 respond 必达，解开客户端侧 turn 死锁。 */
 const DEFAULT_DISPATCH_TIMEOUT_MS = 60_000;
+
+/**
+ * install_skill 例外（#24）：bridge 侧 pollIpcResult 上限 120s（INSTALL_SKILL_POLL_TIMEOUT_MS，
+ * 安装可能很慢），看门狗须给足余量——否则 60s 默认看门狗会以「tool dispatch timeout」假失败
+ * 抢答仍在进行的安装，真实回执到达后 reply 已 settled 被丢弃。
+ */
+const INSTALL_SKILL_DISPATCH_TIMEOUT_MS = INSTALL_SKILL_POLL_TIMEOUT_MS + 10_000;
 
 export interface ToolDispatcherContext {
   /** 调用方会话 folder（透传进每个 ToolContext）。 */
@@ -31,13 +39,18 @@ export interface ToolDispatcherContext {
   bridge: ToolContext['bridge'];
   /** 惰性获取当前 thread id（thread/start 完成后才有值）。 */
   getThreadId: () => string | null;
-  /** 单次 tool dispatch 超时（毫秒），默认 60000；<=0 关闭超时。 */
+  /**
+   * 单次 tool dispatch 超时（毫秒）。缺省按默认值：60000（install_skill 例外 130000，
+   * 须长于其 bridge 侧 120s poll）；显式设置则统一覆盖所有工具（对齐 IpcToolBridge
+   * pollTimeoutMs 的覆盖语义）；<=0 关闭超时。
+   */
   dispatchTimeoutMs?: number;
 }
 
 export class ToolDispatcher implements IToolDispatcher {
   private readonly unsubscribe: () => void;
   private readonly timeoutMs: number;
+  private readonly installSkillTimeoutMs: number;
 
   constructor(
     client: IAppServerClient,
@@ -45,6 +58,7 @@ export class ToolDispatcher implements IToolDispatcher {
     private readonly ctx: ToolDispatcherContext,
   ) {
     this.timeoutMs = ctx.dispatchTimeoutMs ?? DEFAULT_DISPATCH_TIMEOUT_MS;
+    this.installSkillTimeoutMs = ctx.dispatchTimeoutMs ?? INSTALL_SKILL_DISPATCH_TIMEOUT_MS;
     this.unsubscribe = client.onServerRequest((req, respond) => {
       void this.handle(req, respond);
     });
@@ -75,16 +89,19 @@ export class ToolDispatcher implements IToolDispatcher {
     // 看门狗：registry.dispatch 保证不抛但**不保证有限时返回**（handler/bridge 内永不 settle 的
     // await，如对 FIFO/阻塞设备的 fs 调用）→ respond 永不触发 → turn 永久死锁。超时后强制收口，
     // 让 respond 必达、turn/completed 能到、run()/activeTurns 归零、folder 可回收。#9
+    // install_skill 用更长的看门狗（#24：其 bridge poll 上限 120s，60s 会假失败抢答）。
+    const timeoutMs =
+      params.tool === 'install_skill' ? this.installSkillTimeoutMs : this.timeoutMs;
     let timer: ReturnType<typeof setTimeout> | null = null;
-    if (this.timeoutMs > 0) {
+    if (timeoutMs > 0) {
       timer = setTimeout(() => {
         reply(
           toolTextResult(
-            `tool dispatch timeout: ${params.tool} did not settle in ${this.timeoutMs}ms`,
+            `tool dispatch timeout: ${params.tool} did not settle in ${timeoutMs}ms`,
             false,
           ),
         );
-      }, this.timeoutMs);
+      }, timeoutMs);
       timer.unref?.();
     }
 

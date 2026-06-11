@@ -21,6 +21,9 @@ interface UserTelegramConfig {
   proxyUrl: string;
   effectiveProxyUrl: string;
   proxySource: 'user' | 'system' | 'none';
+  // codex 适配（与上游有意分叉）：后端在渠道为 stub（已启用 + 有 token 但永不连接）
+  // 时附加的解释文案，用于说明状态灰点。
+  lastError?: string;
 }
 
 interface TelegramTestResult {
@@ -149,6 +152,13 @@ export function TelegramChannelCard() {
           <div className="text-sm text-muted-foreground">加载中...</div>
         ) : (
           <>
+            {/* codex 适配（与上游有意分叉）：渠道为 stub 时解释灰点（样式镜像
+                WhatsAppChannelCard 的「断线原因」块） */}
+            {config?.lastError && !config.connected && (
+              <div className="rounded-lg border border-destructive/20 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+                断线原因：{config.lastError}
+              </div>
+            )}
             {config?.hasBotToken && (
               <div className="text-xs text-muted-foreground">
                 当前 Token: {config.botTokenMasked || '已配置'}

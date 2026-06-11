@@ -22,8 +22,14 @@ import {
   DialogFooter,
 } from '@/components/ui/dialog';
 import { toast } from 'sonner';
+import { getErrorMessage } from '@/components/settings/types';
 import { usePluginsStore, type PluginEntry } from '../stores/plugins';
 import { useAuthStore } from '../stores/auth';
+
+// happycodex 适配：插件系统（plugin-* 全家）属 A5、本构建后端为 501 stub。
+// 与上游的有意分叉：扫描按钮禁用、空态文案改为「插件系统将在后续版本支持」、
+// 错误提示统一走 getErrorMessage（api client 抛的是 plain ApiError 对象，
+// String(err) 会显示成 "[object Object]"）。A5 搬迁后随上游真版一并还原。
 
 function WarningBadge({
   warnings,
@@ -84,7 +90,7 @@ export function PluginsPage() {
         toast.success(`已禁用 ${plugin.fullId}。下次新会话生效。`);
       }
     } catch (err) {
-      toast.error(`切换失败：${err instanceof Error ? err.message : String(err)}`);
+      toast.error(`切换失败：${getErrorMessage(err, '未知错误')}`);
     }
   };
 
@@ -98,7 +104,7 @@ export function PluginsPage() {
         toast.warning(`扫描告警:\n${report.warnings.join('\n')}`);
       }
     } catch (err) {
-      toast.error(`扫描失败：${err instanceof Error ? err.message : String(err)}`);
+      toast.error(`扫描失败：${getErrorMessage(err, '未知错误')}`);
     }
   };
 
@@ -111,7 +117,7 @@ export function PluginsPage() {
       );
       setDeleteTarget(null);
     } catch (err) {
-      toast.error(`删除失败：${err instanceof Error ? err.message : String(err)}`);
+      toast.error(`删除失败：${getErrorMessage(err, '未知错误')}`);
     }
   };
 
@@ -125,11 +131,13 @@ export function PluginsPage() {
             actions={
               <div className="flex items-center gap-3">
                 {isAdmin && (
+                  // happycodex：后端 scan 端点为 501 stub（A5），按钮常驻禁用，
+                  // 避免引导 admin 点出报错。A5 落地后恢复 disabled={scanning}。
                   <Button
                     variant="outline"
                     onClick={handleScan}
-                    disabled={scanning}
-                    title="扫描宿主机 ~/.claude/plugins/marketplaces/ 并导入 catalog"
+                    disabled
+                    title="插件系统将在后续版本支持（happycodex A5），扫描暂不可用"
                   >
                     <RefreshCw size={18} className={scanning ? 'animate-spin' : ''} />
                     扫描宿主机
@@ -152,17 +160,9 @@ export function PluginsPage() {
           </div>
         </div>
 
-        {!loading && !error && marketplaces.length === 0 && (
-          <div className="mx-6 mt-4 p-3 bg-info-bg border border-info/20 rounded-lg text-xs text-info flex gap-2">
-            <Info size={16} className="flex-shrink-0 mt-0.5" />
-            <div>
-              v3 升级用户首次访问看到 0 plugin 是预期。
-              {isAdmin
-                ? '请点击右上 "扫描宿主机" 触发 catalog 导入；'
-                : '等 admin 完成导入后即可启用。'}
-            </div>
-          </div>
-        )}
+        {/* happycodex tombstone：上游此处有 v3 升级引导 banner（提示 admin 点
+            「扫描宿主机」触发 catalog 导入）——本构建扫描为 501 stub，引导已随
+            按钮禁用一并移除，空态说明收敛到下方 EmptyState。 */}
 
         <div className="p-6 space-y-6">
           {loading && marketplaces.length === 0 ? (
@@ -176,12 +176,8 @@ export function PluginsPage() {
           ) : marketplaces.length === 0 ? (
             <EmptyState
               icon={Puzzle}
-              title="还没有 plugin"
-              description={
-                isAdmin
-                  ? '尚未导入任何 marketplace。点击右上 "扫描宿主机" 触发 catalog 导入。'
-                  : 'admin 还未导入任何 marketplace，请稍后再来。'
-              }
+              title="插件系统将在后续版本支持"
+              description="当前构建（happycodex）暂不提供插件扫描与启用，相关功能将随 A5 插件体系一起到来。"
             />
           ) : (
             marketplaces.map((mp) => (

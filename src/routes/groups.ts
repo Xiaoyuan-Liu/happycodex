@@ -1483,9 +1483,9 @@ groupRoutes.put('/:jid/env', authMiddleware, async (c) => {
     );
   }
 
-  // Check permissions：owner-only。`manage_group_env` 是系统级权限但 envvar
-  // 包含 anthropicAuthToken 等会让 agent 全部流量被劫持的字段，跨用户共享
-  // 工作区里持有该权限的非 owner 不能改 owner 的 token。Admin 例外。
+  // Check permissions：owner-only。`manage_group_env` 是系统级权限但 customEnv
+  // 包含第三方 token（GitHub / 自定义 API key 等）且会注入 agent 进程环境，
+  // 跨用户共享工作区里持有该权限的非 owner 不能改 owner 的 token。Admin 例外。
   if (
     envUser.role !== 'admin' &&
     !canModifyGroup({ id: envUser.id, role: envUser.role }, { ...group, jid })
@@ -1533,18 +1533,12 @@ groupRoutes.put('/:jid/env', authMiddleware, async (c) => {
   const current = getContainerEnvConfig(group.folder);
 
   // Build updated config: only update fields that are explicitly provided
+  // tombstone（happycodex）：上游此处还逐字段拷贝 5 个 per-group Claude provider
+  // 覆盖（anthropic*/claudeCodeOauthToken），随 provider failover 作废（schema 已
+  // 收窄为仅 customEnv）。`{ ...current }` 保留：旧 on-disk 文件里的残留字段
+  // 读侧容忍、原样回写不丢失，但 buildAgentEnvLines 不会注入。
   const updated = { ...current };
 
-  if (data.anthropicBaseUrl !== undefined)
-    updated.anthropicBaseUrl = data.anthropicBaseUrl;
-  if (data.anthropicAuthToken !== undefined)
-    updated.anthropicAuthToken = data.anthropicAuthToken;
-  if (data.anthropicApiKey !== undefined)
-    updated.anthropicApiKey = data.anthropicApiKey;
-  if (data.claudeCodeOauthToken !== undefined)
-    updated.claudeCodeOauthToken = data.claudeCodeOauthToken;
-  if (data.anthropicModel !== undefined)
-    updated.anthropicModel = data.anthropicModel;
   if (data.customEnv !== undefined) updated.customEnv = data.customEnv;
 
   try {

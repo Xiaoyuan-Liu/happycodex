@@ -27,6 +27,13 @@ import type {
   DynamicToolCallResponse,
 } from '../../appserver/protocol.js';
 
+/**
+ * install_skill 的 bridge 侧 poll 上限（对齐上游 mcp-tools.ts：安装可能很慢，120s）。
+ * 共享常量（#24）：IpcToolBridge 用作 pollIpcResult 截止；ToolDispatcher 据此抬高
+ * install_skill 的看门狗（须 ≥ 此值 + 余量），避免 60s 默认看门狗以假失败抢答仍在进行的安装回执。
+ */
+export const INSTALL_SKILL_POLL_TIMEOUT_MS = 120_000;
+
 /** 工具执行上下文。 */
 export interface ToolContext {
   /** 调用方会话的 folder（main / home-{userId} 等）。 */

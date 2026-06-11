@@ -1,13 +1,19 @@
-// Agent definitions management routes
-// Manages ~/.claude/agents/*.md files (global agent definition files)
+// Agent definitions routes（codex 版：只读展示 PREDEFINED_AGENTS）
+//
+// tombstone（happycodex）：上游本路由对宿主机 ~/.claude/agents/*.md 做活体 CRUD
+// （getAgentsDir/discoverAgents/getAgentDetail/parseFrontmatter/extractTools 等
+// frontmatter 解析与 fs 读写全套，Claude Code 全局子代理定义）。codex 引擎不读
+// ~/.claude——预定义子代理的单一真相源是 src/runtime/multitenant/agent-defs.ts 的
+// PREDEFINED_AGENTS，由 FsCodexHomeProvisioner.provisionAgents（src/runtime/
+// multitenant/codex-home.ts）渲染成 {CODEX_HOME}/agents/<name>.toml。GET 改为如实
+// 展示 PREDEFINED_AGENTS（页面呈现 codex 实际运行的子代理）；写操作（PUT/POST/
+// DELETE）返回 501——自定义子代理定义的持久化（DB 或 {dataDir}/agent-defs）与
+// provision 合并留待后续接线，任何路径都绝不写 ~/.claude。
 
 import { Hono } from 'hono';
-import fs from 'fs';
-import path from 'path';
-import os from 'os';
 import type { Variables } from '../web-context.js';
 import { authMiddleware, systemConfigMiddleware } from '../middleware/auth.js';
-import { logger } from '../logger.js';
+import { PREDEFINED_AGENTS } from '../runtime/multitenant/agent-defs.js';
 
 const agentDefinitionsRoutes = new Hono<{ Variables: Variables }>();
 
@@ -25,248 +31,63 @@ interface AgentDefinitionDetail extends AgentDefinition {
   content: string;
 }
 
-// --- Utility Functions ---
+const EDIT_NOT_SUPPORTED =
+  'Agent definition editing is not supported on the codex engine; ' +
+  'predefined agents are provisioned from PREDEFINED_AGENTS into {CODEX_HOME}/agents/*.toml';
 
-function getAgentsDir(): string {
-  return path.join(os.homedir(), '.claude', 'agents');
-}
-
-function validateAgentId(id: string): boolean {
-  return /^[\w\-]+$/.test(id);
-}
-
-function extractTools(frontmatter: Record<string, string | string[]>): string[] {
-  return Array.isArray(frontmatter.tools)
-    ? frontmatter.tools
-    : typeof frontmatter.tools === 'string'
-      ? frontmatter.tools.split(',').map((t) => t.trim()).filter(Boolean)
-      : [];
-}
-
-function parseFrontmatter(content: string): Record<string, string | string[]> {
-  const lines = content.split('\n');
-  if (lines[0]?.trim() !== '---') return {};
-
-  const endIndex = lines.slice(1).findIndex((line) => line.trim() === '---');
-  if (endIndex === -1) return {};
-
-  const frontmatterLines = lines.slice(1, endIndex + 1);
-  const result: Record<string, string | string[]> = {};
-  let currentKey: string | null = null;
-  let currentValue: string[] = [];
-  let multilineMode: 'folded' | 'literal' | 'list' | null = null;
-
-  for (const line of frontmatterLines) {
-    const keyMatch = line.match(/^([\w\-]+):\s*(.*)$/);
-    if (keyMatch) {
-      // Save previous key
-      if (currentKey) {
-        if (multilineMode === 'list') {
-          result[currentKey] = currentValue;
-        } else {
-          result[currentKey] = currentValue.join(
-            multilineMode === 'literal' ? '\n' : ' ',
-          );
-        }
-      }
-
-      currentKey = keyMatch[1] ?? null;
-      const value = (keyMatch[2] ?? '').trim();
-
-      if (value === '>') {
-        multilineMode = 'folded';
-        currentValue = [];
-      } else if (value === '|') {
-        multilineMode = 'literal';
-        currentValue = [];
-      } else if (value === '') {
-        // Could be start of a list
-        multilineMode = 'list';
-        currentValue = [];
-      } else {
-        if (currentKey) result[currentKey] = value;
-        currentKey = null;
-        currentValue = [];
-        multilineMode = null;
-      }
-    } else if (currentKey && multilineMode) {
-      const trimmedLine = line.trimStart();
-      if (multilineMode === 'list' && trimmedLine.startsWith('- ')) {
-        currentValue.push(trimmedLine.slice(2).trim());
-      } else if (trimmedLine) {
-        currentValue.push(trimmedLine);
-      }
-    }
-  }
-
-  // Save last key
-  if (currentKey) {
-    if (multilineMode === 'list') {
-      result[currentKey] = currentValue;
-    } else {
-      result[currentKey] = currentValue.join(
-        multilineMode === 'literal' ? '\n' : ' ',
-      );
-    }
-  }
-
-  return result;
-}
-
-function discoverAgents(): AgentDefinition[] {
-  const agentsDir = getAgentsDir();
-  if (!fs.existsSync(agentsDir)) return [];
-
-  const agents: AgentDefinition[] = [];
-
-  try {
-    const entries = fs.readdirSync(agentsDir, { withFileTypes: true });
-    for (const entry of entries) {
-      if (!entry.isFile() || !entry.name.endsWith('.md')) continue;
-
-      const filePath = path.join(agentsDir, entry.name);
-      try {
-        const content = fs.readFileSync(filePath, 'utf-8');
-        const frontmatter = parseFrontmatter(content);
-        const stats = fs.statSync(filePath);
-        const id = entry.name.replace(/\.md$/, '');
-
-        agents.push({
-          id,
-          name: (frontmatter.name as string) || id,
-          description: (frontmatter.description as string) || '',
-          tools: extractTools(frontmatter),
-          updatedAt: stats.mtime.toISOString(),
-        });
-      } catch (err) {
-        logger.warn({ filePath, error: err instanceof Error ? err.message : String(err) }, 'Failed to parse agent file');
-      }
-    }
-  } catch {
-    // Directory not readable
-  }
-
-  return agents;
-}
-
-function getAgentDetail(id: string): AgentDefinitionDetail | null {
-  if (!validateAgentId(id)) return null;
-
-  const filePath = path.join(getAgentsDir(), `${id}.md`);
-  if (!fs.existsSync(filePath)) return null;
-
-  try {
-    const content = fs.readFileSync(filePath, 'utf-8');
-    const frontmatter = parseFrontmatter(content);
-    const stats = fs.statSync(filePath);
-
-    return {
-      id,
-      name: (frontmatter.name as string) || id,
-      description: (frontmatter.description as string) || '',
-      tools: extractTools(frontmatter),
-      updatedAt: stats.mtime.toISOString(),
-      content,
-    };
-  } catch {
-    return null;
-  }
+/**
+ * PREDEFINED_AGENTS → 路由 wire 形状。
+ * tools 恒空：codex agent TOML 无 tools 字段（子代理工具由 sandbox/审批策略统一
+ * 约束，见 agent-defs.ts 头注）；updatedAt 恒空：编译期常量定义，无文件 mtime。
+ */
+function listPredefinedAgents(): AgentDefinition[] {
+  return PREDEFINED_AGENTS.map((def) => ({
+    id: def.name,
+    name: def.name,
+    description: def.description,
+    tools: [],
+    updatedAt: '',
+  }));
 }
 
 // --- Routes ---
 
-// List all agent definitions
+// List all agent definitions（codex 实际运行的预定义子代理）
 agentDefinitionsRoutes.get('/', authMiddleware, (c) => {
-  const agents = discoverAgents();
-  return c.json({ agents });
+  return c.json({ agents: listPredefinedAgents() });
 });
 
-// Get single agent detail
+// Get single agent detail（content = developer_instructions 人设全文）
 agentDefinitionsRoutes.get('/:id', authMiddleware, (c) => {
   const id = c.req.param('id');
-  const agent = getAgentDetail(id);
-  if (!agent) {
+  const def = PREDEFINED_AGENTS.find((a) => a.name === id);
+  if (!def) {
     return c.json({ error: 'Agent definition not found' }, 404);
   }
+  const agent: AgentDefinitionDetail = {
+    id: def.name,
+    name: def.name,
+    description: def.description,
+    tools: [],
+    updatedAt: '',
+    content: def.developerInstructions,
+  };
   return c.json({ agent });
 });
 
-// Update agent content
-agentDefinitionsRoutes.put('/:id', authMiddleware, systemConfigMiddleware, async (c) => {
-  const id = c.req.param('id');
-  if (!validateAgentId(id)) {
-    return c.json({ error: 'Invalid agent ID' }, 400);
-  }
-
-  const body = await c.req.json().catch(() => ({}));
-  const { content } = body as { content: string };
-  if (typeof content !== 'string') {
-    return c.json({ error: 'content must be a string' }, 400);
-  }
-
-  const filePath = path.join(getAgentsDir(), `${id}.md`);
-  try {
-    fs.accessSync(filePath);
-    fs.writeFileSync(filePath, content, 'utf-8');
-  } catch (err: unknown) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-      return c.json({ error: 'Agent definition not found' }, 404);
-    }
-    throw err;
-  }
-  return c.json({ success: true });
+// Update agent content — codex 引擎不支持（见文件头 tombstone）
+agentDefinitionsRoutes.put('/:id', authMiddleware, systemConfigMiddleware, (c) => {
+  return c.json({ error: EDIT_NOT_SUPPORTED }, 501);
 });
 
-// Create new agent
-agentDefinitionsRoutes.post('/', authMiddleware, systemConfigMiddleware, async (c) => {
-  const body = await c.req.json().catch(() => ({}));
-  const { name, content } = body as { name: string; content: string };
-
-  if (!name || typeof name !== 'string') {
-    return c.json({ error: 'name is required' }, 400);
-  }
-  if (typeof content !== 'string') {
-    return c.json({ error: 'content must be a string' }, 400);
-  }
-
-  // Derive id from name
-  const id = name.toLowerCase().replace(/[^a-z0-9\-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
-  if (!id || !validateAgentId(id)) {
-    return c.json({ error: 'Invalid agent name' }, 400);
-  }
-
-  const agentsDir = getAgentsDir();
-  fs.mkdirSync(agentsDir, { recursive: true });
-
-  const filePath = path.join(agentsDir, `${id}.md`);
-  try {
-    fs.writeFileSync(filePath, content, { encoding: 'utf-8', flag: 'wx' });
-  } catch (err: unknown) {
-    if ((err as NodeJS.ErrnoException).code === 'EEXIST') {
-      return c.json({ error: 'Agent with this name already exists' }, 409);
-    }
-    throw err;
-  }
-  return c.json({ success: true, id });
+// Create new agent — codex 引擎不支持（见文件头 tombstone）
+agentDefinitionsRoutes.post('/', authMiddleware, systemConfigMiddleware, (c) => {
+  return c.json({ error: EDIT_NOT_SUPPORTED }, 501);
 });
 
-// Delete agent
+// Delete agent — codex 引擎不支持（见文件头 tombstone）
 agentDefinitionsRoutes.delete('/:id', authMiddleware, systemConfigMiddleware, (c) => {
-  const id = c.req.param('id');
-  if (!validateAgentId(id)) {
-    return c.json({ error: 'Invalid agent ID' }, 400);
-  }
-
-  const filePath = path.join(getAgentsDir(), `${id}.md`);
-  try {
-    fs.unlinkSync(filePath);
-  } catch (err: unknown) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-      return c.json({ error: 'Agent definition not found' }, 404);
-    }
-    throw err;
-  }
-  return c.json({ success: true });
+  return c.json({ error: EDIT_NOT_SUPPORTED }, 501);
 });
 
 export default agentDefinitionsRoutes;

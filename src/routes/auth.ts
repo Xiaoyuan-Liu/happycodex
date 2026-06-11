@@ -32,11 +32,10 @@ import {
 } from '../db.js';
 import {
   getRegistrationConfig,
-  getClaudeProviderConfig,
-  getEnabledProviders,
   getFeishuProviderConfigWithSource,
   getAppearanceConfig,
 } from '../runtime-config.js';
+import { readCodexAuthStatus } from './config.js';
 import {
   verifyPassword,
   hashPassword,
@@ -95,28 +94,19 @@ export function toUserPublic(u: User): UserPublic {
   };
 }
 
-function buildSetupStatus() {
-  // Check ALL enabled providers, not just the first one.
-  // V3→V4 migration can produce empty providers that sort before real ones,
-  // causing getClaudeProviderConfig() (first-match) to return an unconfigured provider.
-  const providers = getEnabledProviders();
-  const claudeConfigured = providers.some((p) => {
-    const hasOfficial =
-      !!p.claudeCodeOauthToken?.trim() ||
-      !!p.claudeOAuthCredentials ||
-      !!p.anthropicApiKey?.trim();
-    const hasThirdParty = !!(
-      p.anthropicBaseUrl?.trim() &&
-      p.anthropicAuthToken?.trim()
-    );
-    return hasOfficial || hasThirdParty;
-  });
+// export：仅供单测（tests/routes-auth-setup-status.test.ts）直接验证判定逻辑。
+export function buildSetupStatus() {
+  // codex 单账号引擎：凭据 = 共享 CODEX_HOME/auth.json（codex login /
+  // POST /api/config/codex/auth/api-key 产物）。
+  // tombstone（happycodex）：上游此处检查 Claude provider 池
+  // （claudeCodeOauthToken/anthropicApiKey/...），随 provider failover 作废。
+  const codexConfigured = readCodexAuthStatus().loggedIn;
   const { source: feishuSource } = getFeishuProviderConfigWithSource();
   const feishuConfigured = feishuSource !== 'none';
 
   return {
-    needsSetup: !claudeConfigured,
-    claudeConfigured,
+    needsSetup: !codexConfigured,
+    codexConfigured,
     feishuConfigured,
   };
 }

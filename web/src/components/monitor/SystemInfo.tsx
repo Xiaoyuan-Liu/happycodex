@@ -6,7 +6,7 @@ interface SystemInfoProps {
   status: SystemStatus;
 }
 
-/** Extract semver-like version number from strings like "2.1.81 (Claude Code)" */
+/** Extract semver-like version number from strings like "codex-cli 0.137.0" */
 function extractVersion(raw: string | null | undefined): string | null {
   if (!raw) return null;
   const match = raw.match(/(\d+\.\d+\.\d+)/);
@@ -49,7 +49,7 @@ export function SystemInfo({ status }: SystemInfoProps) {
     return `${minutes}m`;
   };
 
-  const versions = status.claudeCodeVersions;
+  const versions = status.codexVersions;
 
   return (
     <Card>

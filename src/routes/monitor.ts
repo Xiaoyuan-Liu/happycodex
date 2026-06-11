@@ -18,11 +18,15 @@ import { CONTAINER_IMAGE } from '../config.js';
 import { getSystemSettings } from '../runtime-config.js';
 // tombstone（happycodex）：上游另从 runtime-config 导入 getProviders、从 container-runner
 // 导入 setProviderOverride（provider 切换 + 一次性 override）——随 provider failover 作废删除。
+// tombstone（happycodex）：上游版本探测目标是 claude-code（claude --version /
+// npm view @anthropic-ai/claude-code / 容器内 /app/node_modules/.bin/claude）——
+// happycodex 引擎为 codex CLI，探测目标整体换为 codex（PATH 裸命令，与
+// sdk-query.ts / appserver/client.ts 的约定一致）+ npm @openai/codex。
 import { logger } from '../logger.js';
 
 const execFileAsync = promisify(execFile);
 
-// --- Claude Code version cache ---
+// --- Codex CLI version cache ---
 
 interface VersionInfo {
   host: string | null;
@@ -42,8 +46,8 @@ let cachedLatestVersion: { version: string | null; fetchedAt: number } | null =
   null;
 const LATEST_VERSION_CACHE_TTL = 30 * 60 * 1000; // 30min
 
-/** Query latest Claude Code version from npm registry */
-async function getLatestClaudeCodeVersion(): Promise<string | null> {
+/** Query latest Codex CLI version from npm registry */
+async function getLatestCodexVersion(): Promise<string | null> {
   const now = Date.now();
   if (
     cachedLatestVersion &&
@@ -55,7 +59,7 @@ async function getLatestClaudeCodeVersion(): Promise<string | null> {
   try {
     const { stdout } = await execFileAsync(
       'npm',
-      ['view', '@anthropic-ai/claude-code', 'version'],
+      ['view', '@openai/codex', 'version'],
       { timeout: 15000 },
     );
     const version = stdout.trim() || null;
@@ -69,10 +73,10 @@ async function getLatestClaudeCodeVersion(): Promise<string | null> {
   }
 }
 
-/** Get host Claude Code version via global `claude --version` CLI */
-async function getHostClaudeCodeVersion(): Promise<string | null> {
+/** Get host Codex CLI version via global `codex --version` CLI */
+async function getHostCodexVersion(): Promise<string | null> {
   try {
-    const { stdout } = await execFileAsync('claude', ['--version'], { timeout: 10000 });
+    const { stdout } = await execFileAsync('codex', ['--version'], { timeout: 10000 });
     return stdout.trim() || null;
   } catch {
     return null;
@@ -92,13 +96,13 @@ async function getDockerImageId(): Promise<string | null> {
   }
 }
 
-/** Get container Claude Code version from Docker image */
-async function getContainerClaudeCodeVersion(): Promise<string | null> {
+/** Get container Codex CLI version from Docker image (codex 全局安装在镜像 PATH 上) */
+async function getContainerCodexVersion(): Promise<string | null> {
   try {
     const { stdout } = await execFileAsync(
       'docker',
       [
-        'run', '--rm', '--entrypoint', '/app/node_modules/.bin/claude',
+        'run', '--rm', '--entrypoint', 'codex',
         CONTAINER_IMAGE, '--version',
       ],
       { timeout: 30000 },
@@ -109,7 +113,7 @@ async function getContainerClaudeCodeVersion(): Promise<string | null> {
   }
 }
 
-async function getClaudeCodeVersions(): Promise<VersionInfo> {
+async function getCodexVersions(): Promise<VersionInfo> {
   const now = Date.now();
   const imageId = await getDockerImageId();
 
@@ -124,9 +128,9 @@ async function getClaudeCodeVersions(): Promise<VersionInfo> {
 
   // Fetch all versions concurrently
   const [host, container, latest] = await Promise.all([
-    getHostClaudeCodeVersion(),
-    imageId ? getContainerClaudeCodeVersion() : Promise.resolve(null),
-    getLatestClaudeCodeVersion(),
+    getHostCodexVersion(),
+    imageId ? getContainerCodexVersion() : Promise.resolve(null),
+    getLatestCodexVersion(),
   ]);
   const info: VersionInfo = { host, container, latest };
 
@@ -308,7 +312,7 @@ monitorRoutes.get('/status', authMiddleware, async (c) => {
     groups: enrichedGroups,
     dockerImageExists,
     dockerBuildInProgress: buildState.building,
-    claudeCodeVersions: isAdmin ? await getClaudeCodeVersions() : undefined,
+    codexVersions: isAdmin ? await getCodexVersions() : undefined,
     dockerBuildLogs:
       isAdmin && buildState.building ? buildState.logs.slice(-50) : undefined,
     dockerBuildResult: isAdmin ? buildState.result : undefined,

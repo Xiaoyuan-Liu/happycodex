@@ -1,10 +1,12 @@
 /**
  * IpcToolBridge —— ToolBridge 的 HappyClaw IPC 实现。
  *
- * 动作类工具（send / schedule / pause / resume / cancel / register / install / uninstall）
+ * 动作类工具（send / schedule / pause / resume / cancel / install / uninstall）
  * 落成 HappyClaw 风格的 IPC 请求文件（原子写：先写 `<target>.tmp` 再 rename 到 `<target>`），
  * 由主进程消费。记忆类工具（memoryAppend / memorySearch / memoryGet）直接对
  * `{memoryDir}/{folder}/` 下的 .md 文件做读写。
+ * register_group 例外（#17/#23）：冻结 schema 缺主进程必填的 folder 参数，请求必被拒且无回执
+ * → 当前版本直接抛错（诚实失败），不写 IPC；A4/A5 扩展 schema 后恢复。
  *
  * IPC 布局与**线格式**对齐主进程消费端（src/index.ts processTaskIpc / messages 分支，
  * 即上游 container/agent-runner/src/mcp-tools.ts 的写出格式）：
@@ -41,6 +43,7 @@ import {
 import * as path from 'node:path';
 
 import { detectImageMimeTypeFromBase64Strict } from '../../image-detector.js';
+import { INSTALL_SKILL_POLL_TIMEOUT_MS } from './types.js';
 import type {
   ToolBridge,
   ScheduleTaskInput,
@@ -60,7 +63,6 @@ const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 /** pollIpcResult 默认轮询间隔 / 超时（对齐上游 mcp-tools.ts：500ms / 30s；install_skill 120s）。 */
 const DEFAULT_POLL_INTERVAL_MS = 500;
 const DEFAULT_POLL_TIMEOUT_MS = 30_000;
-const INSTALL_SKILL_POLL_TIMEOUT_MS = 120_000;
 
 /** 上游 newRequestId()：时间戳 + 随机段；命中主进程 SAFE_REQUEST_ID_RE（[A-Za-z0-9_-]+）。 */
 function newRequestId(): string {
@@ -432,17 +434,21 @@ export class IpcToolBridge implements ToolBridge {
     await this.writeScheduleAction(folder, 'cancel', taskId);
   }
 
-  async registerGroup(folder: string, jid: string, name?: string): Promise<void> {
+  async registerGroup(_folder: string, jid: string, _name?: string): Promise<void> {
     // 上游走 tasks 通道（processTaskIpc case 'register_group'）。
-    // 已知缺口（A4/A5）：主进程还要求 data.folder（新群组目录名），冻结的 12 工具 schema
-    // 没有该参数 → 集成态下主进程会以 missing required fields 拒绝。这里先对齐通道与字段名。
-    await this.writeIpc(folder, 'tasks', {
-      type: 'register_group',
-      jid,
-      name: name ?? null,
-      timestamp: new Date().toISOString(),
-      ts: Date.now(),
-    });
+    // 已知缺口（A4/A5，#17/#23）：主进程消费端要求 data.jid && data.name && data.folder
+    // （src/index.ts case 'register_group'），冻结的工具 schema 无 folder 参数、name 可选
+    // （本方法只能写 name ?? null，过不了真值检查）→ 集成态下请求 100% 被
+    // "missing required fields" 拒绝；且该 case 是 fire-and-forget（无结果回执文件），
+    // 假成功无从纠正。诚实失败：不写注定被拒的请求文件，直接抛错——registry.dispatch
+    // 收敛为 success:false，模型得到真实状态并可引导用户走 Web 注册。
+    // A4/A5 解冻 schema 补 folder（required，对齐上游 regex ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$）
+    // + name 改 required 后，恢复写 IPC（tombstone：原实现见 git 历史）。
+    throw new Error(
+      `register_group 在当前版本不可用：冻结的工具 schema 缺少主进程必填的 folder 参数，` +
+        `请求会被主进程以 missing required fields 拒绝。` +
+        `请让管理员在 Web 界面注册群组（jid=${jid}）。`,
+    );
   }
 
   async installSkill(folder: string, name: string): Promise<{ installed?: string[] }> {

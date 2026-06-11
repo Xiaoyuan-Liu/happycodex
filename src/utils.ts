@@ -90,7 +90,7 @@ export function isSecureRequest(c: any): boolean {
   return false;
 }
 
-/** Create IPC + session directories for an agent. */
+/** Create IPC directories for an agent. */
 export function ensureAgentDirectories(
   folder: string,
   agentId: string,
@@ -99,9 +99,10 @@ export function ensureAgentDirectories(
   fs.mkdirSync(path.join(agentIpcDir, 'input'), { recursive: true });
   fs.mkdirSync(path.join(agentIpcDir, 'messages'), { recursive: true });
   fs.mkdirSync(path.join(agentIpcDir, 'tasks'), { recursive: true });
-  fs.mkdirSync(
-    path.join(DATA_DIR, 'sessions', folder, 'agents', agentId, '.claude'),
-    { recursive: true },
-  );
+  // tombstone（happycodex）：上游此处预建 per-agent `.claude` 会话目录
+  // （sessions/{folder}/agents/{agentId}/.claude）；codex 侧 per-agent 会话目录是
+  // `{folder}/agents/{agentId}/.codex`，由 provisionCodexHome（FsCodexHomeProvisioner
+  // .provision 的 recursive mkdir）在 spawn 时创建并承载完整 provision 语义
+  // （auth.json 复制 / config.toml / agents 物化），此处不预建以免掩盖 provision 失败。
   return agentIpcDir;
 }

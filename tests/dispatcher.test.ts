@@ -377,6 +377,126 @@ describe('ToolDispatcher', () => {
     }
   });
 
+  it('#24 install_skill 看门狗默认 130s（> bridge 120s poll）：60s 不抢答，普通工具仍 60s 收口', async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new FakeClient();
+      const registry = new FakeRegistry();
+      registry.register(makeTool('install_skill', () => new Promise<never>(() => {})));
+      registry.register(makeTool('hang', () => new Promise<never>(() => {})));
+      // 不传 dispatchTimeoutMs → 默认看门狗：普通工具 60s，install_skill 130s。
+      new ToolDispatcher(client, registry, {
+        groupFolder: 'g',
+        bridge: new FakeToolBridge(),
+        getThreadId: () => 'th',
+      });
+
+      let installResponded = false;
+      let installResult: unknown;
+      await client.emitServerRequestRaw(
+        ServerReq.dynamicToolCall,
+        callParams({ tool: 'install_skill' }),
+        (r) => {
+          installResponded = true;
+          installResult = r;
+        },
+      );
+      let hangResponded = false;
+      await client.emitServerRequestRaw(
+        ServerReq.dynamicToolCall,
+        callParams({ tool: 'hang' }),
+        () => {
+          hangResponded = true;
+        },
+      );
+
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(hangResponded).toBe(true); // 普通工具：60s 默认看门狗照常收口
+      expect(installResponded).toBe(false); // install_skill：不被 60s 假失败抢答
+
+      await vi.advanceTimersByTimeAsync(70_000); // 累计 130s，跨过 install 专属看门狗
+      expect(installResponded).toBe(true);
+      expect(installResult).toMatchObject({ success: false });
+      const text = (installResult as DynamicToolCallResponse).contentItems[0] as { text: string };
+      expect(text.text).toMatch(/timeout.*130000ms/);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('#24 安装在 60s-130s 间完成（bridge poll 120s 上限内）→ 真实成功回执胜出，不被假失败抢答', async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new FakeClient();
+      const registry = new FakeRegistry();
+      // 模拟 bridge pollIpcResult 在 90s 时读到主进程成功回执。
+      registry.register(
+        makeTool(
+          'install_skill',
+          () =>
+            new Promise<DynamicToolCallResponse>((resolve) => {
+              setTimeout(() => resolve(toolTextResult('Skill "x/y" 已安装', true)), 90_000);
+            }),
+        ),
+      );
+      new ToolDispatcher(client, registry, {
+        groupFolder: 'g',
+        bridge: new FakeToolBridge(),
+        getThreadId: () => 'th',
+      });
+
+      let responded = false;
+      let result: unknown;
+      await client.emitServerRequestRaw(
+        ServerReq.dynamicToolCall,
+        callParams({ tool: 'install_skill' }),
+        (r) => {
+          responded = true;
+          result = r;
+        },
+      );
+
+      await vi.advanceTimersByTimeAsync(89_000);
+      expect(responded).toBe(false);
+      await vi.advanceTimersByTimeAsync(1_000); // 90s：真实回执先于 130s 看门狗
+      expect(responded).toBe(true);
+      expect(result).toMatchObject({ success: true });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('#24 显式 dispatchTimeoutMs 统一覆盖所有工具（含 install_skill，对齐 IpcToolBridge pollTimeoutMs 语义）', async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new FakeClient();
+      const registry = new FakeRegistry();
+      registry.register(makeTool('install_skill', () => new Promise<never>(() => {})));
+      new ToolDispatcher(client, registry, {
+        groupFolder: 'g',
+        bridge: new FakeToolBridge(),
+        getThreadId: () => 'th',
+        dispatchTimeoutMs: 1000,
+      });
+
+      let responded = false;
+      let result: unknown;
+      await client.emitServerRequestRaw(
+        ServerReq.dynamicToolCall,
+        callParams({ tool: 'install_skill' }),
+        (r) => {
+          responded = true;
+          result = r;
+        },
+      );
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(responded).toBe(true);
+      expect(result).toMatchObject({ success: false });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('dispose() 取消订阅：之后的 item/tool/call 不再触发 handler', async () => {
     const { client, registry, dispatcher } = makeDispatcher();
     registry.register(makeTool('echo', async () => toolTextResult('ok', true)));

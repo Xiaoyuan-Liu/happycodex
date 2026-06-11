@@ -8,8 +8,8 @@ import { Hono } from 'hono';
 
 import { DATA_DIR } from '../config.js';
 import { getUserHomeGroup } from '../db.js';
-import { getClaudeProviderConfig } from '../runtime-config.js';
 import { sdkQuery } from '../sdk-query.js';
+import { readCodexAuthStatus } from './config.js';
 import { logger } from '../logger.js';
 import { authMiddleware } from '../middleware/auth.js';
 import {
@@ -70,9 +70,12 @@ async function checkCapabilities(): Promise<{
       .then(() => true)
       .catch(() => false),
   ]);
-  // Claude availability is determined by provider config, not CLI presence
-  const providerConfig = getClaudeProviderConfig();
-  const claude = !!(providerConfig.anthropicApiKey || providerConfig.claudeCodeOauthToken || providerConfig.claudeOAuthCredentials);
+  // 【codex 触点替换】AI 可用性 = 共享 CODEX_HOME 下 auth.json 存在
+  // （readCodexAuthStatus 与 sdkQuery 的认证来源同口径：
+  // HAPPYCODEX_SHARED_CODEX_HOME > CODEX_HOME > ~/.codex）。
+  // tombstone：上游此处读 Claude provider 配置（anthropicApiKey /
+  // claudeCodeOauthToken / claudeOAuthCredentials），随 provider failover 作废。
+  const claude = readCodexAuthStatus().loggedIn;
 
   // Get gh username if available
   let ghUsername: string | null = null;
@@ -286,7 +289,7 @@ bugReportRoutes.get('/capabilities', authMiddleware, async (c) => {
 
 /**
  * POST /api/bug-report/generate
- * Analyze the bug with Claude and generate a structured report
+ * Analyze the bug with codex (sdkQuery) and generate a structured report
  */
 bugReportRoutes.post('/generate', authMiddleware, async (c) => {
   const user = c.get('user') as AuthUser;
@@ -330,10 +333,10 @@ bugReportRoutes.post('/generate', authMiddleware, async (c) => {
   const rawLogs = readRecentLogs(folder);
   const logs = sanitizeLogs(rawLogs);
 
-  // Try Claude analysis
+  // Try codex analysis（wire 字段名 claudeAvailable 保留：前端 Capabilities 类型未动）
   const caps = await checkCapabilities();
   if (!caps.claudeAvailable) {
-    logger.info('bug-report: claude CLI not available, using fallback template');
+    logger.info('bug-report: codex auth not available, using fallback template');
     const fallback = buildFallbackReport(description, systemInfo, logs);
     return c.json({ ...fallback, systemInfo });
   }
@@ -343,7 +346,7 @@ bugReportRoutes.post('/generate', authMiddleware, async (c) => {
   try {
     logger.info(
       { promptLen: prompt.length, userId: user.id },
-      'bug-report: invoking Claude SDK',
+      'bug-report: invoking codex (sdkQuery)',
     );
 
     const model = process.env.RECALL_MODEL || undefined;

@@ -121,8 +121,17 @@ export function createWhatsAppConnection(
     error: STUB_MESSAGE,
   };
   return {
-    async connect(): Promise<void> {
+    async connect(opts: WhatsAppConnectOpts): Promise<void> {
       logger.error(STUB_MESSAGE);
+      // 推送带 STUB_MESSAGE 的 disconnected 状态（镜像上游 setState→onConnectionUpdate
+      // 契约，upstream src/whatsapp.ts:215-222）：im-manager 缓存到 lastWhatsAppState，
+      // GET/PUT /api/config/user-im/whatsapp 响应与 whatsapp_status WS 均携带 error，
+      // 前端 WhatsAppChannelCard「断线原因」即可显示 stub 降级说明。
+      try {
+        opts.onConnectionUpdate?.(stubState);
+      } catch {
+        /* 回调异常不掩盖 stub 主错误 */
+      }
       throw new Error(STUB_MESSAGE);
     },
     async disconnect(): Promise<void> {

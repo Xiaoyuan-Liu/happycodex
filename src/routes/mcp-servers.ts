@@ -97,6 +97,166 @@ async function writeHostSyncManifest(
   );
 }
 
+// ─── codex config.toml 导入（/sync-host Source 3） ──────────────────────
+
+/**
+ * 共享 codex home（已 `codex login` 的单账号凭据源）。
+ * 解析顺序与 container-runner.sharedCodexHomeDir / sdk-query 一致：
+ * HAPPYCODEX_SHARED_CODEX_HOME > CODEX_HOME > ~/.codex。
+ */
+function sharedCodexHomeDir(): string {
+  return (
+    process.env.HAPPYCODEX_SHARED_CODEX_HOME ||
+    process.env.CODEX_HOME ||
+    path.join(os.homedir(), '.codex')
+  );
+}
+
+/** TOML 基本字符串反转义（覆盖 mcp-toml.tomlString 产出的转义集）。 */
+function unescapeTomlString(s: string): string {
+  return s.replace(/\\(["\\nrt])/g, (_m, ch: string) =>
+    ch === 'n' ? '\n' : ch === 'r' ? '\r' : ch === 't' ? '\t' : ch,
+  );
+}
+
+/** 解析单个 TOML 键（bare key 或带引号 key），返回规范化名字。 */
+function parseTomlKey(raw: string): string {
+  const trimmed = raw.trim();
+  if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
+    return unescapeTomlString(trimmed.slice(1, -1));
+  }
+  return trimmed;
+}
+
+/**
+ * 解析单行 TOML 标量值（基本字符串 / 布尔 / 数字 / 字符串数组 / inline table）。
+ * 解析失败返回 undefined（调用方跳过该键）。
+ */
+function parseTomlValue(raw: string): unknown {
+  const v = raw.trim();
+  if (v.startsWith('"')) {
+    const m = v.match(/^"((?:[^"\\]|\\.)*)"\s*(?:#.*)?$/);
+    return m ? unescapeTomlString(m[1] ?? '') : undefined;
+  }
+  if (v === 'true') return true;
+  if (v === 'false') return false;
+  if (/^-?\d+(\.\d+)?\s*(?:#.*)?$/.test(v)) return Number(v.replace(/#.*$/, '').trim());
+  if (v.startsWith('[')) {
+    // 字符串数组（args 等）；非字符串成员的数组对 hostEntry 形状无意义，跳过。
+    const close = v.lastIndexOf(']');
+    if (close < 0) return undefined;
+    const inner = v.slice(1, close);
+    const out: string[] = [];
+    const re = /"((?:[^"\\]|\\.)*)"/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(inner)) !== null) out.push(unescapeTomlString(m[1] ?? ''));
+    return out;
+  }
+  if (v.startsWith('{')) {
+    // inline table（codex 原生形状常见 env = { KEY = "v" }），只取字符串成员。
+    const out: Record<string, string> = {};
+    const re = /([A-Za-z0-9_-]+|"(?:[^"\\]|\\.)*")\s*=\s*"((?:[^"\\]|\\.)*)"/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(v)) !== null) {
+      out[parseTomlKey(m[1] ?? '')] = unescapeTomlString(m[2] ?? '');
+    }
+    return out;
+  }
+  return undefined;
+}
+
+/** `[mcp_servers.<name>]` 或 `[mcp_servers.<name>.<sub>]` 段头。 */
+const MCP_SECTION_RE =
+  /^\[mcp_servers\.("(?:[^"\\]|\\.)*"|[A-Za-z0-9_-]+)(?:\.("(?:[^"\\]|\\.)*"|[A-Za-z0-9_-]+))?\]\s*(?:#.*)?$/;
+
+/**
+ * 解析 codex config.toml 的 `[mcp_servers.*]` 段。
+ *
+ * tombstone（happycodex）：上游 /sync-host 只认 Claude 配置面（~/.claude/settings.json
+ * + ~/.claude.json）；codex-only 主机的 MCP 真相源是 {codex home}/config.toml。
+ * 行式解析（与 mcp-toml.mergeMcpServersIntoToml 的「段头 marker 检测」同款策略，
+ * 不引入 TOML 依赖），只需覆盖 mcp-toml 渲染器自身产出 + codex 原生形状：
+ * 标量 command/url、数组 args、子表 [mcp_servers.<name>.env]/[.http_headers]、
+ * inline table env = { ... }。未知键原样收集（hostEntry 映射阶段忽略）。
+ */
+export function parseMcpServersFromToml(
+  content: string,
+): Record<string, Record<string, unknown>> {
+  const servers: Record<string, Record<string, unknown>> = {};
+  let current: Record<string, unknown> | null = null;
+
+  for (const rawLine of content.split('\n')) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) continue;
+
+    if (line.startsWith('[')) {
+      const m = line.match(MCP_SECTION_RE);
+      if (!m) {
+        current = null; // 其他段（[model] / [projects."…"] 等）→ 退出 mcp 上下文
+        continue;
+      }
+      const name = parseTomlKey(m[1] ?? '');
+      const srv = (servers[name] ??= {});
+      if (m[2]) {
+        // 子表 [mcp_servers.<name>.env] / [.http_headers]
+        const sub: Record<string, unknown> = {};
+        srv[parseTomlKey(m[2])] = sub;
+        current = sub;
+      } else {
+        current = srv;
+      }
+      continue;
+    }
+
+    if (!current) continue;
+    const eq = line.indexOf('=');
+    if (eq <= 0) continue;
+    const key = parseTomlKey(line.slice(0, eq));
+    if (!key) continue;
+    const value = parseTomlValue(line.slice(eq + 1));
+    if (value !== undefined) current[key] = value;
+  }
+
+  return servers;
+}
+
+/**
+ * codex `[mcp_servers.*]` 段 → sync-host 的 hostEntry 消费形状
+ * （与 ~/.claude 来源对齐：含 url → { type:'http', url, headers }；
+ * 否则 { command, args, env }。codex 的 http_headers 键还原为 headers）。
+ */
+function codexServerToHostEntry(
+  server: Record<string, unknown>,
+): Record<string, unknown> {
+  const url = typeof server.url === 'string' ? server.url : '';
+  if (url) {
+    const headers = (server.http_headers ?? server.headers) as
+      | Record<string, string>
+      | undefined;
+    return {
+      type: 'http',
+      url,
+      ...(headers &&
+      typeof headers === 'object' &&
+      Object.keys(headers).length > 0
+        ? { headers }
+        : {}),
+    };
+  }
+  const entry: Record<string, unknown> = {
+    command: typeof server.command === 'string' ? server.command : '',
+  };
+  if (Array.isArray(server.args)) entry.args = server.args;
+  if (
+    server.env &&
+    typeof server.env === 'object' &&
+    Object.keys(server.env as object).length > 0
+  ) {
+    entry.env = server.env;
+  }
+  return entry;
+}
+
 // --- Routes ---
 
 // 单个 MCP server 字段上限：避免认证用户用一个深度对象 / 巨型 args 把
@@ -368,7 +528,8 @@ mcpServersRoutes.delete('/:id', authMiddleware, async (c) => {
 });
 
 // POST /sync-host — sync from host MCP configs (admin only)
-// Reads from both ~/.claude/settings.json and ~/.claude.json
+// Reads from ~/.claude/settings.json, ~/.claude.json, and the codex
+// config.toml at {shared codex home}（codex-only 主机上前两者通常不存在）.
 mcpServersRoutes.post('/sync-host', authMiddleware, async (c) => {
   const authUser = c.get('user') as AuthUser;
   if (authUser.role !== 'admin') {
@@ -404,13 +565,28 @@ mcpServersRoutes.post('/sync-host', authMiddleware, async (c) => {
     // File may not exist, that's OK
   }
 
+  // Source 3: {shared codex home}/config.toml 的 [mcp_servers.*]（codex 原生
+  // 配置；codex-only 主机上这是唯一非空来源）。codex 来源最后合并——ID 冲突时
+  // 胜出（codex-first 语义）。
+  const codexConfigPath = path.join(sharedCodexHomeDir(), 'config.toml');
+  try {
+    const raw = await fs.readFile(codexConfigPath, 'utf-8');
+    const codexServers = parseMcpServersFromToml(raw);
+    for (const [id, server] of Object.entries(codexServers)) {
+      hostServers[id] = codexServerToHostEntry(server);
+    }
+  } catch {
+    // File may not exist, that's OK
+  }
+
   if (Object.keys(hostServers).length === 0) {
     return c.json({
       added: 0,
       updated: 0,
       deleted: 0,
       skipped: 0,
-      message: 'No MCP servers found in host config files',
+      message:
+        'No MCP servers found in host config files (~/.claude/settings.json, ~/.claude.json, codex config.toml)',
     });
   }
 
@@ -489,4 +665,5 @@ mcpServersRoutes.post('/sync-host', authMiddleware, async (c) => {
 });
 
 export { getUserMcpServersDir, readMcpServersFile };
+// parseMcpServersFromToml 经函数声明处 export（回归测试直接消费）。
 export default mcpServersRoutes;

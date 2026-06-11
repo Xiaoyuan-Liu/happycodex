@@ -11,7 +11,7 @@
  *   无协调）。PoC 阶段可容忍；生产应集中一个 refresh owner（留待"接主仓"阶段）。
  */
 
-import { mkdir, copyFile, access, readFile, writeFile, rm } from 'node:fs/promises';
+import { mkdir, copyFile, access, readFile, writeFile, rm, rename } from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
 import * as path from 'node:path';
 
@@ -177,8 +177,11 @@ export class FsCodexHomeProvisioner implements ICodexHomeProvisioner {
     if (await this.exists(dest)) {
       existing = await readFile(dest, 'utf8');
     }
+    // 空文件视为可重写残留：手工接管的文档化方式是"删除 marker 行"（文件仍有内容），
+    // 空文件只可能是崩溃残留（如非原子写中断），不当作接管，否则投影永久静默丢失。
     const generatedByUs =
-      existing !== null && existing.startsWith(AGENTS_MD_GENERATED_MARKER);
+      existing !== null &&
+      (existing.startsWith(AGENTS_MD_GENERATED_MARKER) || existing.trim() === '');
     if (existing !== null && !generatedByUs) {
       return; // 用户手工接管：不覆盖、不删除。
     }
@@ -190,7 +193,10 @@ export class FsCodexHomeProvisioner implements ICodexHomeProvisioner {
     }
     const next = `${AGENTS_MD_GENERATED_MARKER}\n\n${content}\n`;
     if (existing === next) return; // 幂等：内容未变，免写盘。
-    await writeFile(dest, next, 'utf8');
+    // tmp+rename 原子写（同 routes/config.ts 的既有模式）：避免崩溃留下空/半截文件。
+    const tmp = `${dest}.tmp`;
+    await writeFile(tmp, next, 'utf8');
+    await rename(tmp, dest);
   }
 
   /**
@@ -206,8 +212,13 @@ export class FsCodexHomeProvisioner implements ICodexHomeProvisioner {
     if (await this.exists(configPath)) {
       content = await readFile(configPath, 'utf8');
     }
-    if (/^\s*project_doc_fallback_filenames\s*=/m.test(content)) {
-      return; // 幂等：键已存在（保留 per-folder 本地修改）。
+    // 幂等检测只看顶层区域（第一个表头之前）：表内同名键（如 [profiles.x] 内）不算
+    // 顶层键，不能据此跳过补写。用 /^\s*\[/m（TOML 允许表头前导空白）切出顶层区域，
+    // 与仓库"不解析整份 TOML，只做行式段头检测"的既有约定一致（见 mcp-toml.ts）。
+    const headerIdx = content.search(/^\s*\[/m);
+    const topLevel = headerIdx === -1 ? content : content.slice(0, headerIdx);
+    if (/^\s*project_doc_fallback_filenames\s*=/m.test(topLevel)) {
+      return; // 幂等：顶层键已存在（保留 per-folder 本地修改）。
     }
     const line = `project_doc_fallback_filenames = [${filenames
       .map((f) => tomlString(f))

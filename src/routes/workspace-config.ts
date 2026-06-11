@@ -1,10 +1,14 @@
 /**
  * Workspace-level Skills and MCP Servers management routes.
  *
- * Operates on the workspace's `.claude/` directory (project-level config).
- * SDK reads both 'project' and 'user' settingSources, so these configs
- * take effect alongside global (user-level) configs without any changes
- * to agent-runner or container-runner.
+ * tombstone（happycodex）：上游本路由写工作区 `.claude/`（settings.json + skills/），
+ * Claude SDK 以 settingSources=['project','user'] 读取即生效；host 模式 customCwd
+ * 时上游直接往真实用户仓库里写。codex 引擎不读 `.claude/`——workspace 级
+ * skills/MCP 的 codex 消费接线尚未落地（skills-materializer 四源 builtin/external/
+ * project/user 不含 workspace 源；config.toml [mcp_servers.*] 仅渲染 user 级
+ * loadUserMcpServers，见 container-runner.buildCodexHomeContext）。本路由当前仅
+ * 落盘管理面：成功响应显式带 effective:false + notice，不静默谎报生效；落盘根
+ * 永远是受管群组目录 {GROUPS_DIR}/{folder}/.claude/，绝不写 customCwd。
  */
 
 import { Hono, type Context } from 'hono';
@@ -17,6 +21,7 @@ import type { Variables } from '../web-context.js';
 import type { AuthUser, RegisteredGroup } from '../types.js';
 import { authMiddleware } from '../middleware/auth.js';
 import { GROUPS_DIR } from '../config.js';
+import { logger } from '../logger.js';
 import { validateSafeHttpsUrl } from '../url-safety.js';
 import { canAccessGroup, canModifyGroup } from '../web-context.js';
 import { getRegisteredGroup } from '../db.js';
@@ -35,16 +40,24 @@ const workspaceConfigRoutes = new Hono<{ Variables: Variables }>();
 // --- Path Resolution ---
 
 /**
- * Resolve the workspace root directory for a registered group.
- * Host mode with customCwd uses the real project directory;
- * otherwise falls back to data/groups/{folder}/.
+ * Resolve the workspace-config storage root for a registered group.
+ * tombstone（happycodex）：上游 host 模式 customCwd 时返回真实用户仓库目录
+ * （随后所有写路径落进用户项目的 .claude/）；codex 版恒用受管群组目录
+ * {GROUPS_DIR}/{folder}——绝不向 customCwd（用户自有目录）落盘，与
+ * skills-materializer 的物化边界同精神。
  */
 function getWorkspaceRoot(group: RegisteredGroup & { jid: string }): string {
-  if (group.executionMode === 'host' && group.customCwd) {
-    return group.customCwd;
-  }
   return path.join(GROUPS_DIR, group.folder);
 }
+
+/**
+ * codex 引擎尚未消费 workspace 级 skills/MCP（接线待落地：skills-materializer
+ * 增 workspace 源 / provisionCodexHome 的 mcpServers 合并 workspace 级条目）。
+ * 成功响应显式携带，避免管理面静默谎报生效。
+ */
+const WORKSPACE_CONFIG_NOTICE =
+  'Workspace-level skills/MCP are not yet consumed by the codex engine; ' +
+  'stored for future wiring only (effective: false)';
 
 function getWorkspaceClaudeDir(
   group: RegisteredGroup & { jid: string },
@@ -236,7 +249,7 @@ workspaceConfigRoutes.get(
 
     const skillsDir = getWorkspaceSkillsDir(group);
     const skills = scanSkillDirectory(skillsDir, 'workspace');
-    return c.json({ skills });
+    return c.json({ skills, notice: WORKSPACE_CONFIG_NOTICE });
   },
 );
 
@@ -334,7 +347,16 @@ workspaceConfigRoutes.post(
         fs.cpSync(realSrc, dest, { recursive: true });
       }
 
-      return c.json({ success: true, installed: installedEntries });
+      logger.info(
+        { group: group.name, installed: installedEntries },
+        'Workspace skill installed (not yet consumed by codex engine)',
+      );
+      return c.json({
+        success: true,
+        installed: installedEntries,
+        effective: false,
+        notice: WORKSPACE_CONFIG_NOTICE,
+      });
     } catch (error) {
       return c.json(
         {
@@ -400,7 +422,7 @@ workspaceConfigRoutes.patch(
     }
 
     fs.renameSync(srcPath, dstPath);
-    return c.json({ success: true });
+    return c.json({ success: true, effective: false, notice: WORKSPACE_CONFIG_NOTICE });
   },
 );
 
@@ -486,7 +508,7 @@ workspaceConfigRoutes.get(
       });
     }
 
-    return c.json({ servers });
+    return c.json({ servers, notice: WORKSPACE_CONFIG_NOTICE });
   },
 );
 
@@ -556,7 +578,16 @@ workspaceConfigRoutes.post(
     writeWorkspaceMeta(group, meta);
     syncMcpToSettings(group, meta);
 
-    return c.json({ success: true, server: { id, ...entry } });
+    logger.info(
+      { group: group.name, serverId: id },
+      'Workspace MCP server added (not yet consumed by codex engine)',
+    );
+    return c.json({
+      success: true,
+      server: { id, ...entry },
+      effective: false,
+      notice: WORKSPACE_CONFIG_NOTICE,
+    });
   },
 );
 
@@ -629,7 +660,12 @@ workspaceConfigRoutes.patch(
     writeWorkspaceMeta(group, meta);
     syncMcpToSettings(group, meta);
 
-    return c.json({ success: true, server: { id, ...entry } });
+    return c.json({
+      success: true,
+      server: { id, ...entry },
+      effective: false,
+      notice: WORKSPACE_CONFIG_NOTICE,
+    });
   },
 );
 
