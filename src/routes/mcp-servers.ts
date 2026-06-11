@@ -119,6 +119,46 @@ function parseTomlKey(raw: string): string {
 }
 
 /**
+ * 剥除 TOML 行注释（`#` 到行尾），但保留字符串字面量内的 `#`（含转义双引号串）。
+ * 用于数组分支：累积阶段 tomlArrayClosed 已按剔除注释判定闭合，但 parseTomlValue
+ * 原先对原始文本直接 lastIndexOf(']')，会把注释里的 `]` 误判为数组闭合
+ * （如 `args = ["-y"]  # see [stdio]`，或多行数组成员行尾注释含 `]`），
+ * 致合法 server 被 fail-closed 丢弃。剥注释后再定位闭合 `]` 与逐成员解析，
+ * 与标量分支「容忍行尾注释」语义一致。
+ */
+function stripTomlComments(s: string): string {
+  let out = '';
+  let inStr = false;
+  let quote = '';
+  for (let k = 0; k < s.length; k++) {
+    const c = s[k]!;
+    if (inStr) {
+      out += c;
+      // 双引号 basic string 内 `\x` 为转义：原样保留转义对，不在其中断字符串。
+      if (c === '\\' && quote === '"' && k + 1 < s.length) {
+        out += s[k + 1];
+        k++;
+        continue;
+      }
+      if (c === quote) inStr = false;
+    } else if (c === '"' || c === "'") {
+      inStr = true;
+      quote = c;
+      out += c;
+    } else if (c === '#') {
+      // 注释到行尾：丢弃 `#`..`\n`，保留换行（维持成员间分隔）。
+      const nl = s.indexOf('\n', k);
+      if (nl < 0) break; // 注释到 EOF，余下全丢
+      out += '\n';
+      k = nl;
+    } else {
+      out += c;
+    }
+  }
+  return out;
+}
+
+/**
  * 解析 TOML 标量值（基本/字面字符串 / 布尔 / 数字 / 字符串数组 / inline table）。
  * 数组值可能已由调用方累积为多行文本（TOML 允许数组跨行）。
  * 解析失败返回 undefined（调用方记 warning，消费键失败则跳过整个 server）。
@@ -142,9 +182,11 @@ function parseTomlValue(raw: string): unknown {
     // 裸 token（数字/布尔/嵌套等非字符串成员），整体解析失败返回 undefined，
     // 由调用方记 warning 并（args 属 CONSUMED_SERVER_KEYS）跳过整个 server，
     // 而非静默吞掉该成员产出残缺 args（CR#3：消灭「无声丢元素」）。
-    const close = v.lastIndexOf(']');
+    // 先剥注释再定位闭合 `]`：避免注释里的 `]`（行尾或多行成员行）被误判为数组闭合。
+    const stripped = stripTomlComments(v);
+    const close = stripped.lastIndexOf(']');
     if (close < 0) return undefined;
-    const inner = v.slice(1, close).trim();
+    const inner = stripped.slice(1, close).trim();
     if (inner === '') return [];
     const out: string[] = [];
     // 逐成员（top-level 逗号分隔）匹配带引号字符串；任一成员不匹配 → 失败。

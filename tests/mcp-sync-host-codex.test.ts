@@ -285,6 +285,64 @@ describe('parseMcpServersFromToml', () => {
     expect(warnings).toContainEqual({ server: 'mixed', key: 'args', fatal: true });
     expect(servers.clean).toMatchObject({ command: 'uvx', args: ['ok'] });
   });
+
+  // ── review 轮 4：数组分支行尾/行内注释含 ] 不得误判闭合（fail-closed 误丢） ──
+
+  test('args 行尾注释含 ] 字符：仍正确解析（不被注释里的 ] 误判闭合）', async () => {
+    const { parseMcpServersFromToml } = await import(
+      '../src/routes/mcp-servers.js'
+    );
+    const toml = [
+      '[mcp_servers.commented]',
+      'command = "npx"',
+      'args = ["-y", "@scope/server"]  # launches via npx [stdio]',
+    ].join('\n');
+
+    const warnings: Array<{ server: string; key: string; fatal: boolean }> = [];
+    const servers = parseMcpServersFromToml(toml, (w) => warnings.push(w));
+    expect(servers.commented).toMatchObject({
+      command: 'npx',
+      args: ['-y', '@scope/server'],
+    });
+    expect(warnings).toHaveLength(0);
+  });
+
+  test('多行数组成员行尾注释（含 ] 字符）：完整解析', async () => {
+    const { parseMcpServersFromToml } = await import(
+      '../src/routes/mcp-servers.js'
+    );
+    const toml = [
+      '[mcp_servers.multi-commented]',
+      'command = "npx"',
+      'args = [',
+      '  "-y",          # the -y flag [auto-confirm]',
+      '  "@scope/srv",  # package',
+      ']',
+    ].join('\n');
+
+    const servers = parseMcpServersFromToml(toml);
+    expect(servers['multi-commented']).toMatchObject({
+      command: 'npx',
+      args: ['-y', '@scope/srv'],
+    });
+  });
+
+  test('字符串成员内的 # 不被当作注释剥除', async () => {
+    const { parseMcpServersFromToml } = await import(
+      '../src/routes/mcp-servers.js'
+    );
+    const toml = [
+      '[mcp_servers.hash]',
+      'command = "npx"',
+      'args = ["--tag=a#b", "x"]',
+    ].join('\n');
+
+    const servers = parseMcpServersFromToml(toml);
+    expect(servers.hash).toMatchObject({
+      command: 'npx',
+      args: ['--tag=a#b', 'x'],
+    });
+  });
 });
 
 describe('POST /sync-host — codex config.toml 来源', () => {
