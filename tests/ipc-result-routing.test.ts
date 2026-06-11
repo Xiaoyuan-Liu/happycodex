@@ -124,6 +124,39 @@ describe('resolveSendFileAnchor (CR#8 customCwd 锚点)', () => {
     expect(a.workspaceBase).toBe(path.join(groupsDir, 'g1'));
     expect(a.allowedRoots).toEqual([path.join(groupsDir, 'g1')]);
   });
+
+  it('host + customCwd 含 symlink 段：workspaceBase 归一为 realpath（与 container-runner 注入逐字符同源）', () => {
+    const realRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'hc-anchor-'));
+    try {
+      const realCwd = path.join(realRoot, 'project');
+      fs.mkdirSync(realCwd);
+      const linkedCwd = path.join(realRoot, 'project-link');
+      fs.symlinkSync(realCwd, linkedCwd);
+      const a = resolveSendFileAnchor({
+        groupsDir,
+        sourceGroup: 'g1',
+        executionMode: 'host',
+        customCwd: linkedCwd, // 经 symlink 的 customCwd
+      });
+      // 归一到真实路径（= container-runner runHostAgent fs.realpathSync 注入值），
+      // 而非传入的 symlink 词法路径——消除消费端/生产端锚点分叉。
+      expect(a.workspaceBase).toBe(fs.realpathSync(linkedCwd));
+      expect(a.allowedRoots[0]).toBe(fs.realpathSync(linkedCwd));
+    } finally {
+      fs.rmSync(realRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('host + customCwd 不存在：回退 path.resolve，不抛错', () => {
+    const ghost = path.join(os.tmpdir(), 'hc-anchor-ghost-not-there');
+    const a = resolveSendFileAnchor({
+      groupsDir,
+      sourceGroup: 'g1',
+      executionMode: 'host',
+      customCwd: ghost,
+    });
+    expect(a.workspaceBase).toBe(path.resolve(ghost));
+  });
 });
 
 describe('isRealPathWithinRoots (CR#2 symlink 物理校验)', () => {
@@ -146,7 +179,8 @@ describe('isRealPathWithinRoots (CR#2 symlink 物理校验)', () => {
   it('工作区内常规文件：通过', () => {
     const f = path.join(workspace, 'report.pdf');
     fs.writeFileSync(f, 'data');
-    expect(isRealPathWithinRoots(f, [workspace])).toBe(true);
+    // 返回校验通过的真实路径（常规文件 realpath === 自身）。
+    expect(isRealPathWithinRoots(f, [workspace])).toBe(fs.realpathSync(f));
   });
 
   it('工作区内 symlink 指向外部文件：拒绝（CR#2 核心回归）', () => {
@@ -156,7 +190,7 @@ describe('isRealPathWithinRoots (CR#2 symlink 物理校验)', () => {
     fs.symlinkSync(secret, link);
     // 词法校验会放行（link 路径在 workspace 内），物理校验必须拒绝
     expect(link.startsWith(workspace + path.sep)).toBe(true);
-    expect(isRealPathWithinRoots(link, [workspace])).toBe(false);
+    expect(isRealPathWithinRoots(link, [workspace])).toBeNull();
   });
 
   it('工作区内 symlink 目录穿透到外部：拒绝', () => {
@@ -166,7 +200,7 @@ describe('isRealPathWithinRoots (CR#2 symlink 物理校验)', () => {
     fs.writeFileSync(secret, 'leak');
     expect(
       isRealPathWithinRoots(path.join(linkDir, 'leak.txt'), [workspace]),
-    ).toBe(false);
+    ).toBeNull();
   });
 
   it('工作区内相对 symlink 指向工作区内文件：通过（合法用法不误杀）', () => {
@@ -174,7 +208,8 @@ describe('isRealPathWithinRoots (CR#2 symlink 物理校验)', () => {
     fs.writeFileSync(real, 'ok');
     const link = path.join(workspace, 'alias.txt');
     fs.symlinkSync('real.txt', link);
-    expect(isRealPathWithinRoots(link, [workspace])).toBe(true);
+    // 合法的工作区内 symlink：返回解析后的真实文件（= real，非 link 词法路径）。
+    expect(isRealPathWithinRoots(link, [workspace])).toBe(fs.realpathSync(real));
   });
 
   it('根路径自身含 symlink（如 macOS /var → /private/var）：先 realpath 根再比较，不误拒', () => {
@@ -183,7 +218,7 @@ describe('isRealPathWithinRoots (CR#2 symlink 物理校验)', () => {
     const f = path.join(workspace, 'file.txt');
     fs.writeFileSync(f, 'x');
     // 用 symlink 形式的根校验真实文件
-    expect(isRealPathWithinRoots(f, [linkedRoot])).toBe(true);
+    expect(isRealPathWithinRoots(f, [linkedRoot])).toBe(fs.realpathSync(f));
   });
 
   it('多根（host+customCwd 双根）：downloads 兜底命中默认组目录也通过', () => {
@@ -193,27 +228,27 @@ describe('isRealPathWithinRoots (CR#2 symlink 物理校验)', () => {
     fs.mkdirSync(dl, { recursive: true });
     const f = path.join(dl, 'doc.docx');
     fs.writeFileSync(f, 'x');
-    expect(isRealPathWithinRoots(f, [custom, workspace])).toBe(true);
+    expect(isRealPathWithinRoots(f, [custom, workspace])).toBe(fs.realpathSync(f));
     // 但两根之外仍拒绝
     const out = path.join(outside, 'o.txt');
     fs.writeFileSync(out, 'x');
-    expect(isRealPathWithinRoots(out, [custom, workspace])).toBe(false);
+    expect(isRealPathWithinRoots(out, [custom, workspace])).toBeNull();
   });
 
   it('目标不存在 / 悬空 symlink：拒绝', () => {
     expect(
       isRealPathWithinRoots(path.join(workspace, 'missing.txt'), [workspace]),
-    ).toBe(false);
+    ).toBeNull();
     const dangling = path.join(workspace, 'dangling');
     fs.symlinkSync(path.join(outside, 'gone.txt'), dangling);
-    expect(isRealPathWithinRoots(dangling, [workspace])).toBe(false);
+    expect(isRealPathWithinRoots(dangling, [workspace])).toBeNull();
   });
 
   it('某个允许根不存在：跳过该根而非误放行/抛错', () => {
     const ghost = path.join(root, 'ghost-root');
     const f = path.join(workspace, 'f.txt');
     fs.writeFileSync(f, 'x');
-    expect(isRealPathWithinRoots(f, [ghost, workspace])).toBe(true);
-    expect(isRealPathWithinRoots(f, [ghost])).toBe(false);
+    expect(isRealPathWithinRoots(f, [ghost, workspace])).toBe(fs.realpathSync(f));
+    expect(isRealPathWithinRoots(f, [ghost])).toBeNull();
   });
 });

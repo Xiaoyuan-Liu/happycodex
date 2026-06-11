@@ -53,6 +53,12 @@ export interface SendFileAnchor {
  * CR#8：按 RegisteredGroup 的 executionMode/customCwd 推导 send_file 消费端锚点。
  * 与 container-runner.ts runHostAgent 的 `groupDir = customCwd || GROUPS_DIR/{folder}`
  * 同源；container 模式（默认）恒为默认组目录，customCwd 不生效。
+ *
+ * host+customCwd 分支对 customCwd 做 fs.realpathSync 归一，与 container-runner.ts
+ * runHostAgent（:934 `groupDir = fs.realpathSync(groupDir)` 后注入 HAPPYCLAW_WORKSPACE_GROUP）
+ * 逐字符同源——消除「消费端用原始 customCwd、生产端用 realpath(customCwd)」的锚点分叉
+ * （customCwd 含 symlink 段如 macOS /tmp→/private/tmp 时分叉，未来对两锚做词法 path
+ * 运算会错配）。归一失败（路径不存在）回退 path.resolve，不抛错。
  */
 export function resolveSendFileAnchor(opts: {
   groupsDir: string;
@@ -61,10 +67,16 @@ export function resolveSendFileAnchor(opts: {
   customCwd?: string;
 }): SendFileAnchor {
   const defaultGroupBase = path.join(opts.groupsDir, opts.sourceGroup);
-  const workspaceBase =
-    (opts.executionMode || 'container') === 'host' && opts.customCwd
-      ? opts.customCwd
-      : defaultGroupBase;
+  let workspaceBase: string;
+  if ((opts.executionMode || 'container') === 'host' && opts.customCwd) {
+    try {
+      workspaceBase = fs.realpathSync(opts.customCwd);
+    } catch {
+      workspaceBase = path.resolve(opts.customCwd);
+    }
+  } else {
+    workspaceBase = defaultGroupBase;
+  }
   const allowedRoots =
     workspaceBase === defaultGroupBase
       ? [defaultGroupBase]
@@ -75,18 +87,22 @@ export function resolveSendFileAnchor(opts: {
 /**
  * CR#2：realpath 物理校验——targetPath 解析 symlink 后的真实位置必须仍在任一允许根内。
  * 根自身也 realpath（参照 ipc-bridge.ts memoryGet 范式），避免根路径上游含 symlink
- * （如 macOS /var → /private/var）时前缀比较偏差。targetPath 不存在/不可解析 → false；
- * 某个根不存在则跳过该根（根都不存在时其内不可能有合法文件）。
+ * （如 macOS /var → /private/var）时前缀比较偏差。某个根不存在则跳过该根（根都不存在
+ * 时其内不可能有合法文件）。
+ *
+ * 返回校验通过的**真实路径**（realpath 后），调用方应拿它去 read/send——而非把原 targetPath
+ * 再交给下游（下游 readFile 会二次跟随 symlink，与本次校验解析出的 inode 不必是同一个，
+ * 留下 TOCTOU 窗口：校验通过后换链即可外发）。targetPath 不存在/不可解析、或越界 → null。
  */
 export function isRealPathWithinRoots(
   targetPath: string,
   roots: string[],
-): boolean {
+): string | null {
   let real: string;
   try {
     real = fs.realpathSync(targetPath);
   } catch {
-    return false;
+    return null;
   }
   for (const root of roots) {
     let realRoot: string;
@@ -96,8 +112,8 @@ export function isRealPathWithinRoots(
       continue;
     }
     if (real === realRoot || real.startsWith(realRoot + path.sep)) {
-      return true;
+      return real;
     }
   }
-  return false;
+  return null;
 }

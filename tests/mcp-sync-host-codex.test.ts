@@ -232,6 +232,59 @@ describe('parseMcpServersFromToml', () => {
       fatal: true,
     });
   });
+
+  // ── review 轮 3：#4 未闭合数组不得吞掉后续段；#3 非字符串成员 fail-closed ──
+
+  test('未闭合数组后紧跟新段：当前 server 剔除，后续段不被吞掉（peek-ahead 守卫）', async () => {
+    const { parseMcpServersFromToml } = await import(
+      '../src/routes/mcp-servers.js'
+    );
+    const toml = [
+      // alpha 的 args 缺闭合 ]，下一行直接是新段头
+      '[mcp_servers.alpha]',
+      'command = "npx"',
+      'args = [',
+      '  "-y",',
+      '[mcp_servers.beta]',
+      'command = "uvx"',
+      'args = ["b"]',
+      '',
+      '[mcp_servers.gamma]',
+      'command = "node"',
+      'args = ["g.js"]',
+    ].join('\n');
+
+    const warnings: Array<{ server: string; key: string; fatal: boolean }> = [];
+    const servers = parseMcpServersFromToml(toml, (w) => warnings.push(w));
+    // alpha 未闭合 → fail-closed 剔除 + fatal warning
+    expect(servers.alpha).toBeUndefined();
+    expect(warnings).toContainEqual({ server: 'alpha', key: 'args', fatal: true });
+    // beta / gamma 都完整存活（旧 bug 会把它们吞进 alpha.args 而丢失）
+    expect(servers.beta).toMatchObject({ command: 'uvx', args: ['b'] });
+    expect(servers.gamma).toMatchObject({ command: 'node', args: ['g.js'] });
+  });
+
+  test('数组含非字符串成员（混合类型）→ fail-closed，整个 server 剔除（不静默丢元素）', async () => {
+    const { parseMcpServersFromToml } = await import(
+      '../src/routes/mcp-servers.js'
+    );
+    const toml = [
+      '[mcp_servers.mixed]',
+      'command = "npx"',
+      'args = ["a", 5, "b"]',
+      '',
+      '[mcp_servers.clean]',
+      'command = "uvx"',
+      'args = ["ok"]',
+    ].join('\n');
+
+    const warnings: Array<{ server: string; key: string; fatal: boolean }> = [];
+    const servers = parseMcpServersFromToml(toml, (w) => warnings.push(w));
+    // 旧行为：args 静默变 ['a','b']，5 被吞；新行为：整体失败 + server 剔除
+    expect(servers.mixed).toBeUndefined();
+    expect(warnings).toContainEqual({ server: 'mixed', key: 'args', fatal: true });
+    expect(servers.clean).toMatchObject({ command: 'uvx', args: ['ok'] });
+  });
 });
 
 describe('POST /sync-host — codex config.toml 来源', () => {

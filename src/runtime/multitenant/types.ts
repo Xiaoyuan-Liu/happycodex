@@ -54,7 +54,8 @@ export interface ManagedSessionHandle {
 export interface SessionManagerOptions {
   /** 运行时数据根目录（sessions/ipc/memory 都在其下）。 */
   dataDir: string;
-  /** 共享 auth 源目录（默认取 process.env.CODEX_HOME || ~/.codex）。 */
+  /** 共享 auth 源目录（默认 codex-paths.sharedCodexHomeDir()：
+   *  HAPPYCODEX_SHARED_CODEX_HOME > CODEX_HOME > ~/.codex）。 */
   sharedCodexHome?: string;
   /** codex 可执行文件名，默认 'codex'。 */
   codexBin?: string;

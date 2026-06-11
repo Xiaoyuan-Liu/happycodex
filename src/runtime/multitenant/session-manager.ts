@@ -22,7 +22,6 @@
  *   容量计 entries+creating，防并发突发超额 spawn。#4/#5/#10
  */
 
-import os from 'node:os';
 import path from 'node:path';
 
 import type {
@@ -47,6 +46,7 @@ import { ToolRegistry } from '../tools/registry.js';
 import { createBuiltinTools } from '../tools/builtin.js';
 import { IpcToolBridge } from '../tools/ipc-bridge.js';
 import { ToolDispatcher } from '../tools/dispatcher.js';
+import { sharedCodexHomeDir } from '../../codex-paths.js';
 
 export interface SessionManagerDeps {
   store?: ISessionStore;
@@ -87,8 +87,11 @@ const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
  */
 const STANDALONE_POLL_TIMEOUT_MS = 3_000;
 
+// 委托单一真相源（codex-paths）：与 config/container-runner/sdk-query/mcp-servers
+// 同一三级链 HAPPYCODEX_SHARED_CODEX_HOME > CODEX_HOME > ~/.codex（CR#5：消除最后
+// 一处分叉副本，原实现仅 CODEX_HOME > ~/.codex 漏了顶层覆盖键）。
 function defaultSharedCodexHome(): string {
-  return process.env['CODEX_HOME'] ?? path.join(os.homedir(), '.codex');
+  return sharedCodexHomeDir();
 }
 
 export class SessionManager implements ISessionManager {

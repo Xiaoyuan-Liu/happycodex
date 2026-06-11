@@ -5766,7 +5766,16 @@ async function processTaskIpc(
           // follow symlinks, so a workspace-internal `evil -> /etc/...` link
           // would otherwise exfiltrate arbitrary host files. Applies to the
           // downloads-fallback path too.
-          if (!isRealPathWithinRoots(resolvedPath, anchor.allowedRoots)) {
+          // Use the returned realpath (not the lexical resolvedPath) for the
+          // actual send: passing the lexical path lets the OS re-follow the
+          // symlink at readFile time, reopening a TOCTOU window where a swap
+          // between this check and the channel read exfiltrates an out-of-root
+          // file. realFilePath is the exact inode validated here.
+          const realFilePath = isRealPathWithinRoots(
+            resolvedPath,
+            anchor.allowedRoots,
+          );
+          if (!realFilePath) {
             const escapeMsg = `⚠️ 文件 "${data.fileName}" 的真实位置在工作区之外（symlink 越界），已拒绝发送。`;
             broadcastToWebClients(sourceGroup, escapeMsg);
             const escapeImRoute = resolveImRoute({
@@ -5796,9 +5805,11 @@ async function processTaskIpc(
             sourceGroup,
           });
           if (fileImRoute) {
+            // Display name stays lexical (data.fileName / basename of the path
+            // the agent referenced); only the bytes-on-disk path is realFilePath.
             const imFileName = data.fileName || path.basename(resolvedPath);
             const sent = await retryImOperation('send_file', fileImRoute, () =>
-              imManager.sendFile(fileImRoute, resolvedPath, imFileName),
+              imManager.sendFile(fileImRoute, realFilePath, imFileName),
             );
             if (!sent) {
               const failMsg = `⚠️ 文件 "${data.fileName}" 发送失败，请稍后重试。`;

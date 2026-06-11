@@ -138,16 +138,24 @@ function parseTomlValue(raw: string): unknown {
   if (v === 'false') return false;
   if (/^-?\d+(\.\d+)?\s*(?:#.*)?$/.test(v)) return Number(v.replace(/#.*$/, '').trim());
   if (v.startsWith('[')) {
-    // 字符串数组（args 等，基本/字面串成员均支持）；
-    // 非字符串成员的数组对 hostEntry 形状无意义，跳过。
+    // 字符串数组（args 等）。fail-closed：成员必须全是带引号字符串——若出现
+    // 裸 token（数字/布尔/嵌套等非字符串成员），整体解析失败返回 undefined，
+    // 由调用方记 warning 并（args 属 CONSUMED_SERVER_KEYS）跳过整个 server，
+    // 而非静默吞掉该成员产出残缺 args（CR#3：消灭「无声丢元素」）。
     const close = v.lastIndexOf(']');
     if (close < 0) return undefined;
-    const inner = v.slice(1, close);
+    const inner = v.slice(1, close).trim();
+    if (inner === '') return [];
     const out: string[] = [];
-    const re = /"((?:[^"\\]|\\.)*)"|'([^']*)'/g;
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(inner)) !== null) {
+    // 逐成员（top-level 逗号分隔）匹配带引号字符串；任一成员不匹配 → 失败。
+    const memberRe = /\s*(?:"((?:[^"\\]|\\.)*)"|'([^']*)')\s*(?:,|$)/y;
+    let idx = 0;
+    while (idx < inner.length) {
+      memberRe.lastIndex = idx;
+      const m = memberRe.exec(inner);
+      if (!m) return undefined; // 非字符串成员 → fail-closed
       out.push(m[1] !== undefined ? unescapeTomlString(m[1]) : (m[2] ?? ''));
+      idx = memberRe.lastIndex;
     }
     return out;
   }
@@ -265,6 +273,12 @@ export function parseMcpServersFromToml(
     // inline table 在 TOML 1.0 中禁止跨行，无需同等处理。
     if (valueRaw.trimStart().startsWith('[')) {
       while (!tomlArrayClosed(valueRaw) && i + 1 < lines.length) {
+        // 续行若是新 TOML 段头（[mcp_servers.x] / [model] / …）则绝非数组成员
+        // （渲染器/codex 的数组成员都是带引号字符串）。在此停手，不把它吞进
+        // valueRaw：数组保持未闭合 → parseTomlValue 返回 undefined → 该 server
+        // fatal warning + fail-closed 跳过，后续段照常解析（CR#4：消灭「缺 ]
+        // 的非法数组吞掉文件剩余所有段」）。
+        if ((lines[i + 1] ?? '').trim().startsWith('[')) break;
         i++;
         valueRaw += '\n' + (lines[i] ?? '');
       }
