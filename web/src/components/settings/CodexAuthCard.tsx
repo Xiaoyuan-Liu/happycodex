@@ -51,6 +51,7 @@ export function CodexAuthCard() {
     submitApiKey,
     submitAccessToken,
     startDeviceAuth,
+    startBrowserLogin,
     logout,
     resetDevice,
     subscribeDeviceAuth,
@@ -108,13 +109,25 @@ export function CodexAuthCard() {
     setStartingDevice(true);
     try {
       await startDeviceAuth();
-      toast.info('已发起 ChatGPT 登录，请稍候获取授权链接…');
+      toast.info('已发起设备码登录，请稍候获取授权链接…');
     } catch (err) {
-      toast.error(getErrorMessage(err, '发起 ChatGPT 登录失败'));
+      toast.error(getErrorMessage(err, '发起设备码登录失败'));
     } finally {
       setStartingDevice(false);
     }
   }, [startDeviceAuth]);
+
+  const handleStartBrowser = useCallback(async () => {
+    setStartingDevice(true);
+    try {
+      await startBrowserLogin();
+      toast.info('已发起浏览器登录，浏览器应会自动打开授权页…');
+    } catch (err) {
+      toast.error(getErrorMessage(err, '发起浏览器登录失败'));
+    } finally {
+      setStartingDevice(false);
+    }
+  }, [startBrowserLogin]);
 
   const handleRetryDevice = useCallback(async () => {
     resetDevice();
@@ -357,16 +370,16 @@ export function CodexAuthCard() {
             <TabsTrigger value="access_token">Access Token</TabsTrigger>
           </TabsList>
 
-          {/* ─── ChatGPT 登录（device-auth）─── */}
+          {/* ─── ChatGPT 登录（浏览器 / 设备码）─── */}
           <TabsContent value="chatgpt" className="pt-3 space-y-3">
             <p className="text-xs text-muted-foreground">
-              点击下方按钮后，在打开的页面登录 ChatGPT，并在页面中输入展示的验证码完成授权。
-              授权链接与验证码通过实时推送展示，无需手动刷新。
+              用你自己的 ChatGPT 账号登录 codex。本机部署推荐「浏览器登录」（自动开浏览器、点一下即可）；
+              远程/无头服务器用「设备码登录」（在任意设备打开链接 + 输验证码）。
             </p>
 
             {device.phase === 'pending' && (
               <div className="rounded-lg border border-border bg-muted/20 p-4 space-y-3">
-                {device.verificationUri && device.userCode ? (
+                {device.verificationUri ? (
                   <>
                     <div className="text-sm font-medium text-foreground">
                       请完成 ChatGPT 授权
@@ -405,26 +418,32 @@ export function CodexAuthCard() {
                         </Button>
                       </div>
                     </div>
-                    <div className="space-y-2">
-                      <Label className="text-xs text-muted-foreground">
-                        验证码
-                      </Label>
-                      <div className="flex items-center gap-2">
-                        <code className="flex-1 rounded bg-muted px-2 py-1.5 text-base font-mono tracking-widest">
-                          {device.userCode}
-                        </code>
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          onClick={() =>
-                            copyToClipboard(device.userCode!, '验证码')
-                          }
-                          title="复制验证码"
-                        >
-                          <Copy className="size-4" />
-                        </Button>
+                    {device.userCode ? (
+                      <div className="space-y-2">
+                        <Label className="text-xs text-muted-foreground">
+                          验证码
+                        </Label>
+                        <div className="flex items-center gap-2">
+                          <code className="flex-1 rounded bg-muted px-2 py-1.5 text-base font-mono tracking-widest">
+                            {device.userCode}
+                          </code>
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() =>
+                              copyToClipboard(device.userCode!, '验证码')
+                            }
+                            title="复制验证码"
+                          >
+                            <Copy className="size-4" />
+                          </Button>
+                        </div>
                       </div>
-                    </div>
+                    ) : (
+                      <p className="text-xs text-muted-foreground">
+                        浏览器应已自动打开授权页；若没有，点击上方链接登录即可（无需验证码）。
+                      </p>
+                    )}
                     <div className="flex items-center gap-2 text-xs text-muted-foreground">
                       <Loader2 className="size-3.5 animate-spin" />
                       等待授权完成…
@@ -466,14 +485,24 @@ export function CodexAuthCard() {
             )}
 
             {(device.phase === 'idle' || device.phase === 'authorized') && (
-              <Button onClick={handleStartDevice} disabled={startingDevice}>
-                {startingDevice ? (
-                  <Loader2 className="size-4 animate-spin" />
-                ) : (
-                  <ExternalLink className="size-4" />
-                )}
-                {device.phase === 'authorized' ? '重新登录 ChatGPT' : '用 ChatGPT 登录'}
-              </Button>
+              <div className="flex flex-wrap items-center gap-2">
+                <Button onClick={handleStartBrowser} disabled={startingDevice}>
+                  {startingDevice ? (
+                    <Loader2 className="size-4 animate-spin" />
+                  ) : (
+                    <ExternalLink className="size-4" />
+                  )}
+                  {device.phase === 'authorized' ? '重新用浏览器登录' : '浏览器登录（本机推荐）'}
+                </Button>
+                <Button
+                  variant="outline"
+                  onClick={handleStartDevice}
+                  disabled={startingDevice}
+                  title="远程/无头服务器用；需在 ChatGPT 安全设置启用设备代码授权"
+                >
+                  设备码登录
+                </Button>
+              </div>
             )}
           </TabsContent>
 

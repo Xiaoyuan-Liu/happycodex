@@ -101,6 +101,8 @@ interface CodexAuthState {
   submitApiKey: (apiKey: string, force?: boolean) => Promise<void>;
   submitAccessToken: (accessToken: string) => Promise<void>;
   startDeviceAuth: () => Promise<void>;
+  /** 标准浏览器登录（本机推荐）：POST /browser/start，URL 经同一 WS 事件推。 */
+  startBrowserLogin: () => Promise<void>;
   logout: () => Promise<void>;
   /** 重置 device-auth 流程状态（重试前清场）。 */
   resetDevice: () => void;
@@ -156,6 +158,22 @@ export const useCodexAuthStore = create<CodexAuthState>((set, get) => ({
     set({ device: { phase: 'pending' } });
     try {
       await api.post('/api/config/codex/auth/device/start', {});
+    } catch (err) {
+      set({
+        device: {
+          phase: 'error',
+          error: err instanceof Error ? err.message : String(err),
+        },
+      });
+      throw err;
+    }
+  },
+
+  startBrowserLogin: async () => {
+    // 标准浏览器登录：codex 自动开浏览器，授权 URL 经同一 WS 事件推（无短码）作兜底。
+    set({ device: { phase: 'pending' } });
+    try {
+      await api.post('/api/config/codex/auth/browser/start', {});
     } catch (err) {
       set({
         device: {

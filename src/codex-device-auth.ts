@@ -46,24 +46,39 @@ const DEVICE_AUTH_EXPIRES_SEC = 900;
 // eslint-disable-next-line no-control-regex
 const ANSI_ESCAPE_RE = /\x1b\[[0-9;]*[A-Za-z]/g;
 
+/** 登录模式：device=设备码（远程友好，需账户开关）；browser=标准浏览器回调（本机推荐）。 */
+export type CodexLoginMode = 'device' | 'browser';
+
 /**
- * 从一段输出里抓 verification URL + 紧邻的 user code。
- * codex 0.137.0 device-auth 打印形如 `https://auth.openai.com/codex/device` +
- * 一个短码（如 `ABCD-1234`）。先剥 ANSI 颜色码，再用宽松正则：抓首个 https URL，
- * 再抓一个看起来像短码的 token，避免误抓纯数字端口/时间。
+ * 从 codex 输出里抓 verification URL（+ device 模式的 user code）。先剥 ANSI 颜色码。
+ * - device：`https://auth.openai.com/codex/device` + 短码（如 `ABCD-1234`）。URL 剥 query
+ *   （只需端点）、抓短码。
+ * - browser：`codex login` 打印 `https://auth.openai.com/oauth/authorize?...` 完整授权 URL
+ *   （含 redirect_uri/code_challenge/state 等 PKCE 参数，**保留 query 不可剥**，这正是用户要
+ *   在浏览器打开的地址）+ 一行 `http://localhost:1455` 本地回调服务地址（要跳过它）。无短码。
  */
-function parseVerification(rawText: string): {
-  verificationUri?: string;
-  userCode?: string;
-} {
+function parseVerification(
+  rawText: string,
+  mode: CodexLoginMode,
+): { verificationUri?: string; userCode?: string } {
   const text = rawText.replace(ANSI_ESCAPE_RE, '');
   const out: { verificationUri?: string; userCode?: string } = {};
+
+  if (mode === 'browser') {
+    // 优先 authorize URL（跳过 http://localhost:1455 本地服务地址）；保留完整 query。
+    const m =
+      text.match(/https:\/\/[^\s'"]*authorize[^\s'"]*/) ??
+      text.match(/https:\/\/[^\s'"]+/);
+    if (m) out.verificationUri = m[0].replace(/[.,);'"]+$/, '');
+    return out;
+  }
+
+  // device 模式：剥 query + 抓短码。
   const urlMatch = text.match(/https?:\/\/[^\s'"]+/);
   if (urlMatch) {
-    // 去掉尾随标点（句号 / 逗号 / 右括号）。
     let u = urlMatch[0].replace(/[.,);'"]+$/, '');
-    // 只保留 origin+pathname，剥去 query/fragment：防止 codex 万一把凭据带进 URL 被原样
-    // 转发到前端/WS（device-auth 只需 device 端点 URL；user code 已单独提取展示）。
+    // 只保留 origin+pathname，剥去 query/fragment（device 端点不需要 query；防 codex 万一
+    // 把凭据带进 URL 被原样转发；user code 已单独提取展示）。
     try {
       const parsed = new URL(u);
       u = parsed.origin + parsed.pathname;
@@ -72,7 +87,6 @@ function parseVerification(rawText: string): {
     }
     out.verificationUri = u;
   }
-  // 短码：优先匹配带连字符的 XXXX-XXXX 形态，退化到一段 6-10 位大写字母数字。
   const dashCode = text.match(/\b[A-Z0-9]{3,6}-[A-Z0-9]{3,6}\b/);
   if (dashCode) {
     out.userCode = dashCode[0];
@@ -121,17 +135,21 @@ function killTree(child: ChildProcess, signal: NodeJS.Signals = 'SIGTERM'): void
 }
 
 /**
- * 启动（或复用）某 userId 的 device-auth 流程。
+ * 启动（或复用）某 userId 的 codex 登录流程。
  *
+ * - mode='device'：`codex login --device-auth`，解析 URL + 短码（远程友好，需账户设备码开关）。
+ * - mode='browser'：`codex login`（标准浏览器回调，本机推荐）——codex 起 localhost:1455 回调服务、
+ *   自动开浏览器，并打印授权 URL；我们把 URL 经 WS 推前端作兜底。本机浏览器+服务同机时回调直达。
  * - 同一 userId 已有 in-flight：kill 旧进程后重新 start（用户重试时不残留僵尸）。
  * - 非法 userId 由 userCodexHomeDir 抛错（调用方应已校验或捕获）。
- * - onUpdate 推送序列：pending（抓到 URL/码后）→ authorized | error | expired。
+ * - onUpdate 推送序列：pending（抓到 URL[/码]后）→ authorized | error | expired。
  */
-export function startDeviceAuth(
+export function startCodexLogin(
   userId: string,
   onUpdate: CodexDeviceAuthUpdate,
-  opts: { codexBin?: string } = {},
+  opts: { mode?: CodexLoginMode; codexBin?: string } = {},
 ): void {
+  const mode: CodexLoginMode = opts.mode ?? 'device';
   // 复用 / 抢占：先终结旧流程（不向旧 onUpdate 再推，直接清理）。
   const existing = inflight.get(userId);
   if (existing && !existing.done) {
@@ -149,16 +167,17 @@ export function startDeviceAuth(
   try {
     fs.mkdirSync(codexHome, { recursive: true });
   } catch (err) {
-    logger.warn({ err, userId }, 'codex device-auth: failed to create CODEX_HOME');
+    logger.warn({ err, userId }, 'codex login: failed to create CODEX_HOME');
     onUpdate({ status: 'error', error: 'Failed to prepare codex home' });
     return;
   }
 
+  const args = mode === 'browser' ? ['login'] : ['login', '--device-auth'];
   let child: ChildProcess;
   try {
-    child = spawn(codexBin, ['login', '--device-auth'], {
-      // CODEX_HOME 指向 per-user 目录：device-auth 成功后 codex 直接把 auth.json
-      // 写进这里。detached 方便超时时杀整个进程树。
+    child = spawn(codexBin, args, {
+      // CODEX_HOME 指向 per-user 目录：登录成功后 codex 直接把 auth.json 写进这里。
+      // detached 方便超时时杀整个进程树。
       env: { ...process.env, CODEX_HOME: codexHome },
       stdio: ['ignore', 'pipe', 'pipe'],
       detached: true,
@@ -212,11 +231,11 @@ export function startDeviceAuth(
     if (record.buffer.length > 64 * 1024) {
       record.buffer = record.buffer.slice(-64 * 1024);
     }
-    const { verificationUri, userCode } = parseVerification(record.buffer);
+    const { verificationUri, userCode } = parseVerification(record.buffer, mode);
     if (!verificationUri) return;
-    // 有 URL 但暂无码：再等后续 chunk（码通常紧随 URL）。除非缓冲已较大（码大概率
-    // 不会再来），则 url-only 兜底推出，避免永远卡在"正在获取"。
-    if (!userCode && record.buffer.length < 4096) return;
+    // device 模式：有 URL 但暂无码 → 再等后续 chunk（码通常紧随 URL）；缓冲已较大则 url-only
+    // 兜底，避免永远卡在"正在获取"。browser 模式无短码，抓到 URL 即推。
+    if (mode === 'device' && !userCode && record.buffer.length < 4096) return;
     record.sawPending = true;
     const state: CodexDeviceAuthState = {
       status: 'pending',
@@ -257,6 +276,24 @@ export function startDeviceAuth(
   });
 
   inflight.set(userId, record);
+}
+
+/** 设备码登录（`codex login --device-auth`，远程友好）。 */
+export function startDeviceAuth(
+  userId: string,
+  onUpdate: CodexDeviceAuthUpdate,
+  opts: { codexBin?: string } = {},
+): void {
+  startCodexLogin(userId, onUpdate, { ...opts, mode: 'device' });
+}
+
+/** 标准浏览器登录（`codex login`，本机推荐；localhost:1455 回调）。 */
+export function startBrowserLogin(
+  userId: string,
+  onUpdate: CodexDeviceAuthUpdate,
+  opts: { codexBin?: string } = {},
+): void {
+  startCodexLogin(userId, onUpdate, { ...opts, mode: 'browser' });
 }
 
 /**
