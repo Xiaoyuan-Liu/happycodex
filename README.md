@@ -3,12 +3,18 @@
 **Codex 版 HappyClaw 运行时**——把 [HappyClaw](../happyclaw) 的 Agent 执行层从
 Claude Agent SDK 迁移到 **codex app-server**（JSON-RPC over stdio）的运行时实现。
 
-当前仓库覆盖 **Stage 0-4**：协议契约 + app-server 客户端 + 流式事件映射 + thread/turn
-注入循环 + 12 个工具（dynamicTools）+ 多租户编排（per-folder 隔离 / resume / 单写者）+
+**引擎底座（Stage 0-4）**：协议契约 + app-server 客户端 + 流式事件映射 + thread/turn
+注入循环 + 17 个工具（dynamicTools）+ 多租户编排（per-folder 隔离 / resume / 单写者）+
 针对真实 codex 的 PoC 验证。基线 **codex-cli 0.137.0**。
 
-> 完整迁移规划见 [`../happyclaw/docs/CODEX-PORT-PLAN.md`](../happyclaw/docs/CODEX-PORT-PLAN.md)。
-> 本 README 覆盖 happycodex 仓库内的 Stage 0-4 范围（standalone；接 HappyClaw 主仓待做）。
+**完整应用（A 阶段已搬迁）**：在引擎底座之上，HappyClaw 的应用层（Web 前后端、五渠道 IM、
+调度、计费、权限）已忠实搬迁为 codex-only 版，并叠加了 codex 特有的 per-user 登录与自定义
+模型 provider。MVP 端到端（Web 登录→发消息→codex 执行→流式回复→重启 resume，host + Docker
+双轨）已验证。
+
+> 上游同步台账见 [`docs/UPSTREAM-SYNC.md`](docs/UPSTREAM-SYNC.md)；per-user 登录/provider 细节见
+> [`docs/CODEX-PERUSER-AUTH.md`](docs/CODEX-PERUSER-AUTH.md)。本 README 主体描述引擎底座（Stage 0-4）
+> 的协议/架构；下方「运行完整应用」给出起 Web 服务的命令。
 
 ---
 
@@ -98,10 +104,18 @@ HappyClaw 用 `agent-runner` 在容器/宿主机进程里调用 Claude Agent SDK
 ### 前置条件
 
 1. **安装 codex CLI**，版本对齐基线 `0.137.0`（可用 `codex --version` 确认）。
-2. **codex 已登录**：app-server 复用本机 codex 的登录态（ChatGPT/API key）。
+2. **codex 认证**：
+   - **共享/默认账号**（首次部署的基线）：服务端 `codex login`（或 `codex login --api-key`）一次，
+     凭据落 `~/.codex/auth.json`。它满足首次 setup 门控、并作为未自登用户的回退账号。
+   - **per-user 自登（启动后，各用户在 Web 界面）**：进「设置 → Codex 账号」用自己的 codex 账号
+     登录——支持「浏览器登录」（本机推荐，自动开浏览器）/「设备码登录」（远程）/「API key」/
+     「access-token」。无需预先在终端 `codex login`。登录态按用户隔离（`data/config/user-im/{userId}/codex/`）。
+   - 也可在「Codex 配置」里配第三方模型 provider（兼容 OpenAI Responses API 的 GLM 等）。
+   - 注意：首次 setup 门控目前仍看*共享*账号，故全新机器至少需要一次服务端 `codex login`
+     来过 setup；之后各用户即可在 UI 里登录自己的账号。
 3. **`CODEX_HOME`**：指向有效的 codex 配置目录。PoC 默认用当前环境的 `CODEX_HOME`；
    `poc-resume` 的两次 client 必须共享同一 `CODEX_HOME`，否则第二个进程读不到第一个
-   写入的 rollout，无法续接。
+   写入的 rollout，无法续接。（完整应用为每个 folder provision 独立的 per-folder `CODEX_HOME`。）
 4. 安装依赖：`npm install`。
 
 ### 命令
@@ -123,6 +137,22 @@ npm run poc:multitenant  # 或：make poc-multitenant  —— Stage 4 多租户�
 
 PoC 会话统一用 `{ approvalPolicy: 'never', sandbox: 'read-only' }`：不触发审批回环阻塞、
 不写磁盘。每个脚本结尾打印 `OK / UNCERTAIN / FAIL` 结论并按结果 `process.exit`。
+
+### 运行完整应用（Web + IM）
+
+```bash
+# 1) 构建前端（首次 / 改前端后）：产物 web/dist 由后端静态托管
+cd web && npm run build && cd ..
+
+# 2) 起后端（host 模式 tsx 直跑；WEB_PORT 自定端口，避免与同机其它服务冲突）
+WEB_PORT=3100 npm run dev          # 生产可 npm run build → node dist/index.js
+```
+
+浏览器打开 `http://localhost:<WEB_PORT>` → 首次按向导建管理员（setup）→ 进「设置 → Codex 账号」
+登录你自己的 codex（浏览器/设备码/API key），即可发消息让 codex 执行。
+
+> 同机若另跑了 happyclaw，给 happycodex 用**不同端口**即可（session cookie 已用专属名
+> `happycodex_session`，与 happyclaw 互不顶替）。
 
 ---
 
