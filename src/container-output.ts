@@ -27,6 +27,13 @@
 import type { StreamEvent } from './shared/stream-event.js';
 import type { MessageSourceKind } from './types.js';
 
+/**
+ * codex turn 报失败（result subtype 'failed'）但未带 statusText 时的通用错误文案。
+ * 编排层（index.ts）据此识别"turn 失败但无具体原因"的无回复型失败，与有明确原因的
+ * 硬错误区分（安静重试、耗尽才诚实提示），故导出为单一真相源避免两侧字符串漂移。
+ */
+export const GENERIC_AGENT_FAILURE_MESSAGE = 'agent failed';
+
 // ───────────────────────── 类型（对齐上游 ContainerOutput 形状） ─────────────────────────
 
 export interface ContainerOutput {
@@ -118,7 +125,7 @@ export function mapStreamEventToOutputs(
           withSession({
             status: 'error',
             result: null,
-            error: ev.statusText ?? 'agent failed',
+            error: ev.statusText ?? GENERIC_AGENT_FAILURE_MESSAGE,
             finalizationReason: 'error',
             ...(ev.turnId ? { turnId: ev.turnId } : {}),
           }),

@@ -169,6 +169,7 @@ import type {
   WhatsAppConnectConfig,
 } from './im-manager.js';
 import { GroupQueue } from './group-queue.js';
+import { GENERIC_AGENT_FAILURE_MESSAGE } from './container-output.js';
 import { startSchedulerLoop, triggerTaskNow } from './task-scheduler.js';
 import {
   checkBillingAccessFresh,
@@ -630,6 +631,13 @@ let stuckRunnerCheckCounter = 0;
 // After OOM_AUTO_RESET_THRESHOLD consecutive OOMs, auto-clear the session.
 const consecutiveOomExits: Record<string, number> = {};
 const OOM_AUTO_RESET_THRESHOLD = 2;
+
+// No-reply（空 turn / codex turn 报失败但无原因）连续次数，per folder。
+// codex + 高 reasoning 偶发"turn 失败无原因"，少量到数次退避重试通常自愈（实测一次问答经
+// 数次重试后成功），故沿用 MAX_RETRIES(=5) 的自愈窗口；区别仅在于：重试期间不再每次弹
+// agent_error 刷屏（安静重试），到达上限才发一条诚实提示而非静默丢弃。
+const consecutiveNoReplyExits: Record<string, number> = {};
+const NO_REPLY_RETRY_LIMIT = 5;
 
 // Per-folder reply route updater: lets sendMessage callers update the
 // reply routing of a running processGroupMessages without killing the process.
@@ -3948,6 +3956,35 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       deleteRouterState(`oom_exits:${effectiveGroup.folder}`);
     }
 
+    // 无回复型失败：codex turn 报失败但无具体原因（errorDetail 为通用 'agent failed'）。
+    // 与有明确原因的硬错误（context_overflow / OOM / 真实异常，errorDetail 带详情）区分：
+    // 这类多为瞬时空 turn，退避重试通常自愈。改动点——重试期间不再每次弹 agent_error 刷屏
+    // （安静重试，前端继续维持"思考中"），仅在连续 NO_REPLY_RETRY_LIMIT 次仍无回复时发一条
+    // 诚实提示并停止重试（而非静默丢弃 / 反复弹错）。
+    if (errorDetail === GENERIC_AGENT_FAILURE_MESSAGE) {
+      const folder = effectiveGroup.folder;
+      consecutiveNoReplyExits[folder] = (consecutiveNoReplyExits[folder] || 0) + 1;
+      if (consecutiveNoReplyExits[folder] >= NO_REPLY_RETRY_LIMIT) {
+        consecutiveNoReplyExits[folder] = 0;
+        sendSystemMessage(
+          chatJid,
+          'agent_error',
+          '本轮未能产出回复（已自动重试多次仍为空），可能是临时波动。请换个说法或稍后再试。',
+        );
+        logger.warn(
+          { group: group.name, folder, attempts: NO_REPLY_RETRY_LIMIT },
+          'No-reply turn exceeded retry limit, giving up with honest notice',
+        );
+        commitCursor();
+        return true; // 停止重试（已诚实告知用户）
+      }
+      logger.warn(
+        { group: group.name, folder, attempt: consecutiveNoReplyExits[folder] },
+        'No-reply (empty) agent turn — retrying quietly (suppressing per-retry agent_error)',
+      );
+      return false; // 安静重试，不弹 agent_error
+    }
+
     sendSystemMessage(chatJid, 'agent_error', errorDetail);
     logger.warn(
       { group: group.name, error: errorDetail },
@@ -3960,6 +3997,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   if (consecutiveOomExits[effectiveGroup.folder]) {
     delete consecutiveOomExits[effectiveGroup.folder];
     deleteRouterState(`oom_exits:${effectiveGroup.folder}`);
+  }
+  // Reset no-reply counter on any non-error exit (reply sent, or silent success).
+  if (consecutiveNoReplyExits[effectiveGroup.folder]) {
+    delete consecutiveNoReplyExits[effectiveGroup.folder];
   }
 
   // Final fallback for silent-success paths (no visible reply).
