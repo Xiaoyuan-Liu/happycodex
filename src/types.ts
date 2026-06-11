@@ -434,6 +434,17 @@ export type WsMessageOut =
       userId: string;
       usage: BillingAccessResult;
     }
+  | {
+      // per-user codex device-auth 进度（定向推送给发起 userId）。
+      // 推送范式对标 whatsapp_status：路由触发 startDeviceAuth，onUpdate→broadcast。
+      type: 'codex_device_auth';
+      userId: string;
+      status: 'pending' | 'authorized' | 'expired' | 'error';
+      verificationUri?: string;
+      userCode?: string;
+      expiresInSec?: number;
+      error?: string;
+    }
   | { type: 'ws_error'; error: string; chatJid?: string }
   | {
       type: 'stream_snapshot';

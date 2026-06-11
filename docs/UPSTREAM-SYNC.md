@@ -55,6 +55,14 @@ rm -rf upstream-happyclaw && mkdir upstream-happyclaw && \
 | CR#2 | send_file/send_image 路径校验纯词法（startsWith），工作区内 symlink 可外读/外发任意主机文件 | `src/index.ts:5865-5866`（消费端）；agent-runner mcp-tools 生产端同 | 两侧独立 realpath 物理校验：producer `ipc-bridge.resolveWorkspaceFile`、consumer `ipc-paths.isRealPathWithinRoots` |
 | CR#8 | send_file 相对路径消费端恒锚 `GROUPS_DIR/{folder}`，host+customCwd 群组（生产端按注入的 customCwd 产出相对路径）发文件永远 not found | `src/container-runner.ts:1326/1584`（注入）vs `src/index.ts:5861`（消费） | `src/ipc-paths.ts` resolveSendFileAnchor（与 container-runner 注入同源的 customCwd 映射） |
 
+## happycodex 自有扩展（非上游 1:1）
+
+codex 引擎特有、上游 happyclaw 无对应物的功能，记此以便区分"搬迁"与"衍生"：
+
+| 功能 | 说明 | 触点 |
+|---|---|---|
+| per-user codex OAuth 登录 | 每个 Web 用户用自己的 codex 账号（device-auth 一键登录 / API key / access-token），凭据存 `data/config/user-im/{userId}/codex/auth.json`（明文 0o600，codex 原生形状）；provision 时按 `group.created_by` 选源，缺失时按 `HAPPYCODEX_PERUSER_AUTH_FALLBACK`（默认 true）回退共享账号。上游是 Claude provider 池（per-user UI 录入），codex 是单账号引擎，故此为衍生而非搬迁。详见 `docs/CODEX-PERUSER-AUTH.md` | `src/codex-paths.ts`（userCodexHomeDir/hasUserCodexAuth/perUserAuthFallbackEnabled/readCodexAuthStatus(userId?)）、`src/codex-device-auth.ts`（device-auth 子进程编排）、`src/routes/config.ts`（6 端点）、`src/runtime/multitenant/codex-home.ts`（authSourceDir 选源）、`src/container-runner.ts`（resolveAuthSourceDir）、`web/src/components/settings/CodexAuthCard.tsx` |
+
 ## 迁移水位线 / 台账
 
 - **基线**：riba2534/happyclaw main @ `2599989`（2026-06-08）= 当前已对照基线。

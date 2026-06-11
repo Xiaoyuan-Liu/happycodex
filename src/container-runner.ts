@@ -30,7 +30,12 @@ import {
 import fs from 'fs';
 import path from 'path';
 
-import { sharedCodexHomeDir } from './codex-paths.js';
+import {
+  hasUserCodexAuth,
+  perUserAuthFallbackEnabled,
+  sharedCodexHomeDir,
+  userCodexHomeDir,
+} from './codex-paths.js';
 import { CONTAINER_IMAGE, DATA_DIR, GROUPS_DIR, TIMEZONE } from './config.js';
 import { logger } from './logger.js';
 import { resolveHostNodeBinary, resolveBinaryOnPath } from './node-resolver.js';
@@ -167,6 +172,12 @@ export interface CodexHomeContextOptions {
   projectDocMaxBytes?: number;
   /** loadUserMcpServers(ownerId) 的结果（渲染为 [mcp_servers.*] TOML 段幂等合并）。 */
   mcpServers?: Record<string, Record<string, unknown>>;
+  /**
+   * per-user auth 源目录：auth.json 复制源（缺省回退 sharedCodexHome）。
+   * buildCodexHomeContext 按 owner 的 per-user 凭据存在性 + fallback 开关计算，
+   * 透传进 provisioner（照 projectDocMaxBytes 透传范式）。
+   */
+  authSourceDir?: string;
 }
 
 /**
@@ -194,6 +205,9 @@ export async function provisionCodexHome(
       ? { projectDocMaxBytes: context.projectDocMaxBytes }
       : {}),
     ...(context?.mcpServers ? { mcpServers: context.mcpServers } : {}),
+    ...(context?.authSourceDir !== undefined
+      ? { authSourceDir: context.authSourceDir }
+      : {}),
   });
   const folder = agentId
     ? path.join(groupFolder, 'agents', agentId)
@@ -251,7 +265,25 @@ function buildCodexHomeContext(
     projectDocFallbackFilenames: plan.projectDocFallbackFilenames,
     projectDocMaxBytes: plan.projectDocMaxBytes,
     ...(Object.keys(mcpServers).length > 0 ? { mcpServers } : {}),
+    authSourceDir: resolveAuthSourceDir(ownerId),
   };
+}
+
+/**
+ * 计算 auth.json 复制源目录（per-user OAuth 选源）：
+ * - owner 有 per-user 凭据 → 用其 userCodexHomeDir（用自己的账号）。
+ * - 无 per-user 凭据 + fallback 开启 → sharedCodexHomeDir（回退共享账号）。
+ * - 无 per-user 凭据 + fallback 关闭 → 故意指向不含 auth 的 per-user 目录：
+ *   provision 时 copyIfAbsent(auth.json, required) 抛"未登录"错，由编排层经现有
+ *   agent_error 通路呈现为友好"请先登录"（强制每人自登，不新增分支）。
+ * - ownerId 缺失（无 created_by）→ 回退 sharedCodexHomeDir。
+ */
+function resolveAuthSourceDir(ownerId: string | undefined | null): string {
+  if (!ownerId) return sharedCodexHomeDir();
+  if (hasUserCodexAuth(ownerId)) return userCodexHomeDir(ownerId);
+  return perUserAuthFallbackEnabled()
+    ? sharedCodexHomeDir()
+    : userCodexHomeDir(ownerId);
 }
 
 /**

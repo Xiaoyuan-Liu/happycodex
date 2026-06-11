@@ -104,6 +104,11 @@ export function buildSetupStatus() {
   // 的 preflight 同样缺 auth.json 即抛错（codex-home.ts copyIfMissing required），
   // 没有 auth.json 任何会话都跑不起来；env_key-only（config.toml model_providers
   // 经环境变量供 key、不落 auth.json）的部署形态有意不支持，setup 锁是诚实信号。
+  //
+  // per-user 重要：needsSetup 钉「共享/admin 态」（readCodexAuthStatus() 无参=读共享
+  // CODEX_HOME），**绝不**按 per-user 凭据判定。否则在默认回退共享的形态下，普通用户
+  // 没自登 codex 就会把 admin 的 onboarding 向导误锁；共享账号已登录时系统天然不锁，
+  // per-user 自登是各用户的可选增强（POST /api/config/codex/auth/*），与 setup 门控解耦。
   const codexConfigured = readCodexAuthStatus().loggedIn;
   const { source: feishuSource } = getFeishuProviderConfigWithSource();
   const feishuConfigured = feishuSource !== 'none';

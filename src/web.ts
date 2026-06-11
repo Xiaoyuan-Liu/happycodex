@@ -2226,6 +2226,30 @@ export function broadcastWhatsAppStatus(
   safeBroadcast(msg, false, allowedUserIds);
 }
 
+/**
+ * per-user codex device-auth 进度定向推送（对标 broadcastWhatsAppStatus 范式）。
+ * 仅发给发起的 userId；payload 不含任何 token 明文（device-auth 只回 verification
+ * URI / 短码 / 状态——见 codex-device-auth.ts 的脱敏抓取）。
+ */
+export function broadcastCodexDeviceAuth(
+  userId: string,
+  payload: {
+    status: 'pending' | 'authorized' | 'expired' | 'error';
+    verificationUri?: string;
+    userCode?: string;
+    expiresInSec?: number;
+    error?: string;
+  },
+): void {
+  const msg: WsMessageOut = {
+    type: 'codex_device_auth',
+    userId,
+    ...payload,
+  };
+  const allowedUserIds = new Set([userId]);
+  safeBroadcast(msg, false, allowedUserIds);
+}
+
 export function broadcastAgentStatus(
   chatJid: string,
   agentId: string,

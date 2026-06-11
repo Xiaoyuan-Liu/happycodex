@@ -86,7 +86,18 @@ import {
 // —— provider-pool 已作废（用户决策），整模块不搬。
 import fs from 'fs';
 import path from 'path';
-import { readCodexAuthStatus, sharedCodexHomeDir } from '../codex-paths.js';
+import { spawn } from 'node:child_process';
+import {
+  readCodexAuthStatus,
+  userCodexHomeDir,
+  hasUserCodexAuth,
+  CODEX_AUTH_FILE,
+} from '../codex-paths.js';
+import {
+  startDeviceAuth,
+  getDeviceAuthState,
+  cancelDeviceAuth,
+} from '../codex-device-auth.js';
 import { writeFileAtomic } from '../utils.js';
 
 const configRoutes = new Hono<{ Variables: Variables }>();
@@ -158,72 +169,253 @@ function destroyTelegramApiAgent(agent: HttpsAgent | ProxyAgent): void {
 // per-folder CODEX_HOME 在 provision 时复制），无池化/均衡/切换概念。
 // 前端对应面（ClaudeProviderSection/SetupProvidersPage）已改为占位页，不调用以上端点。
 //
-// 替换为最小 codex 配置面：
-//   - GET  /codex/auth          → 共享 auth.json 是否存在/认证方式/login 指引
-//   - POST /codex/auth/api-key  → 写入 API-key 形态的 auth.json（codex login --api-key 等价）
+// 替换为 per-user codex 配置面（每个登录用户管理自己的 codex 凭据，作用域 user.id）：
+//   - GET    /codex/auth                  → 自己的 auth 状态（脱敏：无 token/key 明文，无 codexHome 路径）
+//   - POST   /codex/auth/api-key          → 写 per-user auth.json {OPENAI_API_KEY}（force 护栏 + 审计）
+//   - POST   /codex/auth/access-token     → 经 codex login --with-access-token 落 per-user auth.json
+//   - POST   /codex/auth/device/start     → 触发 device-auth 子进程，URL/码经 WS codex_device_auth 推
+//   - DELETE /codex/auth                  → 删自己的 auth.json（登出，回退共享）
+//   - GET    /codex/auth/shared           → 系统级共享态查看（systemConfigMiddleware，admin 可见 codexHome）
 //
-// sharedCodexHomeDir / readCodexAuthStatus 已下沉 src/codex-paths.ts（单一真相源，
-// 消除 routes/config / container-runner / sdk-query / routes/mcp-servers 四副本；
-// routes/auth、routes/bug-report 等消费方均直接 import codex-paths，无 route→route 横向依赖）。
+// 凭据只写 c.get('user').id 自己的 userCodexHomeDir(userId)（per-user 隔离）；
+// 子进程 token 不入日志（codex-device-auth 只抓 verification URL/短码）；GET 一律脱敏。
+//
+// sharedCodexHomeDir / readCodexAuthStatus / userCodexHomeDir / hasUserCodexAuth 均在
+// src/codex-paths.ts（单一真相源）。
 
+/**
+ * 脱敏 per-user auth 状态：永不回 token/key 明文，也不回 codexHome 绝对路径
+ * （per-user 路径含 DATA_DIR + userId，无须暴露给前端）。只回 contract 钉的字段。
+ */
+function sanitizeUserCodexAuth(status: ReturnType<typeof readCodexAuthStatus>) {
+  return {
+    loggedIn: status.loggedIn,
+    method: status.method,
+    lastRefresh: status.lastRefresh,
+    loginHint: status.loginHint,
+    hasUserAuth: status.hasUserAuth ?? false,
+    usingShared: status.usingShared ?? false,
+  };
+}
+
+/** 当前用户自己的 codex auth 状态（per-user，脱敏）。 */
+configRoutes.get('/codex/auth', authMiddleware, (c) => {
+  const user = c.get('user') as AuthUser;
+  try {
+    return c.json(sanitizeUserCodexAuth(readCodexAuthStatus(user.id)));
+  } catch (err) {
+    logger.error({ err }, 'Failed to read user codex auth status');
+    return c.json({ error: 'Failed to read codex auth status' }, 500);
+  }
+});
+
+/**
+ * 系统级共享态查看（admin/manage_system_config）：保留对共享 CODEX_HOME 的查看，
+ * 含 codexHome 路径（admin 定位用）。不暴露 token/key（readCodexAuthStatus 本就只回
+ * loggedIn/method/lastRefresh）。
+ */
 configRoutes.get(
-  '/codex/auth',
+  '/codex/auth/shared',
   authMiddleware,
   systemConfigMiddleware,
   (c) => {
     try {
       return c.json(readCodexAuthStatus());
     } catch (err) {
-      logger.error({ err }, 'Failed to read codex auth status');
+      logger.error({ err }, 'Failed to read shared codex auth status');
       return c.json({ error: 'Failed to read codex auth status' }, 500);
     }
   },
 );
 
-configRoutes.post(
-  '/codex/auth/api-key',
-  authMiddleware,
-  systemConfigMiddleware,
-  async (c) => {
-    const body = await c.req.json().catch(() => ({}));
-    const apiKey = typeof body.apiKey === 'string' ? body.apiKey.trim() : '';
-    const force = body.force === true;
-    if (!apiKey) {
-      return c.json({ error: 'apiKey is required' }, 400);
-    }
-    // 安全护栏：已有 ChatGPT OAuth 登录态时拒绝静默覆盖（需 force=true），
-    // 因为共享 CODEX_HOME 可能就是宿主机真实 ~/.codex。
-    const current = readCodexAuthStatus();
-    if (current.loggedIn && current.method === 'chatgpt' && !force) {
+/** 写 per-user API-key 形态 auth.json（codex login --api-key 等价）。 */
+configRoutes.post('/codex/auth/api-key', authMiddleware, async (c) => {
+  const user = c.get('user') as AuthUser;
+  const body = await c.req.json().catch(() => ({}));
+  const apiKey = typeof body.apiKey === 'string' ? body.apiKey.trim() : '';
+  const force = body.force === true;
+  if (!apiKey) {
+    return c.json({ error: 'apiKey is required' }, 400);
+  }
+  // 安全护栏：用户已有自己的 ChatGPT OAuth 登录态时拒绝静默覆盖（需 force=true）。
+  // 只看用户自己的 per-user 凭据（不读共享 fallback），避免「自己没登但共享是 OAuth」
+  // 误触 409。
+  if (hasUserCodexAuth(user.id)) {
+    const current = readCodexAuthStatus(user.id);
+    if (
+      current.hasUserAuth &&
+      current.method === 'chatgpt' &&
+      !force
+    ) {
       return c.json(
         {
           error:
-            '已存在 ChatGPT 登录态（auth.json 含 OAuth tokens）。如确认要替换为 API key，请传 force=true。',
+            '你已有 ChatGPT 登录态（auth.json 含 OAuth tokens）。如确认要替换为 API key，请传 force=true。',
         },
         409,
       );
     }
-    try {
-      const codexHome = sharedCodexHomeDir();
-      fs.mkdirSync(codexHome, { recursive: true });
-      const authPath = path.join(codexHome, 'auth.json');
-      // 原子写 + 0600（对齐 codex login --api-key 的产物形状）；writeFileAtomic
-      // 自带 stale-tmp unlink（裸 writeFileSync 的 mode 仅 on-create 生效，残留
-      // tmp 会让 API key 落到旧 mode）。
-      writeFileAtomic(authPath, JSON.stringify({ OPENAI_API_KEY: apiKey }), {
-        mode: 0o600,
+  }
+  try {
+    const codexHome = userCodexHomeDir(user.id);
+    fs.mkdirSync(codexHome, { recursive: true });
+    const authPath = path.join(codexHome, CODEX_AUTH_FILE);
+    // 原子写 + 0600（对齐 codex login --api-key 产物；codex 必须明文读 auth.json）。
+    writeFileAtomic(authPath, JSON.stringify({ OPENAI_API_KEY: apiKey }), {
+      mode: 0o600,
+    });
+    appendClaudeConfigAudit(user.username, 'codex_auth_api_key_set', [
+      'auth.json',
+    ], { userId: user.id, scope: 'per-user' });
+    return c.json({
+      success: true,
+      status: sanitizeUserCodexAuth(readCodexAuthStatus(user.id)),
+    });
+  } catch (err) {
+    logger.error({ err }, 'Failed to write user codex auth.json');
+    return c.json({ error: 'Failed to write codex auth.json' }, 500);
+  }
+});
+
+/**
+ * 经 codex login --with-access-token 写 per-user auth.json（OAuth access token 形态）。
+ * token 经子进程 stdin 喂入（不进 argv，避免 ps 泄漏），CODEX_HOME 指 per-user 目录。
+ */
+configRoutes.post('/codex/auth/access-token', authMiddleware, async (c) => {
+  const user = c.get('user') as AuthUser;
+  const body = await c.req.json().catch(() => ({}));
+  const accessToken =
+    typeof body.accessToken === 'string' ? body.accessToken.trim() : '';
+  const force = body.force === true;
+  if (!accessToken) {
+    return c.json({ error: 'accessToken is required' }, 400);
+  }
+  if (hasUserCodexAuth(user.id) && !force) {
+    return c.json(
+      {
+        error:
+          '你已有 codex 登录态。如确认要替换，请传 force=true。',
+      },
+      409,
+    );
+  }
+
+  const codexHome = userCodexHomeDir(user.id);
+  try {
+    fs.mkdirSync(codexHome, { recursive: true });
+  } catch (err) {
+    logger.error({ err }, 'Failed to create user codex home');
+    return c.json({ error: 'Failed to prepare codex home' }, 500);
+  }
+
+  // 经 codex login --with-access-token（stdin 喂 token）。失败兜底由 codex 退出码呈现。
+  const result = await new Promise<{ ok: boolean; code: number | null }>(
+    (resolve) => {
+      let child;
+      try {
+        child = spawn(
+          'codex',
+          ['login', '--with-access-token'],
+          {
+            env: { ...process.env, CODEX_HOME: codexHome },
+            stdio: ['pipe', 'ignore', 'pipe'],
+          },
+        );
+      } catch (err) {
+        logger.warn({ err }, 'Failed to spawn codex login --with-access-token');
+        resolve({ ok: false, code: null });
+        return;
+      }
+      // 不记录 stderr 原始内容（可能回显 token）；只用退出码判定。
+      child.stderr?.on('data', () => {});
+      child.on('error', (err) => {
+        logger.warn(
+          { err: err.message },
+          'codex login --with-access-token spawn error',
+        );
+        resolve({ ok: false, code: null });
       });
-      const user = c.get('user') as AuthUser;
-      appendClaudeConfigAudit(user.username, 'codex_auth_api_key_set', [
-        'auth.json',
-      ]);
-      return c.json({ success: true, status: readCodexAuthStatus() });
+      child.on('close', (code) => resolve({ ok: code === 0, code }));
+      child.stdin?.on('error', () => {
+        /* EPIPE if codex dies early */
+      });
+      child.stdin?.end(accessToken);
+    },
+  );
+
+  if (!result.ok) {
+    return c.json(
+      { error: 'codex login --with-access-token failed' },
+      400,
+    );
+  }
+  appendClaudeConfigAudit(user.username, 'codex_auth_access_token_set', [
+    'auth.json',
+  ], { userId: user.id, scope: 'per-user' });
+  return c.json({
+    success: true,
+    status: sanitizeUserCodexAuth(readCodexAuthStatus(user.id)),
+  });
+});
+
+/**
+ * 触发 device-auth 子进程：verification URL/短码经 WS codex_device_auth 异步推。
+ * 幂等去重：同一 userId 已有 in-flight 则复用（startDeviceAuth 内部抢占旧进程）。
+ * 立即返回 {started:true}（不阻塞等 URL）。若已有进行中流程，回当前快照便于前端恢复。
+ */
+configRoutes.post('/codex/auth/device/start', authMiddleware, async (c) => {
+  const user = c.get('user') as AuthUser;
+  try {
+    const existing = getDeviceAuthState(user.id);
+    const { broadcastCodexDeviceAuth } = await import('../web.js');
+    startDeviceAuth(user.id, (state) => {
+      broadcastCodexDeviceAuth(user.id, state);
+    });
+    appendClaudeConfigAudit(user.username, 'codex_auth_device_start', [], {
+      userId: user.id,
+      scope: 'per-user',
+    });
+    return c.json({ started: true, state: existing ?? { status: 'pending' } });
+  } catch (err) {
+    logger.error({ err }, 'Failed to start codex device-auth');
+    return c.json({ error: 'Failed to start codex device authorization' }, 500);
+  }
+});
+
+/** 取消进行中的 device-auth（用户关闭登录弹窗）：kill 子进程 + 清定时器，no-op if 无 in-flight。 */
+configRoutes.post('/codex/auth/device/cancel', authMiddleware, (c) => {
+  const user = c.get('user') as AuthUser;
+  cancelDeviceAuth(user.id);
+  return c.json({ cancelled: true });
+});
+
+/** 删 per-user auth.json（登出 → 回退共享）。 */
+configRoutes.delete('/codex/auth', authMiddleware, (c) => {
+  const user = c.get('user') as AuthUser;
+  try {
+    const authPath = path.join(userCodexHomeDir(user.id), CODEX_AUTH_FILE);
+    let removed = false;
+    try {
+      fs.unlinkSync(authPath);
+      removed = true;
     } catch (err) {
-      logger.error({ err }, 'Failed to write codex auth.json');
-      return c.json({ error: 'Failed to write codex auth.json' }, 500);
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
     }
-  },
-);
+    if (removed) {
+      appendClaudeConfigAudit(user.username, 'codex_auth_deleted', [
+        'auth.json',
+      ], { userId: user.id, scope: 'per-user' });
+    }
+    return c.json({
+      success: true,
+      removed,
+      status: sanitizeUserCodexAuth(readCodexAuthStatus(user.id)),
+    });
+  } catch (err) {
+    logger.error({ err }, 'Failed to delete user codex auth.json');
+    return c.json({ error: 'Failed to delete codex auth.json' }, 500);
+  }
+});
 
 
 // ─── Helpers ────────────────────────────────────────────────────

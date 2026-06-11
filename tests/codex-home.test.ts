@@ -294,3 +294,90 @@ describe('FsCodexHomeProvisioner — 合法嵌套 folder', () => {
     expect(await exists(path.join(codexHome, 'auth.json'))).toBe(true);
   });
 });
+
+describe('FsCodexHomeProvisioner — per-user authSourceDir（契约：auth 源切到 per-user）', () => {
+  const USER_AUTH_CONTENT = '{"tokens":{"access":"per-user-token"}}';
+
+  let userAuthDir: string;
+
+  beforeEach(async () => {
+    userAuthDir = await mkdtemp(path.join(os.tmpdir(), 'happycodex-userauth-'));
+  });
+
+  afterEach(async () => {
+    await rm(userAuthDir, { recursive: true, force: true });
+  });
+
+  it('authSourceDir 存在 auth.json → per-user 优先：复制的是 per-user 凭据（非 shared）', async () => {
+    // shared 与 per-user 都有 auth.json，但内容不同——验证复制的是 per-user。
+    await writeFile(path.join(sharedCodexHome, 'auth.json'), AUTH_CONTENT, 'utf8');
+    await writeFile(path.join(userAuthDir, 'auth.json'), USER_AUTH_CONTENT, 'utf8');
+    const prov = new FsCodexHomeProvisioner({
+      dataDir,
+      sharedCodexHome,
+      authSourceDir: userAuthDir,
+    });
+
+    const codexHome = await prov.provision(FOLDER);
+
+    const copied = await readFile(path.join(codexHome, 'auth.json'), 'utf8');
+    expect(copied).toBe(USER_AUTH_CONTENT);
+    expect(copied).not.toBe(AUTH_CONTENT);
+  });
+
+  it('config.toml 仍取 sharedCodexHome（authSourceDir 只覆盖 auth.json）', async () => {
+    await writeFile(path.join(sharedCodexHome, 'auth.json'), AUTH_CONTENT, 'utf8');
+    await writeFile(path.join(sharedCodexHome, 'config.toml'), CONFIG_CONTENT, 'utf8');
+    await writeFile(path.join(userAuthDir, 'auth.json'), USER_AUTH_CONTENT, 'utf8');
+    // per-user 目录里放一个不同的 config.toml——不应被使用（config 源恒为 shared）。
+    await writeFile(path.join(userAuthDir, 'config.toml'), 'model = "user-only"\n', 'utf8');
+    const prov = new FsCodexHomeProvisioner({
+      dataDir,
+      sharedCodexHome,
+      authSourceDir: userAuthDir,
+    });
+
+    const codexHome = await prov.provision(FOLDER);
+
+    expect(await readFile(path.join(codexHome, 'auth.json'), 'utf8')).toBe(USER_AUTH_CONTENT);
+    // config 来自 shared，而非 per-user。
+    expect(await readFile(path.join(codexHome, 'config.toml'), 'utf8')).toBe(CONFIG_CONTENT);
+  });
+
+  it('缺省 authSourceDir（不传）→ 回退共享：复制的是 shared 凭据', async () => {
+    await writeFile(path.join(sharedCodexHome, 'auth.json'), AUTH_CONTENT, 'utf8');
+    // 不传 authSourceDir —— 等价于 fallback 开启 + per-user 缺失，调用方传 shared 作源。
+    const prov = new FsCodexHomeProvisioner({ dataDir, sharedCodexHome });
+
+    const codexHome = await prov.provision(FOLDER);
+
+    expect(await readFile(path.join(codexHome, 'auth.json'), 'utf8')).toBe(AUTH_CONTENT);
+  });
+
+  it('authSourceDir 缺 auth.json（fallback 关闭场景：指向不含 auth 的 per-user 目录）→ 抛"未登录"错', async () => {
+    // 模拟 container-runner 在 fallback 关闭 + per-user 未登录时，故意把 authSourceDir
+    // 指向不含 auth.json 的 per-user 目录 → provision 抛错（呈现为"请先登录"）。
+    await writeFile(path.join(sharedCodexHome, 'auth.json'), AUTH_CONTENT, 'utf8');
+    // userAuthDir 故意不写 auth.json。
+    const prov = new FsCodexHomeProvisioner({
+      dataDir,
+      sharedCodexHome,
+      authSourceDir: userAuthDir,
+    });
+
+    await expect(prov.provision(FOLDER)).rejects.toThrow(/auth\.json/);
+  });
+
+  it('authSourceDir 显式等于 sharedCodexHome（fallback 回退共享）→ 复制 shared 凭据成功', async () => {
+    await writeFile(path.join(sharedCodexHome, 'auth.json'), AUTH_CONTENT, 'utf8');
+    const prov = new FsCodexHomeProvisioner({
+      dataDir,
+      sharedCodexHome,
+      authSourceDir: sharedCodexHome,
+    });
+
+    const codexHome = await prov.provision(FOLDER);
+
+    expect(await readFile(path.join(codexHome, 'auth.json'), 'utf8')).toBe(AUTH_CONTENT);
+  });
+});

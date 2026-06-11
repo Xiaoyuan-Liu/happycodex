@@ -57,6 +57,13 @@ export interface FsCodexHomeProvisionerOptions {
   /** 共享 codex home 源目录（应已登录，含 auth.json）。 */
   sharedCodexHome: string;
   /**
+   * per-user auth 源目录（per-user 已登录时由调用方传该用户 codex home）。
+   * 缺省回退 sharedCodexHome。auth.json 复制源 = authSourceDir ?? sharedCodexHome；
+   * required 行为不变（源缺 auth.json 仍抛错——由调用方保证 authSourceDir 已含 auth.json
+   * 或回退到含 auth 的 shared）。config.toml 等其余源仍取 sharedCodexHome。
+   */
+  authSourceDir?: string;
+  /**
    * B3：是否注入 SessionStart + Stop hook 配置（hooks.json + [features] hooks=true）。
    * 默认 false（保持向后兼容；信任注入需 live client，由 SessionManager 在 client 起后完成）。
    */
@@ -99,6 +106,8 @@ export interface FsCodexHomeProvisionerOptions {
 export class FsCodexHomeProvisioner implements ICodexHomeProvisioner {
   private readonly dataDir: string;
   private readonly sharedCodexHome: string;
+  /** auth.json 复制源（per-user 已登录则为其 codex home，否则回退 sharedCodexHome）。 */
+  private readonly authSourceDir: string;
   /** sessions 基目录，folder 解析后必须仍在其内（防逃逸）。 */
   private readonly sessionsBase: string;
   private readonly enableHooks: boolean;
@@ -111,6 +120,7 @@ export class FsCodexHomeProvisioner implements ICodexHomeProvisioner {
   constructor(opts: FsCodexHomeProvisionerOptions) {
     this.dataDir = opts.dataDir;
     this.sharedCodexHome = opts.sharedCodexHome;
+    this.authSourceDir = opts.authSourceDir ?? opts.sharedCodexHome;
     this.sessionsBase = path.resolve(this.dataDir, 'sessions');
     this.enableHooks = opts.enableHooks ?? false;
     this.hookCommands = opts.hookCommands;
@@ -126,14 +136,15 @@ export class FsCodexHomeProvisioner implements ICodexHomeProvisioner {
     // 1. 确保 per-folder CODEX_HOME 存在。
     await mkdir(codexHome, { recursive: true });
 
-    // 2. 复制共享凭据（幂等：per-folder 已有则不覆盖）。
-    //    auth.json 必需：源缺失则抛错。
+    // 2. 复制凭据（幂等：per-folder 已有则不覆盖）。
+    //    auth.json 必需：源 = authSourceDir（per-user 已登录的 codex home 或回退 shared）；
+    //    源缺失则抛错（由调用方保证 authSourceDir 已含 auth.json 或回退含 auth 的 shared）。
     await this.copyIfAbsent(
-      path.join(this.sharedCodexHome, AUTH_FILE),
+      path.join(this.authSourceDir, AUTH_FILE),
       path.join(codexHome, AUTH_FILE),
       { required: true },
     );
-    //    config.toml 可选：源存在才复制。
+    //    config.toml 可选：源取 sharedCodexHome（共享配置基线），源存在才复制。
     await this.copyIfAbsent(
       path.join(this.sharedCodexHome, CONFIG_FILE),
       path.join(codexHome, CONFIG_FILE),
@@ -324,7 +335,10 @@ export class FsCodexHomeProvisioner implements ICodexHomeProvisioner {
     }
     if (!(await this.exists(src))) {
       if (opts.required) {
-        throw new Error(`shared codex home 未登录: 缺 ${path.basename(src)} (${src})`);
+        // 消息对 shared / per-user 两种源都成立，且不泄漏绝对路径（会经 agent_error 透到用户）。
+        throw new Error(
+          `codex 未登录：缺 ${path.basename(src)}（请在设置中登录你的 codex 账号，或启用共享账号回退）`,
+        );
       }
       return; // 可选文件源缺失 → 跳过。
     }

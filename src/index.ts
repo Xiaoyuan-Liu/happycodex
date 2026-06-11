@@ -170,6 +170,7 @@ import type {
 } from './im-manager.js';
 import { GroupQueue } from './group-queue.js';
 import { GENERIC_AGENT_FAILURE_MESSAGE } from './container-output.js';
+import { shutdownAllDeviceAuth } from './codex-device-auth.js';
 import { startSchedulerLoop, triggerTaskNow } from './task-scheduler.js';
 import {
   checkBillingAccessFresh,
@@ -8924,6 +8925,13 @@ async function main(): Promise<void> {
       shutdownTerminals();
     } catch (err) {
       logger.warn({ err }, 'Error shutting down terminals');
+    }
+
+    try {
+      // 杀掉所有 in-flight device-auth 子进程（detached，否则可残活至 15min 上限）。
+      shutdownAllDeviceAuth();
+    } catch (err) {
+      logger.warn({ err }, 'Error shutting down device-auth subprocesses');
     }
 
     // Stop periodic buffer, then persist streaming text to DB + clean buffer files.
