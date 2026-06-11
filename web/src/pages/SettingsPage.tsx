@@ -4,7 +4,6 @@ import { Menu } from 'lucide-react';
 
 import { useAuthStore } from '../stores/auth';
 import { SettingsNav } from '../components/settings/SettingsNav';
-import { ClaudeProviderSection } from '../components/settings/ClaudeProviderSection';
 import { CodexAuthCard } from '../components/settings/CodexAuthCard';
 import { RegistrationSection } from '../components/settings/RegistrationSection';
 import { ProfileSection } from '../components/settings/ProfileSection';
@@ -209,14 +208,16 @@ export function SettingsPage() {
 
               <Card>
                 <CardContent>
-                  {/* admin-only：系统级共享 codex 态查看（per-user 登录在「个人偏好」页，全员可达） */}
-                  {activeTab === 'claude' && <ClaudeProviderSection setNotice={() => {}} setError={() => {}} />}
+                  {/* "Codex 配置"(admin-only，admin 默认落地页) = per-user codex 登录。
+                      member 没有此 tab，其登录入口在下方「个人偏好」页（全员可达）。 */}
+                  {activeTab === 'claude' && <CodexAuthCard />}
                   {activeTab === 'registration' && <RegistrationSection />}
                   {activeTab === 'appearance' && <AppearanceSection />}
                   {activeTab === 'system' && <SystemSettingsSection />}
                   {activeTab === 'profile' && (
                     <div className="space-y-6">
-                      <CodexAuthCard />
+                      {/* admin 的 codex 登录在「Codex 配置」tab，此处不重复渲染 */}
+                      {!canManageSystemConfig && <CodexAuthCard />}
                       <ProfileSection />
                     </div>
                   )}
