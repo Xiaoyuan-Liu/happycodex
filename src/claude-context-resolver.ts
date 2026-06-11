@@ -278,9 +278,15 @@ export function buildCodexContextPlan(args: CodexContextPlanArgs): CodexContextP
 
   // ② 项目维度观测：codex 经 project_doc_fallback_filenames 直读工作区 CLAUDE.md，
   // 超 project_doc_max_bytes（默认 32KiB）时 codex 静默截断尾部——此处只 stat 预警，
-  // 不读不写不裁剪（CLAUDE.md 只读红线）。
+  // 不读不写不裁剪（CLAUDE.md 只读红线）。预警锚点跟随 codex 实际 cwd：host 模式
+  // customCwd 群组直读 {customCwd}/CLAUDE.md，其余为受管工作区 {groupsDir}/{folder}
+  // （customCwd 仅宿主机模式语义，container 模式恒挂载受管工作区）。
   try {
-    const workspaceClaudeMd = path.join(args.groupsDir, args.group.folder, 'CLAUDE.md');
+    const workspaceDir =
+      args.executionMode === 'host' && args.group.customCwd
+        ? args.group.customCwd
+        : path.join(args.groupsDir, args.group.folder);
+    const workspaceClaudeMd = path.join(workspaceDir, 'CLAUDE.md');
     const st = fs.statSync(workspaceClaudeMd);
     if (st.size > AGENTS_MD_MAX_BYTES) {
       warnings.push(

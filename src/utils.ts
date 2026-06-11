@@ -90,6 +90,53 @@ export function isSecureRequest(c: any): boolean {
   return false;
 }
 
+/**
+ * 原子写文件（tmp + rename），继承 runtime-config.writeSecretFile 的两层防御：
+ * 1. stale-tmp：Node 的 mode 仅在 on-create 时生效——残留 tmp 会让本次写入复用旧
+ *    mode，故写前先 unlink（非 ENOENT 的 unlink 失败上抛，避免静默落错权限）；
+ * 2. chmod：传入 mode 时 rename 后再 chmod 一次，防御 APFS 上 mode 不跟随 inode
+ *    的边角情况。
+ * 不传 mode 时按 Node 默认（0o666 经 umask），与 fs.writeFileSync 行为一致。
+ */
+export function writeFileAtomic(
+  targetPath: string,
+  data: string | Buffer,
+  opts: { mode?: number } = {},
+): void {
+  const tmp = `${targetPath}.tmp`;
+  try {
+    fs.unlinkSync(tmp);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      throw err;
+    }
+  }
+  // fd 路径强制 mode 创建：fs.openSync 的 mode 在 O_CREAT 时一定生效，
+  // fs.writeFileSync(fd, ...) 内部循环处理 short-write。
+  const fd = fs.openSync(
+    tmp,
+    fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC,
+    opts.mode ?? 0o666,
+  );
+  try {
+    fs.writeFileSync(fd, data);
+  } finally {
+    try {
+      fs.closeSync(fd);
+    } catch {
+      /* ignore */
+    }
+  }
+  fs.renameSync(tmp, targetPath);
+  if (opts.mode !== undefined) {
+    try {
+      fs.chmodSync(targetPath, opts.mode);
+    } catch {
+      /* best effort */
+    }
+  }
+}
+
 /** Create IPC directories for an agent. */
 export function ensureAgentDirectories(
   folder: string,

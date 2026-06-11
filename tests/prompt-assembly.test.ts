@@ -196,6 +196,18 @@ describe('assemblePromptPieces — 分片加载与缓存（临时目录）', () 
     expect(buildSystemPromptAppend(args(), promptsDir)).toContain('## 交互B');
   });
 
+  test('memory 分片为空文件：整段跳过，不注入空 <memory-system> 块（上游 \'\' 语义）', () => {
+    fs.writeFileSync(path.join(promptsDir, 'memory-system.home.md'), '');
+    clearPromptShardCache();
+    const home = assemblePromptPieces(args(), promptsDir);
+    expect(home.some((p) => p.name === 'memory-system.home.md')).toBe(false);
+    expect(home.some((p) => p.text.includes('<memory-system>'))).toBe(false);
+    // guest 分片非空，仍正常注入（name/text 单点推导互相一致）
+    const guest = assemblePromptPieces(args({ isHome: false }), promptsDir);
+    const piece = guest.find((p) => p.name === 'memory-system.guest.md')!;
+    expect(piece.text).toBe('<memory-system>\n## 记忆guest\n</memory-system>');
+  });
+
   test('黄线剥除正则与上游同式：保留红线与安装审查两段', () => {
     const security = assemblePromptPieces(
       args({ disableMemoryLayer: true }),

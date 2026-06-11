@@ -222,6 +222,48 @@ describe('buildCodexContextPlan（AGENTS.md 内容生成）', () => {
     expect(fs.readFileSync(workspaceClaudeMd, 'utf8')).toBe(big);
   });
 
+  test('host + customCwd：预警锚定 {customCwd}/CLAUDE.md（codex 实际 cwd），不再看受管工作区', () => {
+    const custom = path.join(tmp, 'my-project');
+    const customClaudeMd = path.join(custom, 'CLAUDE.md');
+    writeFile(customClaudeMd, 'A'.repeat(AGENTS_MD_MAX_BYTES + 1));
+    // 受管工作区放超限残留：host+customCwd 群组的 codex 根本不读它，不应误报
+    const managedClaudeMd = path.join(groupsDir, 'ws-c', 'CLAUDE.md');
+    writeFile(managedClaudeMd, 'B'.repeat(AGENTS_MD_MAX_BYTES + 1));
+
+    const group = { ...fakeGroup('ws-c', 'u1', false), customCwd: custom };
+    const plan = planFor(group, 'home-u1');
+
+    expect(plan.warnings.some((w) => w.includes(customClaudeMd))).toBe(true);
+    expect(plan.warnings.some((w) => w.includes(managedClaudeMd))).toBe(false);
+  });
+
+  test('host + customCwd：customCwd 侧未超限 → 无预警（受管工作区超限残留不误报）', () => {
+    const custom = path.join(tmp, 'small-project');
+    writeFile(path.join(custom, 'CLAUDE.md'), '# 小文档');
+    writeFile(path.join(groupsDir, 'ws-d', 'CLAUDE.md'), 'B'.repeat(AGENTS_MD_MAX_BYTES + 1));
+
+    const plan = planFor({ ...fakeGroup('ws-d', 'u1', false), customCwd: custom }, 'home-u1');
+
+    expect(plan.warnings.some((w) => w.includes('工作区 CLAUDE.md'))).toBe(false);
+  });
+
+  test('container 模式：customCwd 不生效（宿主机模式语义），预警仍锚定受管工作区', () => {
+    const custom = path.join(tmp, 'container-custom');
+    const customClaudeMd = path.join(custom, 'CLAUDE.md');
+    writeFile(customClaudeMd, 'A'.repeat(AGENTS_MD_MAX_BYTES + 1));
+    const managedClaudeMd = path.join(groupsDir, 'ws-e', 'CLAUDE.md');
+    writeFile(managedClaudeMd, 'B'.repeat(AGENTS_MD_MAX_BYTES + 1));
+
+    const plan = planFor(
+      { ...fakeGroup('ws-e', 'u1', false), customCwd: custom },
+      'home-u1',
+      'container',
+    );
+
+    expect(plan.warnings.some((w) => w.includes(managedClaudeMd))).toBe(true);
+    expect(plan.warnings.some((w) => w.includes(customClaudeMd))).toBe(false);
+  });
+
   test('工作区 CLAUDE.md 未超限/不存在：无工作区预警', () => {
     writeFile(path.join(groupsDir, 'ws-small', 'CLAUDE.md'), '# 小文档');
 

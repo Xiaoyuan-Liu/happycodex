@@ -12,7 +12,13 @@ import path from 'path';
 
 import { describe, expect, test } from 'vitest';
 
-import { FixedFolderToolBridge, parseRunnerInput, resolveWorkspacePaths } from '../src/agent-runner.js';
+import {
+  FixedFolderToolBridge,
+  applySessionEnvFallbacks,
+  parseRunnerInput,
+  resolveWorkspacePaths,
+} from '../src/agent-runner.js';
+import type { ThreadSessionConfig } from '../src/contracts.js';
 import { FakeToolBridge } from './helpers/fake-tool-bridge.js';
 
 const DATA = '/data-root';
@@ -261,5 +267,54 @@ describe('parseRunnerInput — IPC 工具路由上下文（ContainerInput.chatJi
       JSON.stringify({ prompt: 'x', groupFolder: 'g1', images: 'nope' }),
     );
     expect(notArr.images).toBeUndefined();
+  });
+});
+
+describe('applySessionEnvFallbacks — env 系统设置消费端（上游 parity）', () => {
+  test('ANTHROPIC_MODEL：session.model 缺省时回退 env（上游 CLAUDE_MODEL 语义）', () => {
+    const session: ThreadSessionConfig = {};
+    applySessionEnvFallbacks(session, { ANTHROPIC_MODEL: 'gpt-5.1-codex' });
+    expect(session.model).toBe('gpt-5.1-codex');
+  });
+
+  test('ANTHROPIC_MODEL：显式 input.model 优先，env 不覆盖', () => {
+    const session: ThreadSessionConfig = { model: 'explicit-model' };
+    applySessionEnvFallbacks(session, { ANTHROPIC_MODEL: 'env-model' });
+    expect(session.model).toBe('explicit-model');
+  });
+
+  test('AUTO_COMPACT_WINDOW>0 → config.model_auto_compact_token_limit（codex 等价物）', () => {
+    const session: ThreadSessionConfig = {};
+    applySessionEnvFallbacks(session, { AUTO_COMPACT_WINDOW: '300000' });
+    expect(session.config).toEqual({ model_auto_compact_token_limit: 300000 });
+  });
+
+  test('AUTO_COMPACT_WINDOW：缺省/0/非数字不写 config；已显式配置不覆盖', () => {
+    const untouched: ThreadSessionConfig = {};
+    applySessionEnvFallbacks(untouched, {});
+    expect(untouched.config).toBeUndefined();
+
+    const zero: ThreadSessionConfig = {};
+    applySessionEnvFallbacks(zero, { AUTO_COMPACT_WINDOW: '0' });
+    expect(zero.config).toBeUndefined();
+
+    const garbage: ThreadSessionConfig = {};
+    applySessionEnvFallbacks(garbage, { AUTO_COMPACT_WINDOW: 'lots' });
+    expect(garbage.config).toBeUndefined();
+
+    const explicit: ThreadSessionConfig = {
+      config: { model_auto_compact_token_limit: 111 },
+    };
+    applySessionEnvFallbacks(explicit, { AUTO_COMPACT_WINDOW: '300000' });
+    expect(explicit.config).toEqual({ model_auto_compact_token_limit: 111 });
+  });
+
+  test('config 已有其他键时合并不丢失', () => {
+    const session: ThreadSessionConfig = { config: { web_search: 'live' } };
+    applySessionEnvFallbacks(session, { AUTO_COMPACT_WINDOW: '200000' });
+    expect(session.config).toEqual({
+      web_search: 'live',
+      model_auto_compact_token_limit: 200000,
+    });
   });
 });

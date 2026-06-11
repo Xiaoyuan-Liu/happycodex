@@ -11,10 +11,11 @@
  *   无协调）。PoC 阶段可容忍；生产应集中一个 refresh owner（留待"接主仓"阶段）。
  */
 
-import { mkdir, copyFile, access, readFile, writeFile, rm, rename } from 'node:fs/promises';
+import { mkdir, copyFile, access, readFile, writeFile, rm } from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
 import * as path from 'node:path';
 
+import { writeFileAtomic } from '../../utils.js';
 import type { ICodexHomeProvisioner } from './types.js';
 import { PREDEFINED_AGENTS, renderAgentToml } from './agent-defs.js';
 import {
@@ -193,10 +194,8 @@ export class FsCodexHomeProvisioner implements ICodexHomeProvisioner {
     }
     const next = `${AGENTS_MD_GENERATED_MARKER}\n\n${content}\n`;
     if (existing === next) return; // 幂等：内容未变，免写盘。
-    // tmp+rename 原子写（同 routes/config.ts 的既有模式）：避免崩溃留下空/半截文件。
-    const tmp = `${dest}.tmp`;
-    await writeFile(tmp, next, 'utf8');
-    await rename(tmp, dest);
+    // 原子写（tmp+rename，含 stale-tmp 防御）：避免崩溃留下空/半截文件。
+    writeFileAtomic(dest, next);
   }
 
   /**
@@ -293,7 +292,9 @@ export class FsCodexHomeProvisioner implements ICodexHomeProvisioner {
   /**
    * 当目标不存在时复制 src → dest。
    * - 目标已存在 → 跳过（幂等，保留 per-folder 自己的内容）。
-   * - required 且源不存在 → 抛错（auth.json 必需）。
+   * - required 且源不存在 → 抛错（auth.json 必需）。Web 端 setup 门与此同源：
+   *   buildSetupStatus（routes/auth.ts）的 needsSetup 同样钉共享 auth.json
+   *   存在性——两处必须保持一致，否则会出现「过了 setup 却起不了会话」或反之。
    * - 非 required 且源不存在 → 静默跳过（config.toml 可选）。
    */
   private async copyIfAbsent(

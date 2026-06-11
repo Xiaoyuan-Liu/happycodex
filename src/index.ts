@@ -132,6 +132,11 @@ import {
 } from './task-routing.js';
 import { resolveImGroupDefaults } from './im-group-defaults.js';
 import {
+  resolveIpcResultPath,
+  resolveSendFileAnchor,
+  isRealPathWithinRoots,
+} from './ipc-paths.js';
+import {
   applyAutoIsolateContextForGroups,
   getUserContextIsolationConfig,
 } from './im-context-isolation.js';
@@ -5054,13 +5059,18 @@ function startIpcWatcher(): void {
           try {
             const raw = await fsp.readFile(filePath, 'utf-8');
             const data = JSON.parse(raw);
-            // Pass source group identity to processTaskIpc for authorization
+            // Pass source group identity to processTaskIpc for authorization.
+            // CR#1: also pass the tasks dir the request arrived in (may be an
+            // agents/{aid}/ or tasks-run/{id}/ sub-namespace of this per-ipcRoot
+            // loop) so request-response results are written back where the
+            // requester actually polls — not hardcoded to the main namespace.
             await processTaskIpc(
               data,
               sourceGroup,
               isAdminHome,
               isHome,
               sourceGroupEntry,
+              tasksDir,
               ipcAgentId,
             );
             await fsp.unlink(filePath);
@@ -5171,6 +5181,9 @@ async function processTaskIpc(
   isAdminHome: boolean, // Whether source is admin home container
   isHome: boolean, // Whether source is a home container
   sourceGroupEntry: RegisteredGroup | undefined, // Source group's registered entry
+  // CR#1: tasks dir the request file was read from (anchors result write-back;
+  // may be agents/{aid}/tasks or tasks-run/{id}/tasks, not just the main namespace)
+  ipcTasksDir: string,
   ipcAgentId: string | null = null, // Non-null when IPC comes from a conversation agent
 ): Promise<void> {
   switch (data.type) {
@@ -5384,13 +5397,16 @@ async function processTaskIpc(
           );
           break;
         }
-        const listTasksDir = path.join(DATA_DIR, 'ipc', sourceGroup, 'tasks');
-        const listTasksDirResolved = path.resolve(listTasksDir);
-        const resultFileName = `list_tasks_result_${requestId}.json`;
-        const resultFilePath = path.resolve(listTasksDir, resultFileName);
-        if (!resultFilePath.startsWith(`${listTasksDirResolved}${path.sep}`)) {
+        // CR#1: anchor the result at the request's own tasks dir (sub-namespace
+        // aware), not a hardcoded DATA_DIR/ipc/{sourceGroup}/tasks. Containment
+        // semantics pinned by tests/ipc-result-routing.test.ts.
+        const resultFilePath = resolveIpcResultPath(
+          ipcTasksDir,
+          `list_tasks_result_${requestId}.json`,
+        );
+        if (!resultFilePath) {
           logger.warn(
-            { sourceGroup, requestId, resultFilePath },
+            { sourceGroup, requestId, ipcTasksDir },
             'Rejected list_tasks request with unsafe result file path',
           );
           break;
@@ -5441,6 +5457,7 @@ async function processTaskIpc(
         sourceGroup,
         sourceGroupEntry,
         isAdminHome,
+        ipcTasksDir,
       );
       break;
 
@@ -5522,13 +5539,14 @@ async function processTaskIpc(
           );
           break;
         }
-        const tasksDir = path.join(DATA_DIR, 'ipc', sourceGroup, 'tasks');
-        const tasksDirResolved = path.resolve(tasksDir);
-        const resultFileName = `install_skill_result_${requestId}.json`;
-        const resultFilePath = path.resolve(tasksDir, resultFileName);
-        if (!resultFilePath.startsWith(`${tasksDirResolved}${path.sep}`)) {
+        // CR#1: result anchored at the request's own tasks dir (sub-namespace aware).
+        const resultFilePath = resolveIpcResultPath(
+          ipcTasksDir,
+          `install_skill_result_${requestId}.json`,
+        );
+        if (!resultFilePath) {
           logger.warn(
-            { sourceGroup, requestId, resultFilePath },
+            { sourceGroup, requestId, ipcTasksDir },
             'Rejected install_skill request with unsafe result file path',
           );
           break;
@@ -5599,13 +5617,14 @@ async function processTaskIpc(
           );
           break;
         }
-        const tasksDir = path.join(DATA_DIR, 'ipc', sourceGroup, 'tasks');
-        const tasksDirResolved = path.resolve(tasksDir);
-        const resultFileName = `uninstall_skill_result_${requestId}.json`;
-        const resultFilePath = path.resolve(tasksDir, resultFileName);
-        if (!resultFilePath.startsWith(`${tasksDirResolved}${path.sep}`)) {
+        // CR#1: result anchored at the request's own tasks dir (sub-namespace aware).
+        const resultFilePath = resolveIpcResultPath(
+          ipcTasksDir,
+          `uninstall_skill_result_${requestId}.json`,
+        );
+        if (!resultFilePath) {
           logger.warn(
-            { sourceGroup, requestId, resultFilePath },
+            { sourceGroup, requestId, ipcTasksDir },
             'Rejected uninstall_skill request with unsafe result file path',
           );
           break;
@@ -5674,12 +5693,23 @@ async function processTaskIpc(
         }
 
         try {
-          // Resolve to workspace path - IPC sends relative paths from workspace/group
-          const fullPath = path.join(GROUPS_DIR, sourceGroup, data.filePath);
+          // CR#8: resolve relative paths against the same base the agent process
+          // actually ran in — host mode with customCwd anchors at customCwd
+          // (container-runner injects HAPPYCLAW_WORKSPACE_GROUP = customCwd, the
+          // producer-side ipc-bridge sendFile emits paths relative to it).
+          // Anchor semantics pinned by tests/ipc-result-routing.test.ts.
+          const anchor = resolveSendFileAnchor({
+            groupsDir: GROUPS_DIR,
+            sourceGroup,
+            executionMode: sourceGroupEntry?.executionMode,
+            customCwd: sourceGroupEntry?.customCwd,
+          });
+          const fullPath = path.join(anchor.workspaceBase, data.filePath);
 
-          // Path traversal protection: ensure resolved path stays within workspace
+          // Path traversal protection (lexical, first line): ensure resolved
+          // path stays within the workspace base
           let resolvedPath = path.resolve(fullPath);
-          const safeRoot = path.resolve(GROUPS_DIR, sourceGroup) + path.sep;
+          const safeRoot = path.resolve(anchor.workspaceBase) + path.sep;
           if (!resolvedPath.startsWith(safeRoot)) {
             logger.warn(
               { sourceGroup, filePath: data.filePath, resolvedPath },
@@ -5689,10 +5719,11 @@ async function processTaskIpc(
           }
 
           if (!fs.existsSync(resolvedPath)) {
-            // Fallback: search in downloads subdirs (DingTalk/Telegram files land here)
+            // Fallback: search in downloads subdirs (DingTalk/Telegram files land here).
+            // Downloads always live under the default group dir, never customCwd
+            // (im-downloader anchors at GROUPS_DIR/{folder}/downloads).
             const downloadsDir = path.join(
-              GROUPS_DIR,
-              sourceGroup,
+              anchor.defaultGroupBase,
               'downloads',
             );
             const fileName = data.fileName || path.basename(data.filePath);
@@ -5728,6 +5759,34 @@ async function processTaskIpc(
               );
               break;
             }
+          }
+
+          // CR#2: physical (realpath) validation — last line of defense. The
+          // lexical checks above (and the producer-side ipc-bridge isWithin)
+          // follow symlinks, so a workspace-internal `evil -> /etc/...` link
+          // would otherwise exfiltrate arbitrary host files. Applies to the
+          // downloads-fallback path too.
+          if (!isRealPathWithinRoots(resolvedPath, anchor.allowedRoots)) {
+            const escapeMsg = `⚠️ 文件 "${data.fileName}" 的真实位置在工作区之外（symlink 越界），已拒绝发送。`;
+            broadcastToWebClients(sourceGroup, escapeMsg);
+            const escapeImRoute = resolveImRoute({
+              ipcAgentId,
+              isHome,
+              chatJid: data.chatJid,
+              sourceGroup,
+            });
+            if (escapeImRoute) {
+              try {
+                await imManager.sendMessage(escapeImRoute, escapeMsg);
+              } catch {
+                // ignore — warning delivery failure should not crash the loop
+              }
+            }
+            logger.warn(
+              { sourceGroup, filePath: data.filePath, resolvedPath },
+              'send_file blocked: realpath escapes allowed roots (symlink)',
+            );
+            break;
           }
 
           const fileImRoute = resolveImRoute({
@@ -5787,7 +5846,8 @@ async function processTaskIpc(
 
 /**
  * Handle Discord-specific IPC requests (history, channel info, server info).
- * Writes a result file `{type}_result_{requestId}.json` back to the source group's tasks dir.
+ * Writes a result file `{type}_result_{requestId}.json` back to the tasks dir the
+ * request arrived in (CR#1: sub-namespace aware — agents/{aid}/ or tasks-run/{id}/).
  * Authorization: target chatJid must be owned by sourceGroup's user (or admin home for cross-group).
  */
 async function handleDiscordIpcRequest(
@@ -5801,6 +5861,8 @@ async function handleDiscordIpcRequest(
   sourceGroup: string,
   sourceGroupEntry: RegisteredGroup | undefined,
   isAdminHome: boolean,
+  // CR#1: tasks dir the request arrived in (anchors result write-back)
+  ipcTasksDir: string,
 ): Promise<void> {
   const requestId = data.requestId;
   if (!requestId || !SAFE_REQUEST_ID_RE.test(requestId)) {
@@ -5811,13 +5873,14 @@ async function handleDiscordIpcRequest(
     return;
   }
 
-  const tasksDir = path.join(DATA_DIR, 'ipc', sourceGroup, 'tasks');
-  const tasksDirResolved = path.resolve(tasksDir);
-  const resultFileName = `${data.type}_result_${requestId}.json`;
-  const resultFilePath = path.resolve(tasksDir, resultFileName);
-  if (!resultFilePath.startsWith(`${tasksDirResolved}${path.sep}`)) {
+  // CR#1: result anchored at the request's own tasks dir (sub-namespace aware).
+  const resultFilePath = resolveIpcResultPath(
+    ipcTasksDir,
+    `${data.type}_result_${requestId}.json`,
+  );
+  if (!resultFilePath) {
     logger.warn(
-      { sourceGroup, type: data.type, resultFilePath },
+      { sourceGroup, type: data.type, ipcTasksDir },
       'Rejected Discord IPC request with unsafe result file path',
     );
     return;

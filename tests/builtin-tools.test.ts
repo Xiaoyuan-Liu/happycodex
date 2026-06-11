@@ -6,7 +6,7 @@
  *  - 每个工具 spec.inputSchema 是合法的 object schema（additionalProperties:false）；
  *  - 逐个 handler：合法 args → 调对应 bridge 方法（断言 bridge.calls）+ success:true；
  *  - 缺必填字段 → success:false 且文案含 "missing required field"；
- *  - memory_search / list_task 把数据带进文本；memory_get 命中文本 / (not found)；
+ *  - memory_search / list_tasks 把数据带进文本；memory_get 命中文本 / (not found)；
  *  - A4 新工具：send_image 元数据文案、send_file 文案、discord 历史格式化 / DM null 分支。
  */
 
@@ -32,7 +32,7 @@ const EXPECTED_NAMES = [
   'send_image',
   'send_file',
   'schedule_task',
-  'list_task',
+  'list_tasks',
   'pause_task',
   'resume_task',
   'cancel_task',
@@ -138,12 +138,12 @@ describe('createBuiltinTools — handler 合法路径', () => {
     });
   });
 
-  it('list_task → bridge.listTasks，数据进 text', async () => {
+  it('list_tasks → bridge.listTasks，数据进 text', async () => {
     bridge.tasks = [
       { id: 't1', name: 'A', status: 'active' },
       { id: 't2', name: 'B', status: 'paused' },
     ];
-    const r = await tools.get('list_task')!.handler({}, ctxWith(bridge));
+    const r = await tools.get('list_tasks')!.handler({}, ctxWith(bridge));
     expect(r.success).toBe(true);
     expect(bridge.lastCall()).toEqual({ op: 'listTasks', args: [FOLDER] });
     const t = text(r);

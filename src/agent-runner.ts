@@ -145,9 +145,8 @@ class FixedFolderToolBridge implements ToolBridge {
   sendImage(_folder: string, filePath: string, caption?: string): Promise<SendImageResult> {
     // 工作区文件解析锚点由内层 bridge 的 workspaceGroupDir 承担（per-folder 绝对路径），
     // folder 参数只决定 IPC 落盘 namespace —— 钉到 ipcFolder。
-    return caption === undefined
-      ? this.inner.sendImage(this.ipcFolder, filePath)
-      : this.inner.sendImage(this.ipcFolder, filePath, caption);
+    // #20：可选参数直传（undefined 实参对 `caption?: string` 形参合法），不再三元双调用。
+    return this.inner.sendImage(this.ipcFolder, filePath, caption);
   }
   sendFile(_folder: string, filePath: string, fileName: string): Promise<void> {
     return this.inner.sendFile(this.ipcFolder, filePath, fileName);
@@ -168,9 +167,7 @@ class FixedFolderToolBridge implements ToolBridge {
     return this.inner.cancelTask(this.ipcFolder, taskId);
   }
   registerGroup(_folder: string, jid: string, name?: string): Promise<void> {
-    return name === undefined
-      ? this.inner.registerGroup(this.ipcFolder, jid)
-      : this.inner.registerGroup(this.ipcFolder, jid, name);
+    return this.inner.registerGroup(this.ipcFolder, jid, name);
   }
   installSkill(_folder: string, name: string): Promise<{ installed?: string[] }> {
     return this.inner.installSkill(this.ipcFolder, name);
@@ -182,9 +179,7 @@ class FixedFolderToolBridge implements ToolBridge {
     _folder: string,
     opts?: DiscordHistoryOptions,
   ): Promise<DiscordHistoryMessage[]> {
-    return opts === undefined
-      ? this.inner.discordGetHistory(this.ipcFolder)
-      : this.inner.discordGetHistory(this.ipcFolder, opts);
+    return this.inner.discordGetHistory(this.ipcFolder, opts);
   }
   discordGetChannelInfo(_folder: string): Promise<unknown> {
     return this.inner.discordGetChannelInfo(this.ipcFolder);
@@ -193,9 +188,7 @@ class FixedFolderToolBridge implements ToolBridge {
     return this.inner.discordGetServerInfo(this.ipcFolder);
   }
   memoryAppend(_folder: string, content: string, scope?: string): Promise<void> {
-    return scope === undefined
-      ? this.inner.memoryAppend(this.memoryFolder, content)
-      : this.inner.memoryAppend(this.memoryFolder, content, scope);
+    return this.inner.memoryAppend(this.memoryFolder, content, scope);
   }
   memorySearch(_folder: string, query: string): Promise<MemoryHit[]> {
     return this.inner.memorySearch(this.memoryFolder, query);
@@ -319,6 +312,34 @@ export function parseRunnerInput(raw: string): CodexRunnerInput {
   };
 }
 
+/**
+ * 进程 env 中两个引擎相关系统设置的消费端（container-runner buildAgentEnvLines 注入；
+ * 上游消费端是 agent-runner 自身，这里对齐）。显式 input 配置一律优先，env 仅作回退：
+ * - ANTHROPIC_MODEL：上游以 `process.env.ANTHROPIC_MODEL || 默认` 作为模型来源
+ *   （upstream agent-runner index.ts:55 CLAUDE_MODEL）。ContainerInput 不携带 model，
+ *   故生产链路里这是唯一的模型覆盖通道——Web 面板「模型」框经群组 customEnv 注入的
+ *   正是该键（键名保留上游 parity，不改名）。
+ * - AUTO_COMPACT_WINDOW：上游经 SDK flagSettings.autoCompactWindow 提前触发对话压缩
+ *   （upstream agent-runner index.ts:1329-1335）；codex 等价配置是 thread/start
+ *   config.model_auto_compact_token_limit（auto-compact 在 turn 边界生效）。
+ */
+export function applySessionEnvFallbacks(
+  session: ThreadSessionConfig,
+  env: NodeJS.ProcessEnv = process.env,
+): void {
+  if (!session.model && env.ANTHROPIC_MODEL) {
+    session.model = env.ANTHROPIC_MODEL;
+  }
+  const autoCompactWindow = Number.parseInt(env.AUTO_COMPACT_WINDOW ?? '0', 10);
+  if (
+    Number.isFinite(autoCompactWindow) &&
+    autoCompactWindow > 0 &&
+    session.config?.['model_auto_compact_token_limit'] === undefined
+  ) {
+    session.config = { ...session.config, model_auto_compact_token_limit: autoCompactWindow };
+  }
+}
+
 // ───────────────────────── 主流程 ─────────────────────────
 
 async function main(): Promise<void> {
@@ -336,6 +357,7 @@ async function main(): Promise<void> {
     process.exit(1);
   }
   log(`input parsed: folder=${input.groupFolder} promptChars=${input.prompt.length} enableTools=${enableTools}`);
+  applySessionEnvFallbacks(input.session);
 
   const folder = input.groupFolder;
   // 工作区路径：HAPPYCLAW_*（上游名，per-folder）优先，HAPPYCODEX_*（旧名，root 语义）兜底。

@@ -5,6 +5,7 @@ import os from 'os';
 
 import { ASSISTANT_NAME, DATA_DIR } from './config.js';
 import { logger } from './logger.js';
+import { writeFileAtomic } from './utils.js';
 
 const MAX_FIELD_LENGTH = 2000;
 const CURRENT_CONFIG_VERSION = 3;
@@ -16,40 +17,12 @@ const OFFICIAL_CLAUDE_PROFILE_ID = '__official__';
  * 写加密 / OAuth / IM 凭据等含敏感数据的 JSON 配置文件。
  * 即便外层 AES-256-GCM 已加密 ciphertext，密文 + IV + auth tag 仍不应让
  * 同主机其他本地账号读到（旧版默认 0o644 在多租户场景下泄漏整套 IM/OAuth 凭据
- * 的 ciphertext，配合 key 文件泄漏即可解密）。统一走该 helper：tmp 文件以
- * 0o600 创建，rename 后再次 chmod 防御 APFS 上 mode 不跟随 inode 的边角情况。
+ * 的 ciphertext，配合 key 文件泄漏即可解密）。
+ * 实现委托 utils.writeFileAtomic（stale-tmp unlink + fd O_CREAT 强制 mode +
+ * rename 后补 chmod 的防御已下沉该 helper，CR#15），这里只钉死 0o600 语义。
  */
 function writeSecretFile(targetPath: string, data: string): void {
-  const tmp = `${targetPath}.tmp`;
-  // 先 unlink stale tmp，避免 fs.writeFileSync 在文件已存在时复用旧 mode
-  // (Node 文档：mode 仅在 on-create 时应用)。残留 0o644 会让我们这次写入
-  // 落到 0o644 ciphertext，rename 后即便 chmod 0o600 也有 race 窗口。
-  try {
-    fs.unlinkSync(tmp);
-  } catch (err: any) {
-    if (err && err.code !== 'ENOENT') {
-      // 罕见路径权限错：让外层捕捉到，避免静默把 secret 落到 0o644。
-      throw err;
-    }
-  }
-  // 用 fd 路径强制 0o600 创建：fs.openSync 的 mode 在 O_CREAT 时一定生效，
-  // fs.writeFileSync(fd, ...) 内部循环处理 short-write。
-  const fd = fs.openSync(
-    tmp,
-    fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC,
-    0o600,
-  );
-  try {
-    fs.writeFileSync(fd, data);
-  } finally {
-    try { fs.closeSync(fd); } catch { /* ignore */ }
-  }
-  fs.renameSync(tmp, targetPath);
-  try {
-    fs.chmodSync(targetPath, 0o600);
-  } catch {
-    /* best effort */
-  }
+  writeFileAtomic(targetPath, data, { mode: 0o600 });
 }
 
 const CLAUDE_CONFIG_DIR = path.join(DATA_DIR, 'config');
@@ -2101,6 +2074,23 @@ function containerEnvPath(folder: string): string {
   return path.join(CONTAINER_ENV_DIR, `${folder}.json`);
 }
 
+/**
+ * 残留的 Claude provider 覆盖字段（happycodex 无消费路径，仅容忍读取）。
+ * 单一真相源：写侧 routes/groups.ts PUT /:jid/env 的「保存即清」剥离 import 同一列表
+ * （读侧容忍告警 + 写时淘汰共用，键集不漂移）。
+ */
+export const LEGACY_CONTAINER_ENV_KEYS = [
+  'anthropicBaseUrl',
+  'anthropicAuthToken',
+  'anthropicApiKey',
+  'claudeCodeOauthToken',
+  'claudeOAuthCredentials',
+  'anthropicModel',
+] as const;
+
+/** 每个 folder 只告警一次（热路径 buildAgentEnvLines 每次 spawn 都会读取该文件）。 */
+const warnedLegacyContainerEnvFolders = new Set<string>();
+
 export function getContainerEnvConfig(folder: string): ContainerEnvConfig {
   const filePath = containerEnvPath(folder);
   try {
@@ -2115,6 +2105,18 @@ export function getContainerEnvConfig(folder: string): ContainerEnvConfig {
       ) {
         stored.anthropicModel = stored.happyclawModel;
         delete stored.happyclawModel;
+      }
+      // 残留 legacy provider 键：codex 运行时不消费（buildContainerEnvLines 只透传
+      // customEnv），读到时按 folder 去重告警一次，提示存量配置已失效、保存可清除。
+      const legacyKeys = LEGACY_CONTAINER_ENV_KEYS.filter(
+        (k) => (stored as Record<string, unknown>)[k] !== undefined,
+      );
+      if (legacyKeys.length > 0 && !warnedLegacyContainerEnvFolders.has(folder)) {
+        warnedLegacyContainerEnvFolders.add(folder);
+        logger.warn(
+          { folder, legacyKeys },
+          'Container env config contains residual legacy Claude provider keys; they are ignored by the codex runtime (only customEnv is injected)',
+        );
       }
       return stored;
     }
@@ -3043,13 +3045,16 @@ export interface SystemSettings {
   billingCurrencyRate: number;
   // External Claude directory (admin only)
   externalClaudeDir: string;
-  // Claude Agent SDK 自动对话压缩触发点（tokens）。0 = 保留 SDK 默认（约 1M）
+  // 对话自动压缩触发点（tokens）。>0 时经 AUTO_COMPACT_WINDOW 注入 agent 进程 env
+  // （container-runner.ts buildAgentEnvLines）；0 = 不注入，保留 codex 引擎默认
+  // （model_auto_compact_token_limit 语义）
   autoCompactWindow: number;
   // 预定义 SubAgent（code-reviewer / web-researcher）使用的模型别名或完整 ID。
   // 经 SUBAGENT_MODEL 注入容器；默认 inherit（继承主会话模型，不擅自改变），可在设置页改。
   subagentModel: string;
-  // 关闭 admin host 模式下 HappyClaw 自带的 memory 注入层（MCP 工具、模板 CLAUDE.md、WORKSPACE_GLOBAL/MEMORY env）
-  // 启用后 admin 可以在 host 模式下完全按原生 Claude Code 的 Playbook 使用 ~/.claude/ 下的 memory/skills/rules
+  // 关闭 admin host 模式下 HappyClaw 自带的 memory 注入层（MCP 工具、模板 AGENTS.md、
+  // WORKSPACE_GLOBAL/MEMORY env）。启用后 admin 可在 host 模式 + customCwd 下直接用
+  // 自己项目的 AGENTS.md/CLAUDE.md 与 externalClaudeDir（只读数据源）原生工作流
   disableMemoryLayerForAdminHost: boolean;
   // Plugin catalog 自动扫描：true（默认）= 启动 5s 后扫一次 + 每小时一次；
   // false = 关闭定时扫描，admin 仍可手点 POST /api/plugins/catalog/scan。
@@ -3092,9 +3097,11 @@ function parseIntEnv(envVar: string | undefined, fallback: number): number {
 }
 
 /**
- * autoCompactWindow 区间收紧：0 = 禁用（用 SDK 默认 ~1M）；>0 收紧到 [100000, 1000000]。
- * SDK 侧 schema 为 assistant.mjs 的 `.min(1e5).max(1e6).catch(void 0)`——越界值会被静默剥离
- * 回退默认。在读（file/env）与写（save）两端统一调用，避免存量/手填的越界值在下游静默失效。
+ * autoCompactWindow 区间收紧：0 = 禁用（不注入，保留引擎默认）；>0 收紧到 [100000, 1000000]。
+ * 区间 [100K, 1M] 沿用上游 Claude SDK 时代的约束（上游 SDK schema assistant.mjs 的
+ * `.min(1e5).max(1e6).catch(void 0)` 会静默剥离越界值回退默认）；codex 侧对应
+ * model_auto_compact_token_limit、无此 schema，保留统一 clamp 是为了存量/手填的越界值
+ * 不发生语义漂移。在读（file/env）与写（save）两端统一调用。
  */
 function clampAutoCompactWindow(v: unknown): number {
   const n = typeof v === 'number' ? v : NaN;

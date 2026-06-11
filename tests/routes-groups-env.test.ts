@@ -5,8 +5,9 @@
  *
  * 这些字段随 provider failover 作废（codex 引擎无任何生效路径，保存只会沉淀
  * 死配置）：ContainerEnvSchema 收窄为仅 customEnv（zod 默认 strip 未知键），
- * handler 不再拷贝。读侧保持容忍——旧 on-disk 文件里的残留字段在
- * customEnv-only 更新后原样保留（`{ ...current }`），GET 仍按 masked 形状返回。
+ * handler 不再拷贝。写时淘汰（保存即清）：旧 on-disk 文件里的残留 provider
+ * 字段（含明文密钥）在任意一次 PUT 时被显式剥离——这是存量密钥唯一的清除
+ * 路径。读侧保持容忍：从未重写过的旧文件 GET 仍按 masked 形状返回。
  */
 import fs from 'fs';
 import os from 'os';
@@ -150,14 +151,18 @@ describe('PUT /:jid/env rejects per-group Claude provider overrides (#8)', () =>
     expect(stored.customEnv).toEqual({ GITHUB_TOKEN: 'ghp_abc' });
   });
 
-  test('customEnv-only update preserves residual legacy fields in old on-disk files (read-side tolerance)', async () => {
-    // 模拟旧版本落盘的配置文件（含已作废的 provider 覆盖字段）。
+  test('customEnv-only update purges residual legacy fields from old on-disk files (write-time eviction)', async () => {
+    // 模拟旧版本落盘的配置文件（含已作废的 provider 覆盖字段与明文密钥）。
     fs.mkdirSync(path.dirname(envConfigPath()), { recursive: true });
     fs.writeFileSync(
       envConfigPath(),
       JSON.stringify(
         {
+          anthropicBaseUrl: 'https://legacy.example.com',
+          anthropicAuthToken: 'legacy-auth-token',
           anthropicApiKey: 'legacy-key',
+          claudeCodeOauthToken: 'legacy-oauth',
+          claudeOAuthCredentials: { accessToken: 'legacy-access' },
           anthropicModel: 'legacy-model',
           customEnv: { OLD: 'old' },
         },
@@ -166,6 +171,15 @@ describe('PUT /:jid/env rejects per-group Claude provider overrides (#8)', () =>
       ),
     );
 
+    // 读侧容忍：从未重写过的旧文件，GET 仍按 masked 形状展示残留。
+    const preRes = await groupRoutes.request(`/${encodeURIComponent(JID)}/env`, {
+      method: 'GET',
+    });
+    expect(preRes.status).toBe(200);
+    const preBody = (await preRes.json()) as Record<string, unknown>;
+    expect(preBody.hasAnthropicApiKey).toBe(true);
+    expect(preBody.anthropicModel).toBe('legacy-model');
+
     const res = await groupRoutes.request(`/${encodeURIComponent(JID)}/env`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
@@ -173,23 +187,25 @@ describe('PUT /:jid/env rejects per-group Claude provider overrides (#8)', () =>
     });
     expect(res.status).toBe(200);
 
-    // 残留字段不丢（{ ...current } 原样回写），customEnv 已更新。
+    // 写时淘汰（保存即清）：legacy 残留（含明文密钥）一个不剩，customEnv 已更新。
     const stored = readEnvConfigFile();
-    expect(stored.anthropicApiKey).toBe('legacy-key');
-    expect(stored.anthropicModel).toBe('legacy-model');
+    expect(Object.keys(stored).sort()).toEqual(['customEnv']);
     expect(stored.customEnv).toEqual({ NEW: 'new' });
 
-    // GET 读侧仍按 masked 形状容忍展示 legacy 字段。
+    // GET 随之自然清零。
     const getRes = await groupRoutes.request(`/${encodeURIComponent(JID)}/env`, {
       method: 'GET',
     });
     expect(getRes.status).toBe(200);
     const getBody = (await getRes.json()) as Record<string, unknown>;
-    expect(getBody.hasAnthropicApiKey).toBe(true);
-    expect(getBody.anthropicModel).toBe('legacy-model');
+    expect(getBody.hasAnthropicAuthToken).toBe(false);
+    expect(getBody.hasAnthropicApiKey).toBe(false);
+    expect(getBody.hasClaudeCodeOauthToken).toBe(false);
+    expect(getBody.anthropicBaseUrl).toBe('');
+    expect(getBody.anthropicModel).toBe('');
   });
 
-  test('legacy fields in payload cannot resurrect/override residual on-disk values', async () => {
+  test('legacy fields in payload cannot resurrect residual on-disk values (both purged)', async () => {
     fs.mkdirSync(path.dirname(envConfigPath()), { recursive: true });
     fs.writeFileSync(
       envConfigPath(),
@@ -207,7 +223,8 @@ describe('PUT /:jid/env rejects per-group Claude provider overrides (#8)', () =>
     expect(res.status).toBe(200);
 
     const stored = readEnvConfigFile();
-    // 写侧剥离：残留值保持旧值，不被请求载荷改写。
-    expect(stored.anthropicApiKey).toBe('legacy-key');
+    // 写侧剥离 + 写时淘汰：载荷值不被写入，残留旧值也被清除。
+    expect(stored.anthropicApiKey).toBeUndefined();
+    expect(Object.keys(stored).sort()).toEqual(['customEnv']);
   });
 });

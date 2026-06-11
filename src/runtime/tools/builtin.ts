@@ -16,6 +16,7 @@
  */
 
 import { toolTextResult } from '../../appserver/protocol.js';
+import { validateSkillId } from '../../skill-utils.js';
 import type {
   ToolDefinition,
   ToolHandler,
@@ -243,9 +244,9 @@ const installSkill: ToolHandler = async (args, ctx) => {
 const uninstallSkill: ToolHandler = async (args, ctx) => {
   const name = reqString(args, 'name');
   if (name === null) return missing('name');
-  // skill ID 形状校验对齐上游：目录名（字母数字 + 连字符/下划线）。
+  // skill ID 形状校验：单一真相 skill-utils.validateSkillId（routes/skills.ts 同源）。
   const skillId = name.trim();
-  if (!/^[\w\-]+$/.test(skillId)) {
+  if (!validateSkillId(skillId)) {
     return toolTextResult(
       `Invalid skill ID: "${skillId}". Must be alphanumeric with hyphens/underscores.`,
       false,
@@ -405,7 +406,7 @@ export function createBuiltinTools(): ToolDefinition[] {
     },
     {
       spec: {
-        name: 'list_task',
+        name: 'list_tasks',
         description:
           '列出当前会话的所有定时任务（管理员主容器可见全部任务）。返回任务的 id、名称与状态。' +
           '数据来自主进程权威任务表（请求-响应回执）；主进程未运行时降级为本进程排队快照。',

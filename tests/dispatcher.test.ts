@@ -466,8 +466,64 @@ describe('ToolDispatcher', () => {
     }
   });
 
-  it('#24 显式 dispatchTimeoutMs 统一覆盖所有工具（含 install_skill，对齐 IpcToolBridge pollTimeoutMs 语义）', async () => {
+  // 语义更新（CR#13）：原用例「显式 dispatchTimeoutMs 统一拍平所有工具（含 install_skill）」
+  // 被不变量校验取代——低于 bridge poll 上限 + 余量的显式值对 install_skill 是 #24 复发路径，
+  // 构造期 warn + clamp 到 130s；普通工具仍按显式值拍平。
+  it('#13 显式 dispatchTimeoutMs 低于 install 不变量 → warn + install_skill 钳到 130s，普通工具仍拍平', async () => {
     vi.useFakeTimers();
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const client = new FakeClient();
+      const registry = new FakeRegistry();
+      registry.register(makeTool('install_skill', () => new Promise<never>(() => {})));
+      registry.register(makeTool('hang', () => new Promise<never>(() => {})));
+      new ToolDispatcher(client, registry, {
+        groupFolder: 'g',
+        bridge: new FakeToolBridge(),
+        getThreadId: () => 'th',
+        dispatchTimeoutMs: 1000,
+      });
+      // 构造期不变量校验：违反即 warn（一次）。
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(String(warnSpy.mock.calls[0]?.[0])).toMatch(/install_skill/);
+
+      let installResponded = false;
+      let installResult: unknown;
+      await client.emitServerRequestRaw(
+        ServerReq.dynamicToolCall,
+        callParams({ tool: 'install_skill' }),
+        (r) => {
+          installResponded = true;
+          installResult = r;
+        },
+      );
+      let hangResponded = false;
+      await client.emitServerRequestRaw(
+        ServerReq.dynamicToolCall,
+        callParams({ tool: 'hang' }),
+        () => {
+          hangResponded = true;
+        },
+      );
+
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(hangResponded).toBe(true); // 普通工具：显式值照常拍平
+      expect(installResponded).toBe(false); // install_skill：不被 1s 假失败抢答（钳到 130s）
+
+      await vi.advanceTimersByTimeAsync(129_000); // 累计 130s
+      expect(installResponded).toBe(true);
+      expect(installResult).toMatchObject({ success: false });
+      const text = (installResult as DynamicToolCallResponse).contentItems[0] as { text: string };
+      expect(text.text).toMatch(/timeout.*130000ms/);
+    } finally {
+      warnSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it('#13 显式 dispatchTimeoutMs ≥ 不变量（200s）→ 统一拍平含 install_skill，不 warn 不 clamp', async () => {
+    vi.useFakeTimers();
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     try {
       const client = new FakeClient();
       const registry = new FakeRegistry();
@@ -476,23 +532,55 @@ describe('ToolDispatcher', () => {
         groupFolder: 'g',
         bridge: new FakeToolBridge(),
         getThreadId: () => 'th',
-        dispatchTimeoutMs: 1000,
+        dispatchTimeoutMs: 200_000,
       });
+      expect(warnSpy).not.toHaveBeenCalled();
 
       let responded = false;
-      let result: unknown;
       await client.emitServerRequestRaw(
         ServerReq.dynamicToolCall,
         callParams({ tool: 'install_skill' }),
-        (r) => {
+        () => {
           responded = true;
-          result = r;
         },
       );
-      await vi.advanceTimersByTimeAsync(1000);
+      await vi.advanceTimersByTimeAsync(130_000);
+      expect(responded).toBe(false); // 显式 200s 生效（未被回落到 130s）
+      await vi.advanceTimersByTimeAsync(70_000); // 累计 200s
       expect(responded).toBe(true);
-      expect(result).toMatchObject({ success: false });
     } finally {
+      warnSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it('#13 dispatchTimeoutMs<=0 关闭看门狗对 install_skill 同样生效（不 clamp、不 warn）', async () => {
+    vi.useFakeTimers();
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const client = new FakeClient();
+      const registry = new FakeRegistry();
+      registry.register(makeTool('install_skill', () => new Promise<never>(() => {})));
+      new ToolDispatcher(client, registry, {
+        groupFolder: 'g',
+        bridge: new FakeToolBridge(),
+        getThreadId: () => 'th',
+        dispatchTimeoutMs: 0,
+      });
+      expect(warnSpy).not.toHaveBeenCalled();
+
+      let responded = false;
+      await client.emitServerRequestRaw(
+        ServerReq.dynamicToolCall,
+        callParams({ tool: 'install_skill' }),
+        () => {
+          responded = true;
+        },
+      );
+      await vi.advanceTimersByTimeAsync(300_000);
+      expect(responded).toBe(false); // 关闭超时语义保留
+    } finally {
+      warnSpy.mockRestore();
       vi.useRealTimers();
     }
   });

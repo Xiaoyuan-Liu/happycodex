@@ -13,7 +13,7 @@
  *   - -s read-only：摘要/解析类任务无需写盘，最小权限；
  *   - --output-last-message：最终 agent 消息落临时文件，避免解析混杂 stdout；
  *   - CODEX_HOME 取共享认证（HAPPYCODEX_SHARED_CODEX_HOME > CODEX_HOME > ~/.codex，
- *     与 container-runner.sharedCodexHomeDir 同序）。
+ *     单一真相源 codex-paths.sharedCodexHomeDir）。
  *
  * 失败/超时恒返回 null —— 上游所有调用方（/recall、routes/tasks.ts 的 NL 任务
  * 解析、routes/bug-report.ts 的 AI 摘要、LLM 标题）本就把 null 当作"AI 不可用"
@@ -26,18 +26,10 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
+import { sharedCodexHomeDir } from './codex-paths.js';
 import { logger } from './logger.js';
 
 const DEFAULT_TIMEOUT_MS = 30_000;
-
-/** 共享 codex home（与 container-runner.sharedCodexHomeDir 的解析顺序一致）。 */
-function sharedCodexHomeDir(): string {
-  return (
-    process.env.HAPPYCODEX_SHARED_CODEX_HOME ||
-    process.env.CODEX_HOME ||
-    path.join(os.homedir(), '.codex')
-  );
-}
 
 export async function sdkQuery(
   prompt: string,

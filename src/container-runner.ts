@@ -28,9 +28,9 @@ import {
   spawn,
 } from 'child_process';
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
 
+import { sharedCodexHomeDir } from './codex-paths.js';
 import { CONTAINER_IMAGE, DATA_DIR, GROUPS_DIR, TIMEZONE } from './config.js';
 import { logger } from './logger.js';
 import { resolveHostNodeBinary, resolveBinaryOnPath } from './node-resolver.js';
@@ -155,18 +155,7 @@ function mkdirForContainer(dirPath: string): void {
 // codex 单账号凭据由 per-folder CODEX_HOME（auth.json 复制）承载，无池化选择。
 
 // ─── codex 引擎面：CODEX_HOME provision + 引擎 env ───────────────────
-
-/**
- * 共享 codex home（已 `codex login` 的单账号凭据源）。
- * 优先级：HAPPYCODEX_SHARED_CODEX_HOME > CODEX_HOME > ~/.codex。
- */
-function sharedCodexHomeDir(): string {
-  return (
-    process.env.HAPPYCODEX_SHARED_CODEX_HOME ||
-    process.env.CODEX_HOME ||
-    path.join(os.homedir(), '.codex')
-  );
-}
+// sharedCodexHomeDir 已下沉 src/codex-paths.ts（单一真相源），此处副本删除。
 
 /** context-resolver / MCP 接线产物（provision 时一并物化进 per-folder CODEX_HOME）。 */
 export interface CodexHomeContextOptions {
@@ -331,12 +320,15 @@ function buildAgentEnvLines(folder: string): string[] {
     : {};
   const lines = buildContainerEnvLines(EMPTY_PROVIDER_CONFIG, customOnly, {});
 
-  // SystemSettings.autoCompactWindow > 0 时注入，agent-runner 可据此配置压缩窗口（对齐上游语义）
+  // SystemSettings.autoCompactWindow > 0 时注入；消费端 agent-runner applySessionEnvFallbacks
+  // 映射为 codex config.model_auto_compact_token_limit（对齐上游 flagSettings.autoCompactWindow）。
   const sysSettings = getSystemSettings();
   if (sysSettings.autoCompactWindow > 0) {
     lines.push(`AUTO_COMPACT_WINDOW=${sysSettings.autoCompactWindow}`);
   }
   // SubAgent 模型：仅在显式配置了非默认值时注入（默认 'inherit' 不注入，对齐上游）。
+  // 注意：codex 侧当前无消费端——agent TOML 无 model 字段（见 agent-defs.ts 头注释），
+  // 子代理模型由 codex 继承主线程决定；注入保留上游 parity，待 codex 支持 per-agent model 时接线。
   if (sysSettings.subagentModel && sysSettings.subagentModel !== 'inherit') {
     lines.push(`SUBAGENT_MODEL=${sysSettings.subagentModel}`);
   }

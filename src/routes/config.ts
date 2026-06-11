@@ -85,8 +85,9 @@ import {
 // tombstone（happycodex）：上游 `import { providerPool } from '../provider-pool.js'`
 // —— provider-pool 已作废（用户决策），整模块不搬。
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
+import { readCodexAuthStatus, sharedCodexHomeDir } from '../codex-paths.js';
+import { writeFileAtomic } from '../utils.js';
 
 const configRoutes = new Hono<{ Variables: Variables }>();
 
@@ -160,71 +161,10 @@ function destroyTelegramApiAgent(agent: HttpsAgent | ProxyAgent): void {
 // 替换为最小 codex 配置面：
 //   - GET  /codex/auth          → 共享 auth.json 是否存在/认证方式/login 指引
 //   - POST /codex/auth/api-key  → 写入 API-key 形态的 auth.json（codex login --api-key 等价）
-
-/**
- * 共享 codex home（已 `codex login` 的单账号凭据源）。
- * 与 src/container-runner.ts 的 sharedCodexHomeDir() 同一优先级链：
- * HAPPYCODEX_SHARED_CODEX_HOME > CODEX_HOME > ~/.codex。
- */
-function sharedCodexHomeDir(): string {
-  return (
-    process.env.HAPPYCODEX_SHARED_CODEX_HOME ||
-    process.env.CODEX_HOME ||
-    path.join(os.homedir(), '.codex')
-  );
-}
-
-type CodexAuthMethod = 'chatgpt' | 'api_key' | 'unknown';
-
-interface CodexAuthStatus {
-  /** 共享 auth.json 是否存在 */
-  loggedIn: boolean;
-  /** 认证方式：chatgpt（OAuth tokens）/ api_key（OPENAI_API_KEY）/ unknown */
-  method: CodexAuthMethod | null;
-  /** tokens.last_refresh（仅 chatgpt 方式，安全字段，不含凭据） */
-  lastRefresh: string | null;
-  /** 共享 CODEX_HOME 路径（admin 可见，便于定位） */
-  codexHome: string;
-  /** 未登录时的操作指引 */
-  loginHint: string;
-}
-
-// export：routes/auth.ts 的 buildSetupStatus 复用同一判定（codex 单账号引擎，
-// setupStatus 以共享 auth.json 存在性为准）。
-export function readCodexAuthStatus(): CodexAuthStatus {
-  const codexHome = sharedCodexHomeDir();
-  const authPath = path.join(codexHome, 'auth.json');
-  const loginHint =
-    `在服务端运行 \`codex login\`（或 \`codex login --api-key <key>\`）完成认证；` +
-    `凭据写入 ${authPath} 后即对所有工作区生效（新会话 provision 时复制）。`;
-  if (!fs.existsSync(authPath)) {
-    return {
-      loggedIn: false,
-      method: null,
-      lastRefresh: null,
-      codexHome,
-      loginHint,
-    };
-  }
-  let method: CodexAuthMethod = 'unknown';
-  let lastRefresh: string | null = null;
-  try {
-    const raw = JSON.parse(fs.readFileSync(authPath, 'utf-8')) as {
-      OPENAI_API_KEY?: string | null;
-      tokens?: { last_refresh?: string } | null;
-      last_refresh?: string;
-    };
-    if (raw.tokens) {
-      method = 'chatgpt';
-      lastRefresh = raw.tokens.last_refresh ?? raw.last_refresh ?? null;
-    } else if (raw.OPENAI_API_KEY) {
-      method = 'api_key';
-    }
-  } catch {
-    // 非 JSON / 读取失败 → unknown（存在即视为已登录，由 codex 自行校验有效性）
-  }
-  return { loggedIn: true, method, lastRefresh, codexHome, loginHint };
-}
+//
+// sharedCodexHomeDir / readCodexAuthStatus 已下沉 src/codex-paths.ts（单一真相源，
+// 消除 routes/config / container-runner / sdk-query / routes/mcp-servers 四副本；
+// routes/auth、routes/bug-report 等消费方均直接 import codex-paths，无 route→route 横向依赖）。
 
 configRoutes.get(
   '/codex/auth',
@@ -267,12 +207,12 @@ configRoutes.post(
       const codexHome = sharedCodexHomeDir();
       fs.mkdirSync(codexHome, { recursive: true });
       const authPath = path.join(codexHome, 'auth.json');
-      // 原子写 + 0600（对齐 codex login --api-key 的产物形状）
-      const tmpPath = `${authPath}.tmp`;
-      fs.writeFileSync(tmpPath, JSON.stringify({ OPENAI_API_KEY: apiKey }), {
+      // 原子写 + 0600（对齐 codex login --api-key 的产物形状）；writeFileAtomic
+      // 自带 stale-tmp unlink（裸 writeFileSync 的 mode 仅 on-create 生效，残留
+      // tmp 会让 API key 落到旧 mode）。
+      writeFileAtomic(authPath, JSON.stringify({ OPENAI_API_KEY: apiKey }), {
         mode: 0o600,
       });
-      fs.renameSync(tmpPath, authPath);
       const user = c.get('user') as AuthUser;
       appendClaudeConfigAudit(user.username, 'codex_auth_api_key_set', [
         'auth.json',

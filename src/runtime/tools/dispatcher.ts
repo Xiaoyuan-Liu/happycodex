@@ -43,6 +43,8 @@ export interface ToolDispatcherContext {
    * 单次 tool dispatch 超时（毫秒）。缺省按默认值：60000（install_skill 例外 130000，
    * 须长于其 bridge 侧 120s poll）；显式设置则统一覆盖所有工具（对齐 IpcToolBridge
    * pollTimeoutMs 的覆盖语义）；<=0 关闭超时。
+   * #13 例外：显式正值若低于 install_skill 不变量（bridge poll 上限 + 余量 < dispatch），
+   * install_skill 的看门狗被 warn+clamp 上调到 130000，防 #24（假失败抢答仍在进行的安装）复发。
    */
   dispatchTimeoutMs?: number;
 }
@@ -58,7 +60,21 @@ export class ToolDispatcher implements IToolDispatcher {
     private readonly ctx: ToolDispatcherContext,
   ) {
     this.timeoutMs = ctx.dispatchTimeoutMs ?? DEFAULT_DISPATCH_TIMEOUT_MS;
-    this.installSkillTimeoutMs = ctx.dispatchTimeoutMs ?? INSTALL_SKILL_DISPATCH_TIMEOUT_MS;
+    let installSkillTimeoutMs = ctx.dispatchTimeoutMs ?? INSTALL_SKILL_DISPATCH_TIMEOUT_MS;
+    // #13 构造期不变量校验：install_skill 必须满足「bridge poll 上限 + 余量 < dispatch 看门狗」，
+    // 否则看门狗会以假失败抢答仍在 120s poll 内进行的安装（#24 复发路径——显式 dispatchTimeoutMs
+    // 的拍平覆盖正是该路径）。违反 → warn + clamp 上调到 130s。注意 bridge 可能配了更短的
+    // pollTimeoutMs（standalone 3s），本层看不到——上调只延长看门狗、永不抢答，方向安全；
+    // <=0 维持「关闭超时」语义不 clamp。
+    if (installSkillTimeoutMs > 0 && installSkillTimeoutMs < INSTALL_SKILL_DISPATCH_TIMEOUT_MS) {
+      console.warn(
+        `[tool-dispatcher] dispatchTimeoutMs=${installSkillTimeoutMs}ms 违反 install_skill 不变量` +
+          `（bridge poll 上限 ${INSTALL_SKILL_POLL_TIMEOUT_MS}ms + 余量 < dispatch）：` +
+          `install_skill 看门狗钳制为 ${INSTALL_SKILL_DISPATCH_TIMEOUT_MS}ms，其余工具仍按显式值`,
+      );
+      installSkillTimeoutMs = INSTALL_SKILL_DISPATCH_TIMEOUT_MS;
+    }
+    this.installSkillTimeoutMs = installSkillTimeoutMs;
     this.unsubscribe = client.onServerRequest((req, respond) => {
       void this.handle(req, respond);
     });

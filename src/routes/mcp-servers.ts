@@ -7,7 +7,9 @@ import os from 'os';
 import type { Variables } from '../web-context.js';
 import type { AuthUser } from '../types.js';
 import { authMiddleware } from '../middleware/auth.js';
+import { sharedCodexHomeDir } from '../codex-paths.js';
 import { DATA_DIR } from '../config.js';
+import { logger } from '../logger.js';
 import { checkMcpServerLimit } from '../billing.js';
 
 // --- Types ---
@@ -98,19 +100,7 @@ async function writeHostSyncManifest(
 }
 
 // ─── codex config.toml 导入（/sync-host Source 3） ──────────────────────
-
-/**
- * 共享 codex home（已 `codex login` 的单账号凭据源）。
- * 解析顺序与 container-runner.sharedCodexHomeDir / sdk-query 一致：
- * HAPPYCODEX_SHARED_CODEX_HOME > CODEX_HOME > ~/.codex。
- */
-function sharedCodexHomeDir(): string {
-  return (
-    process.env.HAPPYCODEX_SHARED_CODEX_HOME ||
-    process.env.CODEX_HOME ||
-    path.join(os.homedir(), '.codex')
-  );
-}
+// 共享 codex home 解析已下沉 src/codex-paths.ts（单一真相源），此处副本删除。
 
 /** TOML 基本字符串反转义（覆盖 mcp-toml.tomlString 产出的转义集）。 */
 function unescapeTomlString(s: string): string {
@@ -129,8 +119,9 @@ function parseTomlKey(raw: string): string {
 }
 
 /**
- * 解析单行 TOML 标量值（基本字符串 / 布尔 / 数字 / 字符串数组 / inline table）。
- * 解析失败返回 undefined（调用方跳过该键）。
+ * 解析 TOML 标量值（基本/字面字符串 / 布尔 / 数字 / 字符串数组 / inline table）。
+ * 数组值可能已由调用方累积为多行文本（TOML 允许数组跨行）。
+ * 解析失败返回 undefined（调用方记 warning，消费键失败则跳过整个 server）。
  */
 function parseTomlValue(raw: string): unknown {
   const v = raw.trim();
@@ -138,18 +129,26 @@ function parseTomlValue(raw: string): unknown {
     const m = v.match(/^"((?:[^"\\]|\\.)*)"\s*(?:#.*)?$/);
     return m ? unescapeTomlString(m[1] ?? '') : undefined;
   }
+  if (v.startsWith("'")) {
+    // TOML 字面串（literal string）：单引号包裹，无转义语义。
+    const m = v.match(/^'([^']*)'\s*(?:#.*)?$/);
+    return m ? (m[1] ?? '') : undefined;
+  }
   if (v === 'true') return true;
   if (v === 'false') return false;
   if (/^-?\d+(\.\d+)?\s*(?:#.*)?$/.test(v)) return Number(v.replace(/#.*$/, '').trim());
   if (v.startsWith('[')) {
-    // 字符串数组（args 等）；非字符串成员的数组对 hostEntry 形状无意义，跳过。
+    // 字符串数组（args 等，基本/字面串成员均支持）；
+    // 非字符串成员的数组对 hostEntry 形状无意义，跳过。
     const close = v.lastIndexOf(']');
     if (close < 0) return undefined;
     const inner = v.slice(1, close);
     const out: string[] = [];
-    const re = /"((?:[^"\\]|\\.)*)"/g;
+    const re = /"((?:[^"\\]|\\.)*)"|'([^']*)'/g;
     let m: RegExpExecArray | null;
-    while ((m = re.exec(inner)) !== null) out.push(unescapeTomlString(m[1] ?? ''));
+    while ((m = re.exec(inner)) !== null) {
+      out.push(m[1] !== undefined ? unescapeTomlString(m[1]) : (m[2] ?? ''));
+    }
     return out;
   }
   if (v.startsWith('{')) {
@@ -170,23 +169,66 @@ const MCP_SECTION_RE =
   /^\[mcp_servers\.("(?:[^"\\]|\\.)*"|[A-Za-z0-9_-]+)(?:\.("(?:[^"\\]|\\.)*"|[A-Za-z0-9_-]+))?\]\s*(?:#.*)?$/;
 
 /**
+ * codexServerToHostEntry 消费的键集合：这些键（或同名子表）的值解析失败
+ * 意味着导入会产出残缺 server（如有 command 无 args）——整个 server 必须跳过，
+ * 不能静默报成功。其余键（codex 自有配置，如 startup_timeout_sec）解析失败
+ * 仅告警不致命（hostEntry 映射本就忽略它们）。
+ */
+const CONSUMED_SERVER_KEYS = new Set([
+  'command',
+  'args',
+  'env',
+  'url',
+  'http_headers',
+  'headers',
+]);
+
+/** `[mcp_servers.*]` 段内单键解析失败的告警载荷。 */
+export interface McpTomlParseWarning {
+  server: string;
+  key: string;
+  /** true = 消费键失败，server 整体被跳过；false = 无关键失败，仅丢该键。 */
+  fatal: boolean;
+}
+
+/** 多行数组累积的闭合判定：剔除字符串字面量与注释后是否出现 `]`。 */
+function tomlArrayClosed(s: string): boolean {
+  return /\]/.test(
+    s
+      .replace(/"(?:[^"\\]|\\.)*"/g, '')
+      .replace(/'[^']*'/g, '')
+      .replace(/#[^\n]*/g, ''),
+  );
+}
+
+/**
  * 解析 codex config.toml 的 `[mcp_servers.*]` 段。
  *
  * tombstone（happycodex）：上游 /sync-host 只认 Claude 配置面（~/.claude/settings.json
  * + ~/.claude.json）；codex-only 主机的 MCP 真相源是 {codex home}/config.toml。
  * 行式解析（与 mcp-toml.mergeMcpServersIntoToml 的「段头 marker 检测」同款策略，
  * 不引入 TOML 依赖），只需覆盖 mcp-toml 渲染器自身产出 + codex 原生形状：
- * 标量 command/url、数组 args、子表 [mcp_servers.<name>.env]/[.http_headers]、
- * inline table env = { ... }。未知键原样收集（hostEntry 映射阶段忽略）。
+ * 标量 command/url、数组 args（含跨行数组——TOML 允许，`codex mcp add` 与手编
+ * 配置常见）、子表 [mcp_servers.<name>.env]/[.http_headers]、inline table
+ * env = { ... }。未知键原样收集（hostEntry 映射阶段忽略）。
+ *
+ * 值解析失败不再静默丢键：经 onWarning 上报；消费键（CONSUMED_SERVER_KEYS
+ * 或 env/http_headers 子表成员）失败时整个 server 从返回值剔除（fail-closed，
+ * 由调用方计入 skipped），杜绝「缺 args 的残缺 server 报导入成功」。
  */
 export function parseMcpServersFromToml(
   content: string,
+  onWarning?: (warning: McpTomlParseWarning) => void,
 ): Record<string, Record<string, unknown>> {
   const servers: Record<string, Record<string, unknown>> = {};
   let current: Record<string, unknown> | null = null;
+  let currentServer = '';
+  let currentSub = ''; // '' = server 顶层；否则为子表名（env / http_headers / …）
+  const failed = new Set<string>();
 
-  for (const rawLine of content.split('\n')) {
-    const line = rawLine.trim();
+  const lines = content.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const line = (lines[i] ?? '').trim();
     if (!line || line.startsWith('#')) continue;
 
     if (line.startsWith('[')) {
@@ -196,14 +238,18 @@ export function parseMcpServersFromToml(
         continue;
       }
       const name = parseTomlKey(m[1] ?? '');
+      currentServer = name;
       const srv = (servers[name] ??= {});
       if (m[2]) {
         // 子表 [mcp_servers.<name>.env] / [.http_headers]
+        const subName = parseTomlKey(m[2]);
         const sub: Record<string, unknown> = {};
-        srv[parseTomlKey(m[2])] = sub;
+        srv[subName] = sub;
         current = sub;
+        currentSub = subName;
       } else {
         current = srv;
+        currentSub = '';
       }
       continue;
     }
@@ -213,10 +259,30 @@ export function parseMcpServersFromToml(
     if (eq <= 0) continue;
     const key = parseTomlKey(line.slice(0, eq));
     if (!key) continue;
-    const value = parseTomlValue(line.slice(eq + 1));
-    if (value !== undefined) current[key] = value;
+    let valueRaw = line.slice(eq + 1);
+    // TOML 允许数组跨行：累积续行直到出现闭合 ]（剔除字符串字面量与注释后判定），
+    // 再整体交给 parseTomlValue（其数组分支 lastIndexOf(']') + 跨行正则天然兼容）。
+    // inline table 在 TOML 1.0 中禁止跨行，无需同等处理。
+    if (valueRaw.trimStart().startsWith('[')) {
+      while (!tomlArrayClosed(valueRaw) && i + 1 < lines.length) {
+        i++;
+        valueRaw += '\n' + (lines[i] ?? '');
+      }
+    }
+    const value = parseTomlValue(valueRaw);
+    if (value !== undefined) {
+      current[key] = value;
+    } else {
+      const fatal =
+        currentSub === ''
+          ? CONSUMED_SERVER_KEYS.has(key)
+          : CONSUMED_SERVER_KEYS.has(currentSub);
+      if (fatal) failed.add(currentServer);
+      onWarning?.({ server: currentServer, key, fatal });
+    }
   }
 
+  for (const name of failed) delete servers[name];
   return servers;
 }
 
@@ -536,47 +602,73 @@ mcpServersRoutes.post('/sync-host', authMiddleware, async (c) => {
     return c.json({ error: 'Only admin can sync host MCP servers' }, 403);
   }
 
-  // Read MCP servers from both config file locations
+  // 5 处读盘并行（3 个 host 配置源 + 用户 servers.json + sync manifest）；
+  // 合并顺序仍按 Source 1 → 2 → 3 串行应用，语义不变。
+  const settingsPath = path.join(os.homedir(), '.claude', 'settings.json');
+  const globalConfigPath = path.join(os.homedir(), '.claude.json');
+  const codexConfigPath = path.join(sharedCodexHomeDir(), 'config.toml');
+  const [settingsRaw, globalRaw, codexRaw, file, manifest] = await Promise.all([
+    fs.readFile(settingsPath, 'utf-8').catch(() => null), // File may not exist, that's OK
+    fs.readFile(globalConfigPath, 'utf-8').catch(() => null),
+    fs.readFile(codexConfigPath, 'utf-8').catch(() => null),
+    readMcpServersFile(authUser.id),
+    readHostSyncManifest(authUser.id),
+  ]);
+
   let hostServers: Record<string, any> = {};
 
   // Source 1: ~/.claude/settings.json
-  const settingsPath = path.join(os.homedir(), '.claude', 'settings.json');
-  try {
-    const raw = await fs.readFile(settingsPath, 'utf-8');
-    const settings = JSON.parse(raw);
-    if (settings.mcpServers) {
-      hostServers = { ...hostServers, ...settings.mcpServers };
+  if (settingsRaw !== null) {
+    try {
+      const settings = JSON.parse(settingsRaw);
+      if (settings.mcpServers) {
+        hostServers = { ...hostServers, ...settings.mcpServers };
+      }
+    } catch {
+      // Invalid JSON, skip this source
     }
-  } catch {
-    // File may not exist, that's OK
   }
 
   // Source 2: ~/.claude.json (global Claude Code config, stores per-user MCP settings)
   // When both files define the same server ID, ~/.claude.json wins because it's
   // the primary user-facing config file where Claude Code persists MCP settings.
-  const globalConfigPath = path.join(os.homedir(), '.claude.json');
-  try {
-    const raw = await fs.readFile(globalConfigPath, 'utf-8');
-    const config = JSON.parse(raw);
-    if (config.mcpServers) {
-      hostServers = { ...hostServers, ...config.mcpServers };
+  if (globalRaw !== null) {
+    try {
+      const config = JSON.parse(globalRaw);
+      if (config.mcpServers) {
+        hostServers = { ...hostServers, ...config.mcpServers };
+      }
+    } catch {
+      // Invalid JSON, skip this source
     }
-  } catch {
-    // File may not exist, that's OK
   }
 
   // Source 3: {shared codex home}/config.toml 的 [mcp_servers.*]（codex 原生
   // 配置；codex-only 主机上这是唯一非空来源）。codex 来源最后合并——ID 冲突时
-  // 胜出（codex-first 语义）。
-  const codexConfigPath = path.join(sharedCodexHomeDir(), 'config.toml');
-  try {
-    const raw = await fs.readFile(codexConfigPath, 'utf-8');
-    const codexServers = parseMcpServersFromToml(raw);
+  // 胜出（codex-first 语义）。段内值解析失败不再静默：记 warn 日志、计入
+  // skipped、warnings 随响应返回（消灭「缺 args 还报成功」）。
+  const warnings: string[] = [];
+  const tomlSkippedServers = new Set<string>();
+  if (codexRaw !== null) {
+    const codexServers = parseMcpServersFromToml(codexRaw, (w) => {
+      logger.warn(
+        { server: w.server, key: w.key, fatal: w.fatal, file: codexConfigPath },
+        'sync-host: unparseable TOML value in [mcp_servers.*] section',
+      );
+      if (w.fatal) {
+        tomlSkippedServers.add(w.server);
+        warnings.push(
+          `config.toml [mcp_servers.${w.server}]：键 "${w.key}" 的值无法解析，已跳过该 server`,
+        );
+      } else {
+        warnings.push(
+          `config.toml [mcp_servers.${w.server}]：键 "${w.key}" 的值无法解析，已忽略该键`,
+        );
+      }
+    });
     for (const [id, server] of Object.entries(codexServers)) {
       hostServers[id] = codexServerToHostEntry(server);
     }
-  } catch {
-    // File may not exist, that's OK
   }
 
   if (Object.keys(hostServers).length === 0) {
@@ -584,18 +676,22 @@ mcpServersRoutes.post('/sync-host', authMiddleware, async (c) => {
       added: 0,
       updated: 0,
       deleted: 0,
-      skipped: 0,
+      skipped: tomlSkippedServers.size,
+      ...(warnings.length > 0 ? { warnings } : {}),
       message:
         'No MCP servers found in host config files (~/.claude/settings.json, ~/.claude.json, codex config.toml)',
     });
   }
 
-  const file = await readMcpServersFile(authUser.id);
-  const manifest = await readHostSyncManifest(authUser.id);
   const previouslySynced = new Set(manifest.syncedServers);
   const hostServerIds = new Set(Object.keys(hostServers));
 
-  const stats = { added: 0, updated: 0, deleted: 0, skipped: 0 };
+  const stats = {
+    added: 0,
+    updated: 0,
+    deleted: 0,
+    skipped: tomlSkippedServers.size,
+  };
   const newSyncedList: string[] = [];
 
   // Add/update from host
@@ -661,7 +757,7 @@ mcpServersRoutes.post('/sync-host', authMiddleware, async (c) => {
     lastSyncAt: new Date().toISOString(),
   });
 
-  return c.json(stats);
+  return c.json({ ...stats, ...(warnings.length > 0 ? { warnings } : {}) });
 });
 
 export { getUserMcpServersDir, readMcpServersFile };

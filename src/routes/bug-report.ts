@@ -9,7 +9,7 @@ import { Hono } from 'hono';
 import { DATA_DIR } from '../config.js';
 import { getUserHomeGroup } from '../db.js';
 import { sdkQuery } from '../sdk-query.js';
-import { readCodexAuthStatus } from './config.js';
+import { readCodexAuthStatus } from '../codex-paths.js';
 import { logger } from '../logger.js';
 import { authMiddleware } from '../middleware/auth.js';
 import {
@@ -42,12 +42,11 @@ function checkCooldown(userId: string, map: Map<string, number> = cooldowns, coo
   return null;
 }
 
-// --- Capability detection (cached 5min) ---
+// --- Capability detection (gh 探测缓存 5min；codex 认证实时取) ---
 
 let capCache: {
   ghAvailable: boolean;
   ghUsername: string | null;
-  claudeAvailable: boolean;
   checkedAt: number;
 } | null = null;
 const CAP_CACHE_TTL = 5 * 60 * 1000;
@@ -57,25 +56,26 @@ async function checkCapabilities(): Promise<{
   ghUsername: string | null;
   claudeAvailable: boolean;
 }> {
+  // 【codex 触点替换】AI 可用性 = 共享 CODEX_HOME 下 auth.json 存在
+  // （readCodexAuthStatus 与 sdkQuery 的认证来源同口径：
+  // HAPPYCODEX_SHARED_CODEX_HOME > CODEX_HOME > ~/.codex）。
+  // 实时读取不缓存：existsSync 足够便宜，而缓存会让 `codex login` 后最长
+  // 5 分钟仍报"AI 不可用"。缓存只保留昂贵的 gh CLI 探测。
+  // tombstone：上游此处读 Claude provider 配置（anthropicApiKey /
+  // claudeCodeOauthToken / claudeOAuthCredentials），随 provider failover 作废。
+  const claudeAvailable = readCodexAuthStatus().loggedIn;
+
   if (capCache && Date.now() - capCache.checkedAt < CAP_CACHE_TTL) {
     return {
       ghAvailable: capCache.ghAvailable,
       ghUsername: capCache.ghUsername,
-      claudeAvailable: capCache.claudeAvailable,
+      claudeAvailable,
     };
   }
 
-  const [gh] = await Promise.all([
-    execFileAsync('gh', ['auth', 'status'], { timeout: 5000 })
-      .then(() => true)
-      .catch(() => false),
-  ]);
-  // 【codex 触点替换】AI 可用性 = 共享 CODEX_HOME 下 auth.json 存在
-  // （readCodexAuthStatus 与 sdkQuery 的认证来源同口径：
-  // HAPPYCODEX_SHARED_CODEX_HOME > CODEX_HOME > ~/.codex）。
-  // tombstone：上游此处读 Claude provider 配置（anthropicApiKey /
-  // claudeCodeOauthToken / claudeOAuthCredentials），随 provider failover 作废。
-  const claude = readCodexAuthStatus().loggedIn;
+  const gh = await execFileAsync('gh', ['auth', 'status'], { timeout: 5000 })
+    .then(() => true)
+    .catch(() => false);
 
   // Get gh username if available
   let ghUsername: string | null = null;
@@ -88,8 +88,8 @@ async function checkCapabilities(): Promise<{
     }
   }
 
-  capCache = { ghAvailable: gh, ghUsername, claudeAvailable: claude, checkedAt: Date.now() };
-  return { ghAvailable: gh, ghUsername, claudeAvailable: claude };
+  capCache = { ghAvailable: gh, ghUsername, checkedAt: Date.now() };
+  return { ghAvailable: gh, ghUsername, claudeAvailable };
 }
 
 // --- Helpers ---

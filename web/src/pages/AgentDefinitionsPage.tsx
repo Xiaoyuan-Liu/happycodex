@@ -6,10 +6,17 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Label } from '@/components/ui/label';
 import { useMediaQuery } from '@/hooks/useMediaQuery';
+import { getErrorMessage } from '@/components/settings/types';
 import {
   useAgentDefinitionsStore,
   type AgentDefinitionDetail,
 } from '../stores/agent-definitions';
+
+// happycodex 适配：后端 agent-definitions 写端点（PUT/POST/DELETE）为 501 stub——
+// 预定义子代理由 PREDEFINED_AGENTS provision 到 {CODEX_HOME}/agents/*.toml，
+// 页面降级为只读查看器（仿 PluginsPage 的 501 处理：按钮常驻禁用 + title 说明）。
+const EDIT_DISABLED_TITLE =
+  'codex 引擎暂不支持编辑子代理（预定义子代理由 PREDEFINED_AGENTS provision，happycodex 后续接线）';
 
 export function AgentDefinitionsPage() {
   const { agents, loading, error: listError, loadAgents, createAgent } =
@@ -69,7 +76,7 @@ export function AgentDefinitionsPage() {
       setInitialContent(data.content);
       setSelectedId(id);
     } catch (err) {
-      setDetailError(err instanceof Error ? err.message : '加载失败');
+      setDetailError(getErrorMessage(err, '加载失败'));
       setDetail(null);
     } finally {
       setLoadingDetail(false);
@@ -99,7 +106,7 @@ export function AgentDefinitionsPage() {
       setInitialContent(content);
       setNotice('已保存');
     } catch (err) {
-      setDetailError(err instanceof Error ? err.message : '保存失败');
+      setDetailError(getErrorMessage(err, '保存失败'));
     } finally {
       setSaving(false);
     }
@@ -180,7 +187,8 @@ tools:
                 <RefreshCw size={16} className={loading ? 'animate-spin' : ''} />
                 刷新
               </Button>
-              <Button size="sm" onClick={() => setShowCreate(true)}>
+              {/* happycodex：写端点为 501 stub，常驻禁用，避免引导用户点出报错 */}
+              <Button size="sm" onClick={() => setShowCreate(true)} disabled title={EDIT_DISABLED_TITLE}>
                 <Plus size={16} />
                 新建
               </Button>
@@ -293,11 +301,14 @@ tools:
                     className="min-h-[calc(100dvh-380px)] lg:min-h-[460px] resize-y p-4 font-mono text-sm leading-6"
                     placeholder={loadingDetail ? '正在加载...' : '此 Agent 暂无内容'}
                     disabled={loadingDetail || saving}
+                    readOnly
+                    title={EDIT_DISABLED_TITLE}
                     spellCheck={false}
                   />
 
                   <div className="mt-4 flex flex-wrap items-center gap-3">
-                    <Button onClick={handleSave} disabled={loadingDetail || saving || !dirty}>
+                    {/* happycodex：PUT 为 501 stub，常驻禁用（Textarea 同步 readOnly） */}
+                    <Button onClick={handleSave} disabled title={EDIT_DISABLED_TITLE}>
                       {saving && <Loader2 className="size-4 animate-spin" />}
                       <Save className="w-4 h-4" />
                       保存
@@ -312,10 +323,12 @@ tools:
                       重新加载
                     </Button>
 
+                    {/* happycodex：DELETE 为 501 stub，常驻禁用 */}
                     <Button
                       variant="outline"
                       onClick={handleDelete}
-                      disabled={deleting || saving}
+                      disabled
+                      title={EDIT_DISABLED_TITLE}
                       className="text-error hover:text-error hover:bg-error-bg"
                     >
                       <Trash2 className="w-4 h-4" />

@@ -78,6 +78,15 @@ interface Entry {
 const DEFAULT_MAX_CONCURRENT = 8;
 const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 
+/**
+ * CR#7：standalone 编排下 IpcToolBridge 请求-响应工具的 poll 超时。
+ * 本编排器自身就是顶层进程——没有 HappyClaw 主进程消费 {dataDir}/ipc 下的请求文件，
+ * list_tasks/install_skill/uninstall_skill/discord_* 永远等不到回执。短超时让 listTasks
+ * 3s 即降级本地快照、其余工具 3s 诚实超时，而非按上游默认（30s / install 120s）把
+ * turn 阻塞到 dispatcher 看门狗边缘。接入真实主进程消费者时应移除此覆盖、恢复上游默认。
+ */
+const STANDALONE_POLL_TIMEOUT_MS = 3_000;
+
 function defaultSharedCodexHome(): string {
   return process.env['CODEX_HOME'] ?? path.join(os.homedir(), '.codex');
 }
@@ -204,6 +213,8 @@ export class SessionManager implements ISessionManager {
         const bridge = new IpcToolBridge({
           ipcDir: path.join(this.dataDir, 'ipc'),
           memoryDir: path.join(this.dataDir, 'memory'),
+          // standalone 无主进程消费者：请求-响应工具用短 poll 超时（见常量注释）。
+          pollTimeoutMs: STANDALONE_POLL_TIMEOUT_MS,
         });
         config.dynamicTools = registry.specs();
         const s = new ThreadSession(client, config);

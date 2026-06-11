@@ -130,10 +130,10 @@ const fields: FieldConfig[] = [
     key: 'autoCompactWindow',
     label: '对话自动压缩阈值',
     description:
-      '达到该 token 数时主动触发 SDK 对话压缩。0 = 保留 SDK 默认（约 1M）。'
-      + 'SDK 实际只接受 100K–1M，超出会被静默忽略并回退默认。'
-      + '经验值：Opus 1M 建议 300-500，Sonnet/Haiku 建议 100-200。'
-      + '压缩前会通过 PreCompact hook 归档对话',
+      '达到该 token 数时触发对话压缩（经 AUTO_COMPACT_WINDOW 注入，'
+      + '对应 codex 的 model_auto_compact_token_limit）。0 = 保留引擎默认。'
+      + '后端会把 >0 的值收紧到 100K–1M（沿用上游约束）。'
+      + '经验值：设为所用模型上下文窗口的 50–80%。',
     unit: 'K tokens',
     toDisplay: (v) => Math.round(v / 1000),
     toStored: (v) => v * 1000,
@@ -342,7 +342,7 @@ export function SystemSettingsSection() {
             <option value="gpt-5.1">gpt-5.1</option>
           </select>
           <p className="text-xs text-muted-foreground mt-1">
-            预定义 SubAgent（代码审查 / 网页调研）使用的模型。默认 inherit（继承主会话模型，与原行为一致）；想给子任务单独指定更便宜/更强的模型时再改。仅在主 Agent 委派任务时生效。
+            预定义 SubAgent（代码审查 / 网页调研）使用的模型。注意：codex 的 agent 定义当前不支持按子代理指定模型（子代理继承主会话模型），非 inherit 的取值暂不生效——设置会保存并注入，待 codex 支持 per-agent model 后自动接线。
           </p>
         </div>
       </div>
@@ -498,17 +498,18 @@ export function SystemSettingsSection() {
 
         <div className="flex items-center justify-between">
           <div className="flex-1 pr-4">
-            <Label>禁用后按本机 ~/.claude/ Playbook 运行</Label>
+            <Label>禁用后按本机项目 AGENTS.md/CLAUDE.md + externalClaudeDir（只读）运行</Label>
             <p className="text-xs text-muted-foreground mt-0.5">
               启用后 admin 主容器（folder=main）不再注入 memory_append/search/get MCP 工具、
-              不注入 WORKSPACE_GLOBAL/MEMORY 环境变量、不注入 HappyClaw 记忆系统提示、
-              PreCompact 钩子不触发 memory flush，让 Agent 完全按本机
-              ~/.claude/ 下的 Playbook（CLAUDE.md + rules/ + memory/）行事。
+              不注入 WORKSPACE_GLOBAL/MEMORY 环境变量、不注入 HappyClaw 记忆系统提示，
+              让 Agent 完全按本机项目的 AGENTS.md/CLAUDE.md 与
+              externalClaudeDir（只读数据源）行事。
             </p>
             <p className="text-xs text-destructive mt-2">
               <strong>前置要求</strong>：必须先在 admin 主容器配置 customCwd
-              指向真实项目目录。未配置时 CLAUDE_CONFIG_DIR 仍会指向 data/sessions/main/.claude，
-              SDK 既读不到 HappyClaw 记忆层也读不到 ~/.claude/，Agent 会变成空白沙箱。
+              指向真实项目目录。未配置时 agent 仍跑在 per-folder 工作区
+              （CODEX_HOME 指向 data/…），关掉记忆层后 codex 既没有 HappyClaw
+              记忆工具，也读不到你自己项目的 AGENTS.md/CLAUDE.md，会是空白沙箱。
               后端会在保存时校验，未配置则拒绝启用。
             </p>
             <p className="text-xs text-muted-foreground mt-2">
@@ -521,10 +522,8 @@ export function SystemSettingsSection() {
               若有有价值的内容，建议迁移到 ~/.claude/memory/ 下再启用。
             </p>
             <p className="text-xs text-muted-foreground mt-2">
-              <strong>Auto-memory 共享</strong>：启用后 SDK auto-memory 会写入
-              ~/.claude/projects/{'{cwd-slug}'}/memory/，与本机原生 Claude Code 共享。
-              如果 HappyClaw Agent 和你本人的风格/语言偏好不同，两边会互相污染 —
-              介意就不要开这个开关。
+              <strong>只读边界</strong>：externalClaudeDir 是只读数据源——启用后
+              codex 不会向 ~/.claude/ 写入任何内容。
             </p>
           </div>
           <Switch

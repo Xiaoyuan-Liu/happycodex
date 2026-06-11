@@ -550,6 +550,74 @@ describe('IpcToolBridge — sendFile（A4）', () => {
     await expect(bridge.sendFile(FOLDER, 'nope.pdf', 'nope.pdf')).rejects.toThrow(/file not found/);
     expect((await listChannel('tasks')).filter((f) => f.endsWith('.json'))).toEqual([]);
   });
+
+  it('#18 相对路径词法归一化：sub/../report.pdf → 落盘 filePath 为 report.pdf', async () => {
+    await mkdir(workspaceDir, { recursive: true });
+    await writeFile(path.join(workspaceDir, 'report.pdf'), 'pdf-bytes');
+    await bridge.sendFile(FOLDER, 'sub/../report.pdf', 'report.pdf');
+    const files = (await listChannel('tasks')).filter((f) => f.endsWith('.json'));
+    const p = (await readChannelJson('tasks', files[0]!)) as Record<string, unknown>;
+    expect(p.filePath).toBe('report.pdf');
+  });
+});
+
+// ───────────────────────── CR#2：send_image / send_file symlink 外泄防护 ─────────────────────────
+
+describe('IpcToolBridge — #2 symlink 外泄防护（生产侧 realpath 物理校验）', () => {
+  it('工作区内 symlink 指向工作区外文件 → sendImage/sendFile 均抛越界且不落盘', async () => {
+    await mkdir(workspaceDir, { recursive: true });
+    const outside = path.join(root, 'secret.png');
+    await writeFile(outside, PNG_BYTES);
+    await symlink(outside, path.join(workspaceDir, 'leak.png'));
+
+    // 词法上 leak.png 在工作区内（旧实现据此放行并读出目标内容）——物理校验必须拦截。
+    await expect(bridge.sendImage(FOLDER, 'leak.png')).rejects.toThrow(
+      /within workspace directory/,
+    );
+    await expect(bridge.sendFile(FOLDER, 'leak.png', 'leak.png')).rejects.toThrow(
+      /within the workspace/,
+    );
+    expect((await listChannel('messages')).filter((f) => f.endsWith('.json'))).toEqual([]);
+    expect((await listChannel('tasks')).filter((f) => f.endsWith('.json'))).toEqual([]);
+  });
+
+  it('symlink 中间目录逃出工作区 → 同样被物理校验拦截', async () => {
+    await mkdir(workspaceDir, { recursive: true });
+    const outsideDir = path.join(root, 'outside-dir');
+    await mkdir(outsideDir, { recursive: true });
+    await writeFile(path.join(outsideDir, 'f.png'), PNG_BYTES);
+    await symlink(outsideDir, path.join(workspaceDir, 'sub'));
+
+    await expect(bridge.sendImage(FOLDER, 'sub/f.png')).rejects.toThrow(
+      /within workspace directory/,
+    );
+    await expect(bridge.sendFile(FOLDER, 'sub/f.png', 'f.png')).rejects.toThrow(
+      /within the workspace/,
+    );
+  });
+
+  it('悬空 symlink → file not found（不误报越界）', async () => {
+    await mkdir(workspaceDir, { recursive: true });
+    await symlink(path.join(workspaceDir, 'nope.png'), path.join(workspaceDir, 'dangling.png'));
+    await expect(bridge.sendImage(FOLDER, 'dangling.png')).rejects.toThrow(/file not found/);
+    await expect(bridge.sendFile(FOLDER, 'dangling.png', 'd.png')).rejects.toThrow(
+      /file not found/,
+    );
+  });
+
+  it('指向工作区内部的合法 symlink 不误拒（物理校验只拦外泄；锚点字段用词法路径）', async () => {
+    await mkdir(workspaceDir, { recursive: true });
+    await writeFile(path.join(workspaceDir, 'real.png'), PNG_BYTES);
+    await symlink(path.join(workspaceDir, 'real.png'), path.join(workspaceDir, 'alias.png'));
+
+    const r = await bridge.sendImage(FOLDER, 'alias.png');
+    expect(r.fileName).toBe('alias.png'); // fileName 保留调用方指定的词法名
+
+    await bridge.sendFile(FOLDER, 'alias.png', 'alias.png');
+    const files = (await listChannel('tasks')).filter((f) => f.endsWith('.json'));
+    const p = (await readChannelJson('tasks', files[0]!)) as Record<string, unknown>;
+    expect(p.filePath).toBe('alias.png'); // relativePath 同样锚定词法路径（消费端语义不变）
+  });
 });
 
 // ───────────────────────── A4：pollIpcResult 请求-响应协议 ─────────────────────────

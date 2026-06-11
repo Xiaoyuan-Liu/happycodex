@@ -137,15 +137,21 @@ function buildSecurityRulesPrompt(securityRules: string, disableMemoryLayer: boo
   );
 }
 
-/** 上游 buildMemoryRecallPrompt 同式：禁用记忆层 → ''（跳过分片）；否则按 home/guest 选片。 */
-function buildMemoryRecallPrompt(shards: LoadedShards, args: PromptAssemblyArgs): string {
-  if (args.disableMemoryLayer) return '';
-  const text = args.isHome ? shards.memoryHome : shards.memoryGuest;
+/** 上游 buildMemoryRecallPrompt 同式：禁用记忆层 → null（跳过分片）；否则按 home/guest 选片。
+ *  name 与 text 在此单点推导（home/guest 分支只此一处），杜绝拼装侧二次推导漂移。 */
+function buildMemoryRecallPrompt(
+  shards: LoadedShards,
+  args: PromptAssemblyArgs,
+): { name: string; text: string } | null {
+  if (args.disableMemoryLayer) return null;
+  const name = args.isHome ? 'memory-system.home.md' : 'memory-system.guest.md';
+  let text = args.isHome ? shards.memoryHome : shards.memoryGuest;
   // host 模式注入真实 user-global 路径（容器路径 /workspace/global 在宿主机不存在）。
   if (args.workspaceGlobalDir) {
-    return text.split('/workspace/global').join(args.workspaceGlobalDir);
+    text = text.split('/workspace/global').join(args.workspaceGlobalDir);
   }
-  return text;
+  // 空分片与上游 '' 语义一致：整段跳过，不注入空 <memory-system> 块。
+  return text ? { name, text } : null;
 }
 
 /**
@@ -168,11 +174,6 @@ export function assemblePromptPieces(
   const agentOverrideBlock = `<agent-override>\n${shards.agentOverride}\n</agent-override>`;
   const channelGuidelines = shards.channels[args.channel] ?? '';
   const memoryRecall = buildMemoryRecallPrompt(shards, args);
-  const memoryPromptName = !args.disableMemoryLayer
-    ? args.isHome
-      ? 'memory-system.home.md'
-      : 'memory-system.guest.md'
-    : null;
 
   return [
     { name: 'interaction.md', text: `<behavior>\n${shards.interaction}\n</behavior>` },
@@ -181,8 +182,8 @@ export function assemblePromptPieces(
       name: 'security-rules.md',
       text: `<security>\n${buildSecurityRulesPrompt(shards.securityRules, args.disableMemoryLayer)}\n</security>`,
     },
-    ...(memoryRecall && memoryPromptName
-      ? [{ name: memoryPromptName, text: `<memory-system>\n${memoryRecall}\n</memory-system>` }]
+    ...(memoryRecall
+      ? [{ name: memoryRecall.name, text: `<memory-system>\n${memoryRecall.text}\n</memory-system>` }]
       : []),
     { name: 'guidelines', text: guidelinesBlock },
     ...(channelGuidelines

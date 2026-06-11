@@ -44,6 +44,17 @@ rm -rf upstream-happyclaw && mkdir upstream-happyclaw && \
 | `container/agent-runner/prompts/`（9+4 分片）+ agent-runner 启动期 loadPrompt/promptPieces 拼装 → `systemPrompt.append` | `container/agent-runner/prompts/`（路径镜像 port）+ `src/prompt-assembly.ts`（宿主侧惰性加载 + 场景化选片，产物经 deriveInputWithSessionContext 并入 developerInstructions） | 选片条件/包裹标签/顺序/黄线剥除正则与上游同式；Claude 措辞最小适配清单见 prompt-assembly.ts 头注释（skill-routing→.skills 索引、background-tasks 去 Task 工具、memory 去 Read/Edit 工具名 + host 模式 /workspace/global 字面替换、channels 去 send_image/send_file、品牌词/API key 名） |
 | `container/skills/`（3 个 SKILL.md）+ 四源 skills 发现/symlink 农场（claude-context-resolver 四源目录 + syncHostClaudeContext linkEntries + 容器 entrypoint 链接 + SDK skills:'all'） | `container/skills/`（port，post-test-cleanup 容器名/会话措辞适配）+ `src/skills-materializer.ts`（四源**复制**物化到 {groupDir}/.skills/ + manifest 受管语义 + AGENTS.md 技能索引经 buildCodexContextPlan.skillsIndex 通道） | codex 无 SKILL.md 发现/Skill 工具机制 → 索引进 CODEX_HOME/AGENTS.md、模型按需 cat 入口；同名后者胜出顺序 builtin→external→project→user 对齐上游；install_skill/uninstall_skill 落盘端（data/skills/{ownerId}）即 user 源，下次 spawn 物化生效 |
 
+## 主动修复的上游继承缺陷（偏离记录）
+
+迁移时 1:1 继承自上游、经 review 实证后在 happycodex 侧主动修复的缺陷。上游若日后
+自行修复，按本表对照消偏（行号均为基线 `2599989` 下的上游位置）：
+
+| 编号 | 缺陷 | 上游位置（2599989） | happycodex 修复 |
+|---|---|---|---|
+| CR#1 | 请求-响应 IPC（list_tasks 等）结果写回硬编码 `data/ipc/{folder}/tasks`，请求来自 agents/{aid}/ 或 tasks-run/{id}/ 子命名空间时轮询方永远收不到回执（假超时） | `src/index.ts:5570-5574` 等写回点 | `src/ipc-paths.ts` resolveIpcResultPath（锚定请求所在 tasks 目录）+ index.ts 全部写回点接入；tests/ipc-result-routing.test.ts 钉死 |
+| CR#2 | send_file/send_image 路径校验纯词法（startsWith），工作区内 symlink 可外读/外发任意主机文件 | `src/index.ts:5865-5866`（消费端）；agent-runner mcp-tools 生产端同 | 两侧独立 realpath 物理校验：producer `ipc-bridge.resolveWorkspaceFile`、consumer `ipc-paths.isRealPathWithinRoots` |
+| CR#8 | send_file 相对路径消费端恒锚 `GROUPS_DIR/{folder}`，host+customCwd 群组（生产端按注入的 customCwd 产出相对路径）发文件永远 not found | `src/container-runner.ts:1326/1584`（注入）vs `src/index.ts:5861`（消费） | `src/ipc-paths.ts` resolveSendFileAnchor（与 container-runner 注入同源的 customCwd 映射） |
+
 ## 迁移水位线 / 台账
 
 - **基线**：riba2534/happyclaw main @ `2599989`（2026-06-08）= 当前已对照基线。

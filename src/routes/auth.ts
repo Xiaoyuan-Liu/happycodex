@@ -35,7 +35,7 @@ import {
   getFeishuProviderConfigWithSource,
   getAppearanceConfig,
 } from '../runtime-config.js';
-import { readCodexAuthStatus } from './config.js';
+import { readCodexAuthStatus } from '../codex-paths.js';
 import {
   verifyPassword,
   hashPassword,
@@ -100,6 +100,10 @@ export function buildSetupStatus() {
   // POST /api/config/codex/auth/api-key 产物）。
   // tombstone（happycodex）：上游此处检查 Claude provider 池
   // （claudeCodeOauthToken/anthropicApiKey/...），随 provider failover 作废。
+  // 注意：needsSetup 钉 auth.json 存在性与运行时硬需求一致——per-folder provision
+  // 的 preflight 同样缺 auth.json 即抛错（codex-home.ts copyIfMissing required），
+  // 没有 auth.json 任何会话都跑不起来；env_key-only（config.toml model_providers
+  // 经环境变量供 key、不落 auth.json）的部署形态有意不支持，setup 锁是诚实信号。
   const codexConfigured = readCodexAuthStatus().loggedIn;
   const { source: feishuSource } = getFeishuProviderConfigWithSource();
   const feishuConfigured = feishuSource !== 'none';

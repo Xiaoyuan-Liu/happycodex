@@ -9,6 +9,8 @@
  * loadUserMcpServers，见 container-runner.buildCodexHomeContext）。本路由当前仅
  * 落盘管理面：成功响应显式带 effective:false + notice，不静默谎报生效；落盘根
  * 永远是受管群组目录 {GROUPS_DIR}/{folder}/.claude/，绝不写 customCwd。
+ * 响应形状相对上游的变更（含 DELETE 也带 effective/notice）无兼容包袱——项目
+ * 未发布、无存量 API 消费者。
  */
 
 import { Hono, type Context } from 'hono';
@@ -452,7 +454,7 @@ workspaceConfigRoutes.delete(
     }
 
     fs.rmSync(skillDir, { recursive: true, force: true });
-    return c.json({ success: true });
+    return c.json({ success: true, effective: false, notice: WORKSPACE_CONFIG_NOTICE });
   },
 );
 
@@ -703,7 +705,7 @@ workspaceConfigRoutes.delete(
     }
     syncMcpToSettings(group, meta, settings);
 
-    return c.json({ success: true });
+    return c.json({ success: true, effective: false, notice: WORKSPACE_CONFIG_NOTICE });
   },
 );
 

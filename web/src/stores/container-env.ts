@@ -20,12 +20,11 @@ interface ContainerEnvState {
   error: string | null;
 
   loadConfig: (jid: string) => Promise<void>;
+  // happycodex：saveConfig 入参收窄为 customEnv-only，与后端 ContainerEnvSchema
+  // 对齐（per-group Claude provider 覆盖随 provider failover 作废，后端 zod strip）。
+  // ContainerEnvPublicConfig 读侧 shape 保留——未重写过的旧文件 GET 仍返回 masked
+  // legacy 字段（无害的读侧容忍）。
   saveConfig: (jid: string, data: {
-    anthropicBaseUrl?: string;
-    anthropicAuthToken?: string;
-    anthropicApiKey?: string;
-    claudeCodeOauthToken?: string;
-    anthropicModel?: string;
     customEnv?: Record<string, string>;
   }) => Promise<boolean>;
 }

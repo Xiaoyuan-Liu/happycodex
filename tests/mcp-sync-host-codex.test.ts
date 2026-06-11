@@ -126,6 +126,112 @@ describe('parseMcpServersFromToml', () => {
       env: { TOKEN: 't1', REGION: 'us' },
     });
   });
+
+  // ── 修复轮 2：CR#4/VR2#4 多行数组 + 单引号字面串 + 解析失败不静默 ──
+
+  test('多行 args 数组（含同行多元素）完整解析，且不污染后续 server 段', async () => {
+    const { parseMcpServersFromToml } = await import(
+      '../src/routes/mcp-servers.js'
+    );
+    const toml = [
+      '[mcp_servers.multiline]',
+      'command = "npx"',
+      'args = [',
+      '  "-y",',
+      '  "@scope/server-name",',
+      '  "--port", "8080"',
+      ']',
+      '',
+      '[mcp_servers.next-one]',
+      'command = "uvx"',
+      'args = ["a"]',
+    ].join('\n');
+
+    const servers = parseMcpServersFromToml(toml);
+    expect(servers.multiline).toMatchObject({
+      command: 'npx',
+      args: ['-y', '@scope/server-name', '--port', '8080'],
+    });
+    // 累积循环必须在闭合 ] 处停止，后续段不受影响
+    expect(servers['next-one']).toMatchObject({
+      command: 'uvx',
+      args: ['a'],
+    });
+  });
+
+  test('单引号字面串：标量与数组成员均支持（无转义语义）', async () => {
+    const { parseMcpServersFromToml } = await import(
+      '../src/routes/mcp-servers.js'
+    );
+    const toml = [
+      '[mcp_servers.literal]',
+      "command = 'npx'",
+      "args = ['-y', 'C:\\path\\raw']",
+    ].join('\n');
+
+    const servers = parseMcpServersFromToml(toml);
+    expect(servers.literal).toMatchObject({
+      command: 'npx',
+      // 字面串不反转义：反斜杠原样保留
+      args: ['-y', 'C:\\path\\raw'],
+    });
+  });
+
+  test('消费键解析失败 → server 整体剔除并报 fatal warning；无关键失败仅丢键', async () => {
+    const { parseMcpServersFromToml } = await import(
+      '../src/routes/mcp-servers.js'
+    );
+    const toml = [
+      // command 是裸值（非法 TOML 标量）→ 消费键失败 → 整个 server 剔除
+      '[mcp_servers.broken]',
+      'command = npx-without-quotes',
+      'args = ["-y"]',
+      '',
+      // startup_timeout_ms 带下划线数字解析失败，但非消费键 → server 保留
+      '[mcp_servers.tolerated]',
+      'command = "npx"',
+      'startup_timeout_ms = 20_000',
+    ].join('\n');
+
+    const warnings: Array<{ server: string; key: string; fatal: boolean }> = [];
+    const servers = parseMcpServersFromToml(toml, (w) => warnings.push(w));
+
+    expect(servers.broken).toBeUndefined();
+    expect(servers.tolerated).toMatchObject({ command: 'npx' });
+    expect(servers.tolerated?.startup_timeout_ms).toBeUndefined();
+
+    expect(warnings).toContainEqual({
+      server: 'broken',
+      key: 'command',
+      fatal: true,
+    });
+    expect(warnings).toContainEqual({
+      server: 'tolerated',
+      key: 'startup_timeout_ms',
+      fatal: false,
+    });
+  });
+
+  test('未闭合的多行数组（直到 EOF）→ 消费键失败，server 剔除', async () => {
+    const { parseMcpServersFromToml } = await import(
+      '../src/routes/mcp-servers.js'
+    );
+    const toml = [
+      '[mcp_servers.unclosed]',
+      'command = "npx"',
+      'args = [',
+      '  "-y",',
+    ].join('\n');
+
+    const warnings: Array<{ server: string; key: string; fatal: boolean }> = [];
+    const servers = parseMcpServersFromToml(toml, (w) => warnings.push(w));
+    expect(servers.unclosed).toBeUndefined();
+    expect(warnings).toContainEqual({
+      server: 'unclosed',
+      key: 'args',
+      fatal: true,
+    });
+  });
 });
 
 describe('POST /sync-host — codex config.toml 来源', () => {
@@ -178,5 +284,51 @@ describe('POST /sync-host — codex config.toml 来源', () => {
       syncedFromHost: true,
       enabled: true,
     });
+  });
+
+  // 修复轮 2（CR#4/VR2#4）：多行 args 完整导入；解析失败的 server 计入
+  // skipped 且响应带 warnings（不再「缺 args 还报成功」）。
+  test('多行 args 完整导入；解析失败的 server 报 skipped + warnings', async () => {
+    fs.writeFileSync(
+      path.join(CODEX_HOME, 'config.toml'),
+      [
+        '[mcp_servers.good-multiline]',
+        'command = "npx"',
+        'args = [',
+        '  "-y",',
+        '  "@scope/server",',
+        '  "--port", "8080"',
+        ']',
+        '',
+        '[mcp_servers.broken-server]',
+        'command = bare-unquoted-value',
+        '',
+      ].join('\n'),
+    );
+
+    const routesModule = await import('../src/routes/mcp-servers.js');
+    const mcpServersRoutes = routesModule.default;
+
+    const res = await mcpServersRoutes.request('/sync-host', { method: 'POST' });
+    const body = (await res.json()) as any;
+    expect(res.status).toBe(200);
+    expect(body.added).toBe(1); // 仅 good-multiline
+    expect(body.skipped).toBe(1); // broken-server 解析失败 fail-closed
+    expect(Array.isArray(body.warnings)).toBe(true);
+    expect(String(body.warnings.join('\n'))).toContain('broken-server');
+
+    const listRes = await mcpServersRoutes.request('/', { method: 'GET' });
+    const listBody = (await listRes.json()) as any;
+    const byId: Record<string, any> = {};
+    for (const s of listBody.servers) byId[s.id] = s;
+
+    // 多行数组不再被静默丢弃：args 完整
+    expect(byId['good-multiline']).toMatchObject({
+      command: 'npx',
+      args: ['-y', '@scope/server', '--port', '8080'],
+      syncedFromHost: true,
+    });
+    // 残缺 server 不落盘
+    expect(byId['broken-server']).toBeUndefined();
   });
 });

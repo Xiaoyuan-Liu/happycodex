@@ -32,6 +32,11 @@
  *   - 仅物化启用技能（含 SKILL.md；SKILL.md.disabled 跳过并从工作区清除）。
  *   - manifest（.happycodex-skills.json）记录受管技能 id：源消失/禁用时只清除受管目录，
  *     用户手工放进 .skills/ 的目录不动（与 AGENTS.md generated-marker 同精神）。
+ *   - 瞬时错误不当「源消失」：单技能物化失败后仍是候选（candidates 含之）→ 既有产物
+ *     与受管身份保留；源目录非 ENOENT 扫描失败（权限等）→ 本轮保守跳过全部受管清理。
+ *   - 复制护栏（上游 symlink 农场从不复制内容，codex 版复制必须自带边界）：symlink
+ *     目标 realpath 越出技能根即跳过；深度/文件数/字节数超 SYNC_MAX_* 抛错由
+ *     per-skill catch 兜成 warning。
  *   - 幂等：文件内容未变不重写；无技能时不创建 .skills/。
  */
 import fs from 'fs';
@@ -108,14 +113,35 @@ function statOrNull(p: string): fs.Stats | null {
   }
 }
 
+/** 安全 lstat（不穿透 symlink）；失败返回 null。 */
+function lstatOrNull(p: string): fs.Stats | null {
+  try {
+    return fs.lstatSync(p);
+  } catch {
+    return null;
+  }
+}
+
+interface ScanSourceResult {
+  skills: SkillCandidate[];
+  /** 非 ENOENT 的 IO 错（EACCES 等）：源状态未知，调用方保守跳过受管清理。 */
+  failed: boolean;
+}
+
 /** 扫描单个源目录下的启用技能（含 SKILL.md 的子目录；同名由调用方后者覆盖）。 */
-function scanSource(rootDir: string, source: SkillSourceName): SkillCandidate[] {
+function scanSource(rootDir: string, source: SkillSourceName): ScanSourceResult {
   const out: SkillCandidate[] = [];
   let entries: fs.Dirent[];
   try {
     entries = fs.readdirSync(rootDir, { withFileTypes: true });
-  } catch {
-    return out; // 源目录不存在/不可读：跳过（上游 linkEntries 同语义）。
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') {
+      return { skills: out, failed: false }; // 源目录不存在：正常（上游 linkEntries 同语义）。
+    }
+    // 其他 IO 错（权限等）≠ 源消失：返回 failed，让调用方跳过本轮清理，
+    // 避免瞬时不可读被误判为「技能已删除」而清掉既有物化产物。
+    return { skills: out, failed: true };
   }
   for (const entry of entries) {
     if (!validateSkillId(entry.name)) continue; // 路径安全：仅 [\w-]+ 目录名
@@ -125,14 +151,38 @@ function scanSource(rootDir: string, source: SkillSourceName): SkillCandidate[] 
     if (!statOrNull(path.join(dir, 'SKILL.md'))?.isFile()) continue; // 禁用/无入口 → 跳过
     out.push({ id: entry.name, source, dir });
   }
-  return out;
+  return { skills: out, failed: false };
+}
+
+/** 物化护栏（per-skill 预算）：阻断 symlink 循环 / 整树外泄 / 超体量技能拖垮物化。 */
+export const SYNC_MAX_DEPTH = 16;
+export const SYNC_MAX_FILES = 2000;
+export const SYNC_MAX_BYTES = 64 * 1024 * 1024;
+
+/** 单技能同步预算（跨递归共享的可变计数器 + symlink 越界判定锚点）。 */
+interface SyncBudget {
+  /** 技能根目录的物理路径（realpath）：symlink 目标必须落在其内才物化。 */
+  rootReal: string;
+  files: number;
+  bytes: number;
+  /** 越界 symlink 等非致命跳过的警告出口（直通 MaterializeSkillsResult.warnings）。 */
+  warnings: string[];
+  skillId: string;
 }
 
 /**
  * 递归同步 src → dest（内容比对幂等：未变不重写；dest 多余条目清除；跳过 .git）。
- * 穿透 symlink（跨挂载 symlink 在容器内会悬空，故物化为实体文件）。
+ * 穿透 symlink（跨挂载 symlink 在容器内会悬空，故物化为实体文件），但：
+ *   - symlink 目标 realpath 必须在技能根（budget.rootReal）内，越界（-> / 、~/.ssh、
+ *     node_modules 等）跳过该条目并记 warning——上游是 symlink 农场从不复制内容，
+ *     codex 版复制物化必须自带边界；
+ *   - 深度/文件数/字节数超过 SYNC_MAX_* 即抛（`loop -> .` 的 realpath 在根内，仅靠
+ *     包含性检查挡不住），由调用方 per-skill catch 兜成 warning 跳过该技能。
  */
-function syncDir(srcDir: string, destDir: string): void {
+function syncDir(srcDir: string, destDir: string, budget: SyncBudget, depth: number): void {
+  if (depth >= SYNC_MAX_DEPTH) {
+    throw new Error(`目录深度超过上限 ${SYNC_MAX_DEPTH}（symlink 循环或异常嵌套）`);
+  }
   fs.mkdirSync(destDir, { recursive: true });
   const srcEntries = fs.readdirSync(srcDir, { withFileTypes: true });
   const keep = new Set<string>();
@@ -140,16 +190,48 @@ function syncDir(srcDir: string, destDir: string): void {
   for (const entry of srcEntries) {
     if (entry.name === '.git') continue;
     const srcPath = path.join(srcDir, entry.name);
-    const st = statOrNull(srcPath);
-    if (!st) continue; // 悬空 symlink 等
+    const lst = lstatOrNull(srcPath);
+    if (!lst) continue;
+    let st: fs.Stats;
+    if (lst.isSymbolicLink()) {
+      let real: string;
+      try {
+        real = fs.realpathSync(srcPath);
+      } catch {
+        continue; // 悬空 symlink
+      }
+      if (real !== budget.rootReal && !real.startsWith(budget.rootReal + path.sep)) {
+        budget.warnings.push(
+          `技能 ${budget.skillId}：symlink 越出技能目录，已跳过（${srcPath} -> ${real}）`,
+        );
+        logger.warn(
+          { skillId: budget.skillId, srcPath, realPath: real },
+          'Skill symlink escapes skill root, entry skipped',
+        );
+        continue;
+      }
+      const target = statOrNull(srcPath); // 根内合法 symlink：按目标类型物化为实体
+      if (!target) continue;
+      st = target;
+    } else {
+      st = lst;
+    }
     const destPath = path.join(destDir, entry.name);
     if (st.isDirectory()) {
       const destSt = statOrNull(destPath);
       if (destSt && !destSt.isDirectory()) fs.rmSync(destPath, { force: true });
-      syncDir(srcPath, destPath);
+      syncDir(srcPath, destPath, budget, depth + 1);
       keep.add(entry.name);
     } else if (st.isFile()) {
       const content = fs.readFileSync(srcPath);
+      budget.files += 1;
+      budget.bytes += content.byteLength;
+      if (budget.files > SYNC_MAX_FILES) {
+        throw new Error(`文件数超过上限 ${SYNC_MAX_FILES}`);
+      }
+      if (budget.bytes > SYNC_MAX_BYTES) {
+        throw new Error(`总字节数超过上限 ${SYNC_MAX_BYTES}`);
+      }
       const destSt = statOrNull(destPath);
       if (destSt?.isDirectory()) fs.rmSync(destPath, { recursive: true, force: true });
       const same =
@@ -221,8 +303,18 @@ export function materializeGroupSkills(args: MaterializeSkillsArgs): Materialize
   ];
 
   const candidates = new Map<string, SkillCandidate>();
+  let scanFailed = false; // 任一源非 ENOENT 扫描失败 → 源状态未知，本轮保守跳过受管清理
   for (const { root, name } of sources) {
-    for (const candidate of scanSource(root, name)) {
+    const scanned = scanSource(root, name);
+    if (scanned.failed) {
+      scanFailed = true;
+      warnings.push(`技能源不可读（${name}: ${root}），本轮跳过受管清理`);
+      logger.warn(
+        { source: name, root },
+        'Skill source unreadable (non-ENOENT), skipping managed cleanup this round',
+      );
+    }
+    for (const candidate of scanned.skills) {
       candidates.set(candidate.id, candidate); // 后者覆盖前者
     }
   }
@@ -238,7 +330,16 @@ export function materializeGroupSkills(args: MaterializeSkillsArgs): Materialize
 
   for (const candidate of [...candidates.values()].sort((a, b) => a.id.localeCompare(b.id))) {
     try {
-      syncDir(candidate.dir, path.join(skillsDir, candidate.id));
+      const budget: SyncBudget = {
+        // candidate.dir 可能本身是 symlink（external 农场顶层）：realpath 后内部
+        // 包含性判断才正确，且顶层 symlink 技能继续可用。
+        rootReal: fs.realpathSync(candidate.dir),
+        files: 0,
+        bytes: 0,
+        warnings,
+        skillId: candidate.id,
+      };
+      syncDir(candidate.dir, path.join(skillsDir, candidate.id), budget, 0);
       const frontmatter = parseFrontmatter(
         fs.readFileSync(path.join(candidate.dir, 'SKILL.md'), 'utf-8'),
       );
@@ -253,6 +354,8 @@ export function materializeGroupSkills(args: MaterializeSkillsArgs): Materialize
       });
       materializedIds.push(candidate.id);
     } catch (err) {
+      // 瞬时物化失败的候选仍在 candidates 中：下方清理守卫与 manifest 收编据此
+      // 保留其既有产物与受管身份（无需单独跟踪失败集合）。
       const message = err instanceof Error ? err.message : String(err);
       warnings.push(`技能物化失败（${candidate.id}）: ${message}`);
       logger.warn(
@@ -263,10 +366,12 @@ export function materializeGroupSkills(args: MaterializeSkillsArgs): Materialize
   }
 
   // 清除受管但已消失/禁用的技能目录（用户手工目录不在 manifest，不动）。
+  // 守卫：仍是候选（candidates，含瞬时物化失败的技能）→ 源还在，不删；
+  // scanFailed → 源状态未知，本轮保守不删任何受管目录。
   const removed: string[] = [];
   const current = new Set(materializedIds);
   for (const id of prevManifest.managed) {
-    if (current.has(id)) continue;
+    if (current.has(id) || candidates.has(id) || scanFailed) continue;
     const dir = path.join(skillsDir, id);
     if (statOrNull(dir)?.isDirectory()) {
       fs.rmSync(dir, { recursive: true, force: true });
@@ -274,9 +379,16 @@ export function materializeGroupSkills(args: MaterializeSkillsArgs): Materialize
     removed.push(id);
   }
 
+  // manifest = 本轮物化成功 ∪ (旧受管 ∩ 仍是候选)：瞬时失败不丢受管身份；
+  // scanFailed 轮保留全部旧受管 id，待源恢复后再裁决清理。
+  const managedNext = new Set(materializedIds);
+  for (const id of prevManifest.managed) {
+    if (scanFailed || candidates.has(id)) managedNext.add(id);
+  }
+
   // manifest 收尾：有受管技能则更新；全部清空且目录已空则连 manifest/.skills 一并移除。
-  if (materializedIds.length > 0) {
-    writeManifestIfChanged(skillsDir, prevManifest, materializedIds);
+  if (managedNext.size > 0) {
+    writeManifestIfChanged(skillsDir, prevManifest, [...managedNext]);
   } else if (statOrNull(skillsDir)?.isDirectory()) {
     fs.rmSync(path.join(skillsDir, SKILLS_MANIFEST_FILE), { force: true });
     if (fs.readdirSync(skillsDir).length === 0) {

@@ -262,6 +262,20 @@ describe('workspace-config ACL — MCP servers', () => {
     expect(body.error).toMatch(/owner/i);
   });
 
+  // 落盘管理面纪律：DELETE 与 POST/PATCH 一样不得静默谎报生效，
+  // 成功响应必须带 effective:false + notice。
+  test('owner DELETE returns effective:false + notice (not silently claimed effective)', async () => {
+    seedTestGroup();
+    asUser(OWNER_ID);
+    await postMcp({ id: 'srv-del', command: 'echo' });
+
+    const { status, body } = await deleteMcp('srv-del');
+    expect(status).toBe(200);
+    expect(body.success).toBe(true);
+    expect(body.effective).toBe(false);
+    expect(body.notice).toMatch(/effective: false/);
+  });
+
   test('shared member can still GET (200)', async () => {
     seedTestGroup();
     asUser(MEMBER_ID);
@@ -369,6 +383,19 @@ describe('workspace-config ACL — skills', () => {
     const { status, body } = await patchSkill('my-skill', { enabled: false });
     expect(status).toBe(200);
     expect(body.success).toBe(true);
+  });
+
+  // 落盘管理面纪律：skills DELETE 成功响应同样必须带 effective:false + notice。
+  test('owner skills DELETE returns effective:false + notice', async () => {
+    seedTestGroup();
+    seedFakeSkill('my-skill');
+    asUser(OWNER_ID);
+
+    const { status, body } = await deleteSkill('my-skill');
+    expect(status).toBe(200);
+    expect(body.success).toBe(true);
+    expect(body.effective).toBe(false);
+    expect(body.notice).toMatch(/effective: false/);
   });
 
   test('shared member is denied for skills PATCH (403)', async () => {

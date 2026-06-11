@@ -7,8 +7,8 @@
  * claudeAvailable 恒 false、AI 生成恒走 fallback。现门控 = readCodexAuthStatus()
  * .loggedIn（共享 CODEX_HOME/auth.json 存在，与 sdkQuery 认证来源同口径）。
  *
- * 门控函数本体（readCodexAuthStatus）由 routes/config.ts 自己的测试覆盖；
- * 这里 mock 它，只验证 bug-report 的接线与分支行为。
+ * 门控函数本体（readCodexAuthStatus）由 src/codex-paths.ts 的测试覆盖
+ * （tests/codex-paths.test.ts）；这里 mock 它，只验证 bug-report 的接线与分支行为。
  */
 import fs from 'fs';
 import os from 'os';
@@ -59,16 +59,21 @@ vi.mock('../src/db.js', () => ({
   getUserHomeGroup: () => null,
 }));
 
-// codex 门控真相源：bug-report 只消费 loggedIn。
-vi.mock('../src/routes/config.js', () => ({
-  readCodexAuthStatus: () => ({
-    loggedIn: mockLoggedIn,
-    method: mockLoggedIn ? 'chatgpt' : null,
-    lastRefresh: null,
-    codexHome: '/tmp/fake-codex-home',
-    loginHint: 'run codex login',
-  }),
-}));
+// codex 门控真相源：bug-report 只消费 loggedIn（已下沉 src/codex-paths.ts；
+// 保留其余导出如 sharedCodexHomeDir 供可能的间接消费方）。
+vi.mock('../src/codex-paths.js', async (importOriginal) => {
+  const real = (await importOriginal()) as Record<string, unknown>;
+  return {
+    ...real,
+    readCodexAuthStatus: () => ({
+      loggedIn: mockLoggedIn,
+      method: mockLoggedIn ? 'chatgpt' : null,
+      lastRefresh: null,
+      codexHome: '/tmp/fake-codex-home',
+      loginHint: 'run codex login',
+    }),
+  };
+});
 
 vi.mock('../src/sdk-query.js', () => ({
   sdkQuery: mockSdkQuery,
@@ -121,6 +126,26 @@ describe('GET /capabilities — AI 门控走 codex auth（#7/#22）', () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as Record<string, unknown>;
     expect(body.claudeAvailable).toBe(true);
+  });
+
+  // 修复轮 2（CR#12）：codex 认证实时取，不进 5min capCache——
+  // `codex login` 后无需等缓存过期即可用 AI 生成（同一模块实例内验证）。
+  test('登录态变化立即反映（不被 gh 探测缓存钉死）', async () => {
+    mockLoggedIn = false;
+    const routes = await freshBugReportRoutes();
+
+    const res1 = await routes.request('/capabilities', { method: 'GET' });
+    expect(((await res1.json()) as any).claudeAvailable).toBe(false);
+
+    // 模拟 `codex login` 完成：同一模块实例（capCache 仍温热）再查
+    mockLoggedIn = true;
+    const res2 = await routes.request('/capabilities', { method: 'GET' });
+    expect(((await res2.json()) as any).claudeAvailable).toBe(true);
+
+    // 反向：登出后也立即失效
+    mockLoggedIn = false;
+    const res3 = await routes.request('/capabilities', { method: 'GET' });
+    expect(((await res3.json()) as any).claudeAvailable).toBe(false);
   });
 });
 

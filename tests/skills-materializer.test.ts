@@ -16,6 +16,8 @@ import {
   buildSkillsIndexSection,
   materializeGroupSkills,
   SKILLS_MANIFEST_FILE,
+  SYNC_MAX_DEPTH,
+  SYNC_MAX_FILES,
   WORKSPACE_SKILLS_DIRNAME,
   type MaterializeSkillsArgs,
 } from '../src/skills-materializer.js';
@@ -241,6 +243,179 @@ describe('materializeGroupSkills — 幂等物化与受管清除', () => {
 
     const result = materialize();
     expect(result.skills.map((s) => s.id)).toEqual(['good']);
+  });
+});
+
+// ─── 瞬时错误与保守清理（修复轮 2 CR#5） ─────────────────────────────
+
+const isRoot = typeof process.getuid === 'function' && process.getuid() === 0;
+
+describe('materializeGroupSkills — 瞬时错误不触发受管清除', () => {
+  test.skipIf(isRoot)(
+    '单技能瞬时物化失败（EACCES）：既有产物保留、不进 removed、manifest 保留受管身份',
+    () => {
+      const projSkills = path.join(projectRoot, 'container', 'skills');
+      writeSkill(projSkills, 'flaky', 'v1');
+      writeSkill(projSkills, 'stable', 'ok');
+      materialize();
+      const flakyDest = path.join(skillsDir(), 'flaky', 'SKILL.md');
+      expect(fs.readFileSync(flakyDest, 'utf8')).toContain('v1');
+
+      // 源 SKILL.md 瞬时不可读（stat 仍可达 → 仍是候选；read 抛 EACCES → 物化失败）
+      const flakySrcMd = path.join(projSkills, 'flaky', 'SKILL.md');
+      fs.chmodSync(flakySrcMd, 0o000);
+      try {
+        const result = materialize();
+
+        expect(result.warnings.some((w) => w.includes('技能物化失败（flaky）'))).toBe(true);
+        expect(result.removed).toEqual([]); // 瞬时错误 ≠ 源消失，不清除
+        expect(fs.readFileSync(flakyDest, 'utf8')).toContain('v1'); // 既有产物保留
+        expect(result.skills.map((s) => s.id)).toEqual(['stable']); // 其余技能不受影响
+
+        // manifest = 物化成功 ∪ (旧受管 ∩ 仍是候选)：flaky 不丢受管身份
+        const manifest = JSON.parse(
+          fs.readFileSync(path.join(skillsDir(), SKILLS_MANIFEST_FILE), 'utf8'),
+        );
+        expect(manifest.managed).toEqual(['flaky', 'stable']);
+      } finally {
+        fs.chmodSync(flakySrcMd, 0o644);
+      }
+
+      // 源恢复后再物化：flaky 重新就位
+      const recovered = materialize();
+      expect(recovered.skills.map((s) => s.id)).toEqual(['flaky', 'stable']);
+    },
+  );
+
+  test.skipIf(isRoot)(
+    '源目录非 ENOENT 扫描失败（权限）：本轮保守跳过全部受管清理并 warning',
+    () => {
+      const projSkills = path.join(projectRoot, 'container', 'skills');
+      writeSkill(projSkills, 's1', 'v1');
+      materialize();
+      expect(fs.existsSync(path.join(skillsDir(), 's1'))).toBe(true);
+
+      const projRoot = path.join(projectRoot, 'container', 'skills');
+      fs.chmodSync(projRoot, 0o000); // readdir → EACCES（≠ ENOENT）
+      try {
+        const result = materialize();
+
+        expect(result.warnings.some((w) => w.includes('技能源不可读'))).toBe(true);
+        expect(result.removed).toEqual([]); // 源状态未知 → 不清除
+        expect(fs.existsSync(path.join(skillsDir(), 's1', 'SKILL.md'))).toBe(true);
+        // manifest 保留旧受管 id，待源恢复后再裁决
+        const manifest = JSON.parse(
+          fs.readFileSync(path.join(skillsDir(), SKILLS_MANIFEST_FILE), 'utf8'),
+        );
+        expect(manifest.managed).toEqual(['s1']);
+      } finally {
+        fs.chmodSync(projRoot, 0o755);
+      }
+
+      // 源恢复且技能真消失 → 正常清除路径不受影响
+      fs.rmSync(path.join(projSkills, 's1'), { recursive: true, force: true });
+      const after = materialize();
+      expect(after.removed).toEqual(['s1']);
+      expect(fs.existsSync(path.join(skillsDir(), 's1'))).toBe(false);
+    },
+  );
+
+  test('源目录 ENOENT（不存在）仍走正常清除：行为与既有语义一致', () => {
+    writeSkill(path.join(projectRoot, 'container', 'skills'), 'gone', 'v1');
+    materialize();
+
+    fs.rmSync(path.join(projectRoot, 'container', 'skills'), { recursive: true, force: true });
+    const result = materialize();
+
+    expect(result.warnings.some((w) => w.includes('技能源不可读'))).toBe(false);
+    expect(result.removed).toEqual(['gone']);
+  });
+});
+
+// ─── 复制护栏（修复轮 2 VR2#5：symlink 越界 / 循环 / 体量） ──────────
+
+describe('materializeGroupSkills — syncDir 复制护栏', () => {
+  test('越界 symlink 跳过不复制（阻断整树外泄），技能内相对 symlink 正常物化', () => {
+    const projSkills = path.join(projectRoot, 'container', 'skills');
+    // 技能目录外的「敏感」内容
+    const outside = path.join(tmp, 'outside-secrets');
+    fs.mkdirSync(outside, { recursive: true });
+    fs.writeFileSync(path.join(outside, 'id_rsa'), 'PRIVATE KEY');
+    writeSkill(projSkills, 'esc', 'with symlinks');
+    const escDir = path.join(projSkills, 'esc');
+    fs.symlinkSync(outside, path.join(escDir, 'leak')); // 越界 → 跳过
+    fs.symlinkSync(
+      path.join(escDir, 'SKILL.md'),
+      path.join(escDir, 'alias.md'),
+    ); // 根内 → 物化为实体文件
+
+    const result = materialize();
+
+    expect(result.skills.map((s) => s.id)).toEqual(['esc']); // 技能本身物化成功
+    expect(result.warnings.some((w) => w.includes('symlink 越出技能目录'))).toBe(true);
+    const dest = path.join(skillsDir(), 'esc');
+    expect(fs.existsSync(path.join(dest, 'leak'))).toBe(false); // 外泄内容未复制
+    expect(fs.existsSync(path.join(dest, 'id_rsa'))).toBe(false);
+    const alias = path.join(dest, 'alias.md');
+    expect(fs.lstatSync(alias).isFile()).toBe(true); // 实体文件而非 symlink
+    expect(fs.readFileSync(alias, 'utf8')).toContain('esc');
+  });
+
+  test('symlink 循环（loop -> .）：MAX_DEPTH 内确定性终止，技能跳过 warning，其余正常', () => {
+    const projSkills = path.join(projectRoot, 'container', 'skills');
+    writeSkill(projSkills, 'loopy', 'self loop');
+    fs.symlinkSync('.', path.join(projSkills, 'loopy', 'loop')); // realpath 在根内，包含性检查挡不住
+    writeSkill(projSkills, 'normal', 'fine');
+
+    const result = materialize();
+
+    expect(result.skills.map((s) => s.id)).toEqual(['normal']);
+    expect(
+      result.warnings.some((w) => w.includes('技能物化失败（loopy）') && w.includes('深度')),
+    ).toBe(true);
+    // dest 无超出 MAX_DEPTH 的深层嵌套垃圾
+    const tooDeep = path.join(
+      skillsDir(),
+      'loopy',
+      ...Array<string>(SYNC_MAX_DEPTH).fill('loop'),
+    );
+    expect(fs.existsSync(tooDeep)).toBe(false);
+  });
+
+  test('超体量技能（文件数超 SYNC_MAX_FILES）：该技能 warning 跳过，同批其他技能正常物化', () => {
+    const projSkills = path.join(projectRoot, 'container', 'skills');
+    writeSkill(projSkills, 'huge', 'too many files');
+    const filesDir = path.join(projSkills, 'huge', 'files');
+    fs.mkdirSync(filesDir, { recursive: true });
+    for (let i = 0; i < SYNC_MAX_FILES + 1; i++) {
+      fs.writeFileSync(path.join(filesDir, `f${i}.txt`), 'x');
+    }
+    writeSkill(projSkills, 'tiny', 'fine');
+
+    const result = materialize();
+
+    expect(result.skills.map((s) => s.id)).toEqual(['tiny']);
+    expect(
+      result.warnings.some(
+        (w) => w.includes('技能物化失败（huge）') && w.includes('文件数超过上限'),
+      ),
+    ).toBe(true);
+    expect(fs.existsSync(path.join(skillsDir(), 'tiny', 'SKILL.md'))).toBe(true);
+  });
+
+  test('悬空 symlink 条目跳过，不影响技能其余文件物化', () => {
+    const projSkills = path.join(projectRoot, 'container', 'skills');
+    writeSkill(projSkills, 'dangle', 'with dangling link');
+    fs.symlinkSync(
+      path.join(tmp, 'no-such-target'),
+      path.join(projSkills, 'dangle', 'broken'),
+    );
+
+    const result = materialize();
+
+    expect(result.skills.map((s) => s.id)).toEqual(['dangle']);
+    expect(fs.existsSync(path.join(skillsDir(), 'dangle', 'SKILL.md'))).toBe(true);
+    expect(fs.existsSync(path.join(skillsDir(), 'dangle', 'broken'))).toBe(false);
   });
 });
 

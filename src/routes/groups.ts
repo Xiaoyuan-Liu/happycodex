@@ -62,6 +62,7 @@ import {
   getContainerEnvConfig,
   saveContainerEnvConfig,
   toPublicContainerEnvConfig,
+  LEGACY_CONTAINER_ENV_KEYS,
 } from '../runtime-config.js';
 import { clearTargetAgentBindingsForDeletedAgents } from '../im-context-isolation.js';
 import { getChannelType } from '../im-channel.js';
@@ -1535,9 +1536,15 @@ groupRoutes.put('/:jid/env', authMiddleware, async (c) => {
   // Build updated config: only update fields that are explicitly provided
   // tombstone（happycodex）：上游此处还逐字段拷贝 5 个 per-group Claude provider
   // 覆盖（anthropic*/claudeCodeOauthToken），随 provider failover 作废（schema 已
-  // 收窄为仅 customEnv）。`{ ...current }` 保留：旧 on-disk 文件里的残留字段
-  // 读侧容忍、原样回写不丢失，但 buildAgentEnvLines 不会注入。
+  // 收窄为仅 customEnv）。写时淘汰（保存即清）：旧 on-disk 文件里的残留 provider
+  // 字段（含明文密钥）在任意一次保存/清空时被显式剥离，不再原样回写——这是
+  // 存量密钥唯一的清除路径。读侧 getContainerEnvConfig 容忍保持不变：从未
+  // 重写过的旧文件 GET 仍按 masked 形状展示，buildAgentEnvLines 不会注入。
+  // 键列表与读侧告警共用 LEGACY_CONTAINER_ENV_KEYS（runtime-config.ts），防键集漂移。
   const updated = { ...current };
+  for (const key of LEGACY_CONTAINER_ENV_KEYS) {
+    delete (updated as Record<string, unknown>)[key];
+  }
 
   if (data.customEnv !== undefined) updated.customEnv = data.customEnv;
 

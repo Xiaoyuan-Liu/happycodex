@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { api } from '../api/client';
+import { getErrorMessage } from '../components/settings/types';
 
 export interface AgentDefinition {
   id: string;
@@ -36,7 +37,9 @@ export const useAgentDefinitionsStore = create<AgentDefinitionsState>((set, get)
       const data = await api.get<{ agents: AgentDefinition[] }>('/api/agent-definitions');
       set({ agents: data.agents, loading: false, error: null });
     } catch (err) {
-      set({ loading: false, error: err instanceof Error ? err.message : String(err) });
+      // ApiError 是 plain object（非 Error 实例），String(err) 会变 "[object Object]"，
+      // 统一走 getErrorMessage 取后端 message（与 plugins store 同式）。
+      set({ loading: false, error: getErrorMessage(err, '请求失败') });
     }
   },
 
@@ -51,7 +54,7 @@ export const useAgentDefinitionsStore = create<AgentDefinitionsState>((set, get)
       set({ error: null });
       await get().loadAgents();
     } catch (err) {
-      set({ error: err instanceof Error ? err.message : String(err) });
+      set({ error: getErrorMessage(err, '请求失败') });
       throw err;
     }
   },
@@ -63,7 +66,7 @@ export const useAgentDefinitionsStore = create<AgentDefinitionsState>((set, get)
       await get().loadAgents();
       return data.id;
     } catch (err) {
-      set({ error: err instanceof Error ? err.message : String(err) });
+      set({ error: getErrorMessage(err, '请求失败') });
       throw err;
     }
   },
@@ -74,7 +77,7 @@ export const useAgentDefinitionsStore = create<AgentDefinitionsState>((set, get)
       set({ error: null });
       await get().loadAgents();
     } catch (err) {
-      set({ error: err instanceof Error ? err.message : String(err) });
+      set({ error: getErrorMessage(err, '请求失败') });
       throw err;
     }
   },

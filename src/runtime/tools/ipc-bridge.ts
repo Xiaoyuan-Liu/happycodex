@@ -168,17 +168,15 @@ export class IpcToolBridge implements ToolBridge {
     const chatJid = this.requireChatJid('send_image');
     const wsDir = this.requireWorkspaceDir('send_image');
 
-    // 路径解析与越界校验（对齐上游：绝对路径直接用，相对路径锚定工作区；path.sep 后缀防前缀绕过）。
-    const resolved = path.resolve(
-      path.isAbsolute(filePath) ? filePath : path.join(wsDir, filePath),
+    const { resolved, real } = await this.resolveWorkspaceFile(
+      filePath,
+      wsDir,
+      'file path must be within workspace directory.',
     );
-    if (!this.isWithin(resolved, wsDir)) {
-      throw new Error('file path must be within workspace directory.');
-    }
 
     let st;
     try {
-      st = await stat(resolved);
+      st = await stat(real);
     } catch {
       throw new Error(`file not found: ${filePath}`);
     }
@@ -194,7 +192,7 @@ export class IpcToolBridge implements ToolBridge {
       throw new Error('image file is empty.');
     }
 
-    const base64 = (await readFile(resolved)).toString('base64');
+    const base64 = (await readFile(real)).toString('base64');
     // magic bytes 检测（与上游 detectImageMimeTypeFromBase64Strict 同源实现）。
     const mimeType = detectImageMimeTypeFromBase64Strict(base64);
     if (!mimeType) {
@@ -226,25 +224,18 @@ export class IpcToolBridge implements ToolBridge {
     const chatJid = this.requireChatJid('send_file');
     const wsDir = this.requireWorkspaceDir('send_file');
 
-    let resolvedPath: string;
-    let relativePath: string;
-    if (path.isAbsolute(filePath)) {
-      resolvedPath = path.resolve(filePath);
-      if (!this.isWithin(resolvedPath, wsDir)) {
-        throw new Error('file must be within the workspace/group directory.');
-      }
-      relativePath = path.relative(wsDir, resolvedPath);
-    } else {
-      relativePath = filePath;
-      resolvedPath = path.resolve(wsDir, filePath);
-      if (!this.isWithin(resolvedPath, wsDir)) {
-        throw new Error('file must be within the workspace/group directory.');
-      }
-    }
+    // #18 单路径收敛：绝对/相对统一 resolve → isWithin → relative（相对输入的 relativePath
+    // 由 path.relative 词法归一化，'a/../b' 类输入落盘为 'b'，消费端锚点语义不变）。
+    const { resolved, real } = await this.resolveWorkspaceFile(
+      filePath,
+      wsDir,
+      'file must be within the workspace/group directory.',
+    );
+    const relativePath = path.relative(path.resolve(wsDir), resolved);
 
     let exists = false;
     try {
-      exists = (await stat(resolvedPath)).isFile();
+      exists = (await stat(real)).isFile();
     } catch {
       exists = false;
     }
@@ -454,32 +445,21 @@ export class IpcToolBridge implements ToolBridge {
   async installSkill(folder: string, name: string): Promise<{ installed?: string[] }> {
     // A4：真协议——poll 主进程写回的 install_skill_result_{requestId}.json
     // （src/index.ts processTaskIpc case 'install_skill'）。超时 120s（上游默认：安装可能很慢）。
-    let result: Record<string, unknown>;
-    try {
-      result = await this.pollIpcResult(
-        folder,
-        {
-          type: 'install_skill',
-          package: name,
-          requestId: newRequestId(),
-          groupFolder: folder,
-          timestamp: new Date().toISOString(),
-        },
-        'install_skill_result',
-        this.installPollTimeoutMs,
-      );
-    } catch (err) {
-      if (err instanceof IpcPollTimeoutError) {
-        // 上游同文案：安装可能仍在进行（主进程可能只是慢，请求文件不删）。
-        throw new Error(
-          `Timeout waiting for skill installation result (${this.installPollTimeoutMs / 1000}s). The installation may still be in progress.`,
-        );
-      }
-      throw err;
-    }
-    if (!result.success) {
-      throw new Error(`Failed to install skill "${name}": ${String(result.error ?? 'Unknown error')}`);
-    }
+    // 超时文案对齐上游：安装可能仍在进行（主进程可能只是慢，请求文件不删）。
+    const result = await this.pollOrThrow(
+      folder,
+      {
+        type: 'install_skill',
+        package: name,
+        requestId: newRequestId(),
+        groupFolder: folder,
+        timestamp: new Date().toISOString(),
+      },
+      'install_skill_result',
+      this.installPollTimeoutMs,
+      `Timeout waiting for skill installation result (${this.installPollTimeoutMs / 1000}s). The installation may still be in progress.`,
+      `Failed to install skill "${name}": `,
+    );
     const installed = Array.isArray(result.installed)
       ? result.installed.filter((s): s is string => typeof s === 'string')
       : [];
@@ -487,29 +467,20 @@ export class IpcToolBridge implements ToolBridge {
   }
 
   async uninstallSkill(folder: string, name: string): Promise<void> {
-    let result: Record<string, unknown>;
-    try {
-      result = await this.pollIpcResult(
-        folder,
-        {
-          type: 'uninstall_skill',
-          skillId: name,
-          requestId: newRequestId(),
-          groupFolder: folder,
-          timestamp: new Date().toISOString(),
-        },
-        'uninstall_skill_result',
-        this.pollTimeoutMs,
-      );
-    } catch (err) {
-      if (err instanceof IpcPollTimeoutError) {
-        throw new Error('Timeout waiting for skill uninstall result.');
-      }
-      throw err;
-    }
-    if (!result.success) {
-      throw new Error(`Failed to uninstall skill "${name}": ${String(result.error ?? 'Unknown error')}`);
-    }
+    await this.pollOrThrow(
+      folder,
+      {
+        type: 'uninstall_skill',
+        skillId: name,
+        requestId: newRequestId(),
+        groupFolder: folder,
+        timestamp: new Date().toISOString(),
+      },
+      'uninstall_skill_result',
+      this.pollTimeoutMs,
+      'Timeout waiting for skill uninstall result.',
+      `Failed to uninstall skill "${name}": `,
+    );
   }
 
   // ───────────────────────── Discord 读类（请求-响应协议） ─────────────────────────
@@ -519,90 +490,57 @@ export class IpcToolBridge implements ToolBridge {
     opts?: DiscordHistoryOptions,
   ): Promise<DiscordHistoryMessage[]> {
     const chatJid = this.requireDiscordChatJid('discord_get_history');
-    let result: Record<string, unknown>;
-    try {
-      result = await this.pollIpcResult(
-        folder,
-        {
-          type: 'discord_get_history',
-          chatJid,
-          ...(opts?.limit !== undefined ? { limit: opts.limit } : {}),
-          ...(opts?.before !== undefined ? { before: opts.before } : {}),
-          requestId: newRequestId(),
-          timestamp: new Date().toISOString(),
-        },
-        'discord_get_history_result',
-        this.pollTimeoutMs,
-      );
-    } catch (err) {
-      if (err instanceof IpcPollTimeoutError) {
-        throw new Error('Timeout waiting for Discord history response.');
-      }
-      throw err;
-    }
-    if (!result.success) {
-      throw new Error(
-        `Error fetching Discord history: ${String(result.error ?? 'Unknown error')}`,
-      );
-    }
+    const result = await this.pollOrThrow(
+      folder,
+      {
+        type: 'discord_get_history',
+        chatJid,
+        ...(opts?.limit !== undefined ? { limit: opts.limit } : {}),
+        ...(opts?.before !== undefined ? { before: opts.before } : {}),
+        requestId: newRequestId(),
+        timestamp: new Date().toISOString(),
+      },
+      'discord_get_history_result',
+      this.pollTimeoutMs,
+      'Timeout waiting for Discord history response.',
+      'Error fetching Discord history: ',
+    );
     return (Array.isArray(result.messages) ? result.messages : []) as DiscordHistoryMessage[];
   }
 
   async discordGetChannelInfo(folder: string): Promise<unknown> {
     const chatJid = this.requireDiscordChatJid('discord_get_channel_info');
-    let result: Record<string, unknown>;
-    try {
-      result = await this.pollIpcResult(
-        folder,
-        {
-          type: 'discord_get_channel_info',
-          chatJid,
-          requestId: newRequestId(),
-          timestamp: new Date().toISOString(),
-        },
-        'discord_get_channel_info_result',
-        this.pollTimeoutMs,
-      );
-    } catch (err) {
-      if (err instanceof IpcPollTimeoutError) {
-        throw new Error('Timeout waiting for Discord channel info response.');
-      }
-      throw err;
-    }
-    if (!result.success) {
-      throw new Error(
-        `Error fetching Discord channel info: ${String(result.error ?? 'Unknown error')}`,
-      );
-    }
+    const result = await this.pollOrThrow(
+      folder,
+      {
+        type: 'discord_get_channel_info',
+        chatJid,
+        requestId: newRequestId(),
+        timestamp: new Date().toISOString(),
+      },
+      'discord_get_channel_info_result',
+      this.pollTimeoutMs,
+      'Timeout waiting for Discord channel info response.',
+      'Error fetching Discord channel info: ',
+    );
     return result.channel;
   }
 
   async discordGetServerInfo(folder: string): Promise<unknown | null> {
     const chatJid = this.requireDiscordChatJid('discord_get_server_info');
-    let result: Record<string, unknown>;
-    try {
-      result = await this.pollIpcResult(
-        folder,
-        {
-          type: 'discord_get_server_info',
-          chatJid,
-          requestId: newRequestId(),
-          timestamp: new Date().toISOString(),
-        },
-        'discord_get_server_info_result',
-        this.pollTimeoutMs,
-      );
-    } catch (err) {
-      if (err instanceof IpcPollTimeoutError) {
-        throw new Error('Timeout waiting for Discord server info response.');
-      }
-      throw err;
-    }
-    if (!result.success) {
-      throw new Error(
-        `Error fetching Discord server info: ${String(result.error ?? 'Unknown error')}`,
-      );
-    }
+    const result = await this.pollOrThrow(
+      folder,
+      {
+        type: 'discord_get_server_info',
+        chatJid,
+        requestId: newRequestId(),
+        timestamp: new Date().toISOString(),
+      },
+      'discord_get_server_info_result',
+      this.pollTimeoutMs,
+      'Timeout waiting for Discord server info response.',
+      'Error fetching Discord server info: ',
+    );
     return result.guild ?? null;
   }
 
@@ -695,6 +633,43 @@ export class IpcToolBridge implements ToolBridge {
     return chatJid;
   }
 
+  /**
+   * send_image / send_file 共用的工作区文件解析（#18 单路径收敛）：
+   * resolve（绝对路径直用，相对路径锚定 wsDir）→ 词法 isWithin → realpath 物理校验。
+   *
+   * 物理校验（#2，参照 memoryGet 范式）：词法通过后 realpath 解析符号链接，真实路径仍须在
+   * 工作区内——否则工作区内的 symlink（文件或中间目录）可把工作区外的任意主机文件外发出去
+   * （sendImage 直接读出内容、sendFile 经主进程消费端读出）。wsDir 自身也 realpath 一次，
+   * 避免工作区上游含 symlink（如 macOS /var → /private/var）时前缀比较误拒；指向工作区
+   * **内部**的合法 symlink 物理校验通过，继续可用。
+   *
+   * @returns resolved 词法路径（fileName/relativePath 锚点，保留调用方语义）；
+   *          real 物理路径（后续 stat/readFile 用，杜绝 TOCTOU 换链）。
+   */
+  private async resolveWorkspaceFile(
+    filePath: string,
+    wsDir: string,
+    outsideError: string,
+  ): Promise<{ resolved: string; real: string }> {
+    const resolved = path.resolve(
+      path.isAbsolute(filePath) ? filePath : path.join(wsDir, filePath),
+    );
+    if (!this.isWithin(resolved, wsDir)) {
+      throw new Error(outsideError);
+    }
+    const realRoot = await realpath(wsDir).catch(() => path.resolve(wsDir));
+    let real: string;
+    try {
+      real = await realpath(resolved); // 不存在（含悬空 symlink）抛 ENOENT
+    } catch {
+      throw new Error(`file not found: ${filePath}`);
+    }
+    if (!this.isWithin(real, realRoot)) {
+      throw new Error(outsideError);
+    }
+    return { resolved, real };
+  }
+
   /** resolved 是否在 root 内（含 root 自身；path.sep 后缀防 /ws/g1 匹配 /ws/g10 的前缀绕过）。 */
   private isWithin(resolved: string, root: string): boolean {
     const normalizedRoot = path.resolve(root);
@@ -737,6 +712,35 @@ export class IpcToolBridge implements ToolBridge {
     }
   }
 
+  /**
+   * #17：5 个请求-响应工具（install/uninstall_skill、discord_get_*）的公共收口——
+   * pollIpcResult 超时映射为各工具的上游文案，回执 success:false 映射为
+   * `{failurePrefix}{error}`。listTasks 例外：超时要走 standalone 降级快照而非抛错，
+   * 仍直接用 pollIpcResult。
+   */
+  private async pollOrThrow(
+    folder: string,
+    payload: Record<string, unknown> & { requestId: string },
+    resultFilePrefix: string,
+    timeoutMs: number,
+    timeoutMessage: string,
+    failurePrefix: string,
+  ): Promise<Record<string, unknown>> {
+    let result: Record<string, unknown>;
+    try {
+      result = await this.pollIpcResult(folder, payload, resultFilePrefix, timeoutMs);
+    } catch (err) {
+      if (err instanceof IpcPollTimeoutError) {
+        throw new Error(timeoutMessage);
+      }
+      throw err;
+    }
+    if (!result.success) {
+      throw new Error(`${failurePrefix}${String(result.error ?? 'Unknown error')}`);
+    }
+    return result;
+  }
+
   /** {ipcDir}/{folder}/{channel} 目录。folder 逃出 ipc 根 → 抛错（写类越界）。#7 */
   private channelDir(folder: string, channel: 'messages' | 'tasks'): string {
     if (this.folderEscapes(this.ipcDir, folder)) {
@@ -755,7 +759,11 @@ export class IpcToolBridge implements ToolBridge {
     return rel === '' || rel.startsWith('..') || path.isAbsolute(rel);
   }
 
-  /** 原子写一条 JSON 请求到 IPC channel：先写 `<target>.tmp` 再 rename 到 `<target>`。 */
+  /**
+   * 原子写一条 JSON 请求到 IPC channel：先写 `<target>.tmp` 再 rename 到 `<target>`。
+   * 刻意不走 utils.writeFileAtomic（sync）：本方法在工具调用热路径上保持 async I/O；
+   * 且 target 名是 per-write 唯一 UUID，同名 stale-tmp 复用 mode 的隐患在此不存在。
+   */
   private async writeIpc(
     folder: string,
     channel: 'messages' | 'tasks',
