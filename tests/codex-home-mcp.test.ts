@@ -123,3 +123,86 @@ describe('FsCodexHomeProvisioner — mcpServers 接线点', () => {
     expect(await exists(path.join(codexHome, 'config.toml'))).toBe(false);
   });
 });
+
+describe('FsCodexHomeProvisioner — project_doc 设置（fallback_filenames + max_bytes）', () => {
+  it('写入 project_doc_fallback_filenames 与 project_doc_max_bytes（顶层）', async () => {
+    const prov = new FsCodexHomeProvisioner({
+      dataDir,
+      sharedCodexHome,
+      projectDocFallbackFilenames: ['CLAUDE.md'],
+      projectDocMaxBytes: 64 * 1024,
+    });
+
+    const codexHome = await prov.provision(FOLDER);
+
+    const content = await readFile(path.join(codexHome, 'config.toml'), 'utf8');
+    expect(content).toContain('project_doc_fallback_filenames = ["CLAUDE.md"]');
+    expect(content).toContain('project_doc_max_bytes = 65536');
+    // 顶层键须在任意表头之前。
+    const headerIdx = content.search(/^\s*\[/m);
+    const maxIdx = content.indexOf('project_doc_max_bytes');
+    expect(maxIdx).toBeGreaterThanOrEqual(0);
+    if (headerIdx !== -1) expect(maxIdx).toBeLessThan(headerIdx);
+  });
+
+  it('二次 provision 幂等：两个键都不重复', async () => {
+    const prov = new FsCodexHomeProvisioner({
+      dataDir,
+      sharedCodexHome,
+      projectDocFallbackFilenames: ['CLAUDE.md'],
+      projectDocMaxBytes: 64 * 1024,
+    });
+
+    await prov.provision(FOLDER);
+    const codexHome = await prov.provision(FOLDER);
+
+    const content = await readFile(path.join(codexHome, 'config.toml'), 'utf8');
+    expect(content.match(/project_doc_fallback_filenames\s*=/g)).toHaveLength(1);
+    expect(content.match(/project_doc_max_bytes\s*=/g)).toHaveLength(1);
+  });
+
+  it('已有 fallback 键、缺 max_bytes（存量 config）→ 只补 max_bytes，不动既有键', async () => {
+    // 模拟旧版只写了 fallback 的 per-folder config.toml。
+    const prov1 = new FsCodexHomeProvisioner({ dataDir, sharedCodexHome });
+    const codexHome = await prov1.provision(FOLDER);
+    await writeFile(
+      path.join(codexHome, 'config.toml'),
+      'project_doc_fallback_filenames = ["CLAUDE.md"]\n',
+      'utf8',
+    );
+
+    const prov2 = new FsCodexHomeProvisioner({
+      dataDir,
+      sharedCodexHome,
+      projectDocFallbackFilenames: ['CLAUDE.md'],
+      projectDocMaxBytes: 64 * 1024,
+    });
+    await prov2.provision(FOLDER);
+
+    const content = await readFile(path.join(codexHome, 'config.toml'), 'utf8');
+    expect(content.match(/project_doc_fallback_filenames\s*=/g)).toHaveLength(1);
+    expect(content).toContain('project_doc_max_bytes = 65536');
+  });
+
+  it('per-folder 已自定义 max_bytes（本地修改）→ 不覆盖', async () => {
+    const prov1 = new FsCodexHomeProvisioner({ dataDir, sharedCodexHome });
+    const codexHome = await prov1.provision(FOLDER);
+    await writeFile(
+      path.join(codexHome, 'config.toml'),
+      'project_doc_fallback_filenames = ["CLAUDE.md"]\nproject_doc_max_bytes = 131072\n',
+      'utf8',
+    );
+
+    const prov2 = new FsCodexHomeProvisioner({
+      dataDir,
+      sharedCodexHome,
+      projectDocFallbackFilenames: ['CLAUDE.md'],
+      projectDocMaxBytes: 64 * 1024,
+    });
+    await prov2.provision(FOLDER);
+
+    const content = await readFile(path.join(codexHome, 'config.toml'), 'utf8');
+    expect(content).toContain('project_doc_max_bytes = 131072');
+    expect(content).not.toContain('project_doc_max_bytes = 65536');
+  });
+});

@@ -88,6 +88,12 @@ export interface FsCodexHomeProvisionerOptions {
    * （TOML 顶层键必须出现在第一个表头之前）。
    */
   projectDocFallbackFilenames?: readonly string[];
+  /**
+   * 项目维度上下文：写 config.toml 顶层 project_doc_max_bytes（codex 默认 32KiB）。
+   * 调用方（container-runner）传 AGENTS_MD_MAX_BYTES，使 codex 实际读取上限与生成侧
+   * 预裁剪预算一致，避免大 AGENTS.md（如多技能索引）被 codex 静默截断。幂等写入。
+   */
+  projectDocMaxBytes?: number;
 }
 
 export class FsCodexHomeProvisioner implements ICodexHomeProvisioner {
@@ -100,6 +106,7 @@ export class FsCodexHomeProvisioner implements ICodexHomeProvisioner {
   private readonly mcpServers: FsCodexHomeProvisionerOptions['mcpServers'];
   private readonly agentsMd: FsCodexHomeProvisionerOptions['agentsMd'];
   private readonly projectDocFallbackFilenames: FsCodexHomeProvisionerOptions['projectDocFallbackFilenames'];
+  private readonly projectDocMaxBytes: FsCodexHomeProvisionerOptions['projectDocMaxBytes'];
 
   constructor(opts: FsCodexHomeProvisionerOptions) {
     this.dataDir = opts.dataDir;
@@ -110,6 +117,7 @@ export class FsCodexHomeProvisioner implements ICodexHomeProvisioner {
     this.mcpServers = opts.mcpServers;
     this.agentsMd = opts.agentsMd;
     this.projectDocFallbackFilenames = opts.projectDocFallbackFilenames;
+    this.projectDocMaxBytes = opts.projectDocMaxBytes;
   }
 
   async provision(folder: string): Promise<string> {
@@ -151,11 +159,13 @@ export class FsCodexHomeProvisioner implements ICodexHomeProvisioner {
       await this.provisionAgentsMd(codexHome, this.agentsMd);
     }
 
-    // 7. context-resolver：项目维度 → config.toml 顶层 project_doc_fallback_filenames。
+    // 7. context-resolver：项目维度 → config.toml 顶层 project_doc_fallback_filenames
+    //    + project_doc_max_bytes（提高 codex 默认 32KiB 上限，与生成侧预算一致）。
     if (this.projectDocFallbackFilenames && this.projectDocFallbackFilenames.length > 0) {
-      await this.ensureProjectDocFallback(
+      await this.ensureProjectDocSettings(
         path.join(codexHome, CONFIG_FILE),
         this.projectDocFallbackFilenames,
+        this.projectDocMaxBytes,
       );
     }
 
@@ -199,13 +209,14 @@ export class FsCodexHomeProvisioner implements ICodexHomeProvisioner {
   }
 
   /**
-   * 确保 config.toml 顶层含 project_doc_fallback_filenames 键（幂等）。
-   * 键已存在（无论值是什么——per-folder 本地修改优先）则不动；
-   * 否则把键行插到文件最前（TOML 顶层键必须出现在第一个表头之前）。
+   * 确保 config.toml 顶层含 project_doc_fallback_filenames 与 project_doc_max_bytes
+   * 两个键（各自幂等）。键已存在（无论值是什么——per-folder 本地修改优先）则不动；
+   * 缺失的键行插到文件最前（TOML 顶层键必须出现在第一个表头之前）。两键都已存在则免写盘。
    */
-  private async ensureProjectDocFallback(
+  private async ensureProjectDocSettings(
     configPath: string,
     filenames: readonly string[],
+    maxBytes: number | undefined,
   ): Promise<void> {
     let content = '';
     if (await this.exists(configPath)) {
@@ -216,13 +227,19 @@ export class FsCodexHomeProvisioner implements ICodexHomeProvisioner {
     // 与仓库"不解析整份 TOML，只做行式段头检测"的既有约定一致（见 mcp-toml.ts）。
     const headerIdx = content.search(/^\s*\[/m);
     const topLevel = headerIdx === -1 ? content : content.slice(0, headerIdx);
-    if (/^\s*project_doc_fallback_filenames\s*=/m.test(topLevel)) {
-      return; // 幂等：顶层键已存在（保留 per-folder 本地修改）。
+    const prepend: string[] = [];
+    if (!/^\s*project_doc_fallback_filenames\s*=/m.test(topLevel)) {
+      prepend.push(
+        `project_doc_fallback_filenames = [${filenames.map((f) => tomlString(f)).join(', ')}]`,
+      );
     }
-    const line = `project_doc_fallback_filenames = [${filenames
-      .map((f) => tomlString(f))
-      .join(', ')}]\n`;
-    await writeFile(configPath, line + content, 'utf8');
+    if (maxBytes !== undefined && !/^\s*project_doc_max_bytes\s*=/m.test(topLevel)) {
+      prepend.push(`project_doc_max_bytes = ${maxBytes}`);
+    }
+    if (prepend.length === 0) {
+      return; // 幂等：顶层键都已存在（保留 per-folder 本地修改）。
+    }
+    await writeFile(configPath, `${prepend.join('\n')}\n${content}`, 'utf8');
   }
 
   /**

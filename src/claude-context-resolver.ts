@@ -62,11 +62,14 @@ const ADMIN_HOME_FOLDER = 'main';
 const CONTAINER_USER_GLOBAL_CLAUDE_MD = '/workspace/global/CLAUDE.md';
 
 /**
- * codex 的 project_doc_max_bytes 默认值（PoC 结论 ④：单文件 32KiB 上限）。
- * 物化的 AGENTS.md（含 generated marker 行）超过该值会被 codex 静默截断，
- * 因此在生成侧预裁剪并日志。
+ * happycodex 的 AGENTS.md / project doc 字节预算。
+ * codex 的 project_doc_max_bytes **默认** 32KiB（PoC 结论 ④）；超过即被 codex 静默截断。
+ * happycodex 在 per-folder config.toml 显式把 project_doc_max_bytes 提到本值（见
+ * CodexContextPlan.projectDocMaxBytes → provisioner ensureProjectDocSettings），并按本值
+ * 在生成侧预裁剪——两者必须一致，否则要么 codex 截断我们没截的尾部，要么我们截短了
+ * codex 本可读的内容。64KiB 容纳多技能场景的技能索引（实测 ~99 技能索引达 ~47KiB）。
  */
-export const AGENTS_MD_MAX_BYTES = 32 * 1024;
+export const AGENTS_MD_MAX_BYTES = 64 * 1024;
 
 /** 项目维度 fallback 文件名（PoC 结论 ②：codex 零拷贝直读工作区 CLAUDE.md）。 */
 export const PROJECT_DOC_FALLBACK_FILENAMES: readonly string[] = ['CLAUDE.md'];
@@ -109,6 +112,11 @@ export interface CodexContextPlan {
   agentsMdSources: CodexAgentsMdSource[];
   /** 项目维度：写进 per-folder config.toml 的 project_doc_fallback_filenames。 */
   projectDocFallbackFilenames: readonly string[];
+  /**
+   * 项目维度：写进 per-folder config.toml 的 project_doc_max_bytes（= AGENTS_MD_MAX_BYTES），
+   * 把 codex 默认 32KiB 上限提到与生成侧预算一致，避免大技能索引等被 codex 静默截断。
+   */
+  projectDocMaxBytes: number;
   warnings: string[];
 }
 
@@ -312,6 +320,7 @@ export function buildCodexContextPlan(args: CodexContextPlanArgs): CodexContextP
     agentsMd,
     agentsMdSources: sources,
     projectDocFallbackFilenames: PROJECT_DOC_FALLBACK_FILENAMES,
+    projectDocMaxBytes: AGENTS_MD_MAX_BYTES,
     warnings,
   };
 }

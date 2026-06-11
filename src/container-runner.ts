@@ -163,6 +163,8 @@ export interface CodexHomeContextOptions {
   agentsMd?: string | null;
   /** config.toml 顶层 project_doc_fallback_filenames（幂等写入）。 */
   projectDocFallbackFilenames?: readonly string[];
+  /** config.toml 顶层 project_doc_max_bytes（幂等写入；提高 codex 默认 32KiB 上限）。 */
+  projectDocMaxBytes?: number;
   /** loadUserMcpServers(ownerId) 的结果（渲染为 [mcp_servers.*] TOML 段幂等合并）。 */
   mcpServers?: Record<string, Record<string, unknown>>;
 }
@@ -187,6 +189,9 @@ export async function provisionCodexHome(
       : {}),
     ...(context?.projectDocFallbackFilenames
       ? { projectDocFallbackFilenames: context.projectDocFallbackFilenames }
+      : {}),
+    ...(context?.projectDocMaxBytes !== undefined
+      ? { projectDocMaxBytes: context.projectDocMaxBytes }
       : {}),
     ...(context?.mcpServers ? { mcpServers: context.mcpServers } : {}),
   });
@@ -244,6 +249,7 @@ function buildCodexHomeContext(
   return {
     agentsMd: plan.agentsMd,
     projectDocFallbackFilenames: plan.projectDocFallbackFilenames,
+    projectDocMaxBytes: plan.projectDocMaxBytes,
     ...(Object.keys(mcpServers).length > 0 ? { mcpServers } : {}),
   };
 }
