@@ -147,7 +147,7 @@ function killTree(child: ChildProcess, signal: NodeJS.Signals = 'SIGTERM'): void
 export function startCodexLogin(
   userId: string,
   onUpdate: CodexDeviceAuthUpdate,
-  opts: { mode?: CodexLoginMode; codexBin?: string } = {},
+  opts: { mode?: CodexLoginMode; codexBin?: string; codexHome?: string } = {},
 ): void {
   const mode: CodexLoginMode = opts.mode ?? 'device';
   // 复用 / 抢占：先终结旧流程（不向旧 onUpdate 再推，直接清理）。
@@ -159,7 +159,10 @@ export function startCodexLogin(
     inflight.delete(userId);
   }
 
-  const codexHome = userCodexHomeDir(userId);
+  // 写入目标 CODEX_HOME：默认 per-user 隔离；调用方可显式覆盖为共享目录
+  // （bootstrap 期 admin 首登 seed 共享基线——见 resolveCodexLoginTarget）。
+  // 仍以 userId 作 in-flight 键（同一用户单一登录流），仅写入位置随 opts.codexHome 变。
+  const codexHome = opts.codexHome ?? userCodexHomeDir(userId);
   const codexBin = opts.codexBin ?? 'codex';
 
   // 先建目录：codex 对不存在的 CODEX_HOME 直接报 "path does not exist" 退出 1
@@ -282,7 +285,7 @@ export function startCodexLogin(
 export function startDeviceAuth(
   userId: string,
   onUpdate: CodexDeviceAuthUpdate,
-  opts: { codexBin?: string } = {},
+  opts: { codexBin?: string; codexHome?: string } = {},
 ): void {
   startCodexLogin(userId, onUpdate, { ...opts, mode: 'device' });
 }
@@ -291,7 +294,7 @@ export function startDeviceAuth(
 export function startBrowserLogin(
   userId: string,
   onUpdate: CodexDeviceAuthUpdate,
-  opts: { codexBin?: string } = {},
+  opts: { codexBin?: string; codexHome?: string } = {},
 ): void {
   startCodexLogin(userId, onUpdate, { ...opts, mode: 'browser' });
 }

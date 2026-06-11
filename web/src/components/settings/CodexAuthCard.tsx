@@ -42,7 +42,15 @@ const METHOD_LABEL: Record<string, string> = {
   unknown: '已登录',
 };
 
-export function CodexAuthCard() {
+export function CodexAuthCard({
+  onLoginSuccess,
+}: {
+  /**
+   * 任一方式登录成功后回调（api-key/access-token 保存成功、device/browser 授权完成）。
+   * setup 引导页用它在 bootstrap 期刷新 setup 门控（needsSetup）并据此放行。
+   */
+  onLoginSuccess?: () => void;
+} = {}) {
   const {
     status,
     loading,
@@ -106,6 +114,12 @@ export function CodexAuthCard() {
     return () => unsub();
   }, [subscribeDeviceAuth]);
 
+  // device/browser 授权完成 → 通知外层（setup 引导页据此刷新门控并放行）。
+  // device.phase 仅在转为 authorized 时触发一次；checkAuth 幂等，重触发无害。
+  useEffect(() => {
+    if (device.phase === 'authorized') onLoginSuccess?.();
+  }, [device.phase, onLoginSuccess]);
+
   const handleStartDevice = useCallback(async () => {
     setStartingDevice(true);
     try {
@@ -146,6 +160,7 @@ export function CodexAuthCard() {
       await submitApiKey(trimmed);
       setApiKey('');
       toast.success('API Key 已保存到你的 codex 凭据');
+      onLoginSuccess?.();
     } catch (err) {
       // 已有 ChatGPT 登录态时后端返回 409，提示用户确认覆盖。
       const msg = getErrorMessage(err, '保存 API Key 失败');
@@ -158,6 +173,7 @@ export function CodexAuthCard() {
           await submitApiKey(trimmed, true);
           setApiKey('');
           toast.success('API Key 已保存（已覆盖原登录态）');
+          onLoginSuccess?.();
         } catch (err2) {
           toast.error(getErrorMessage(err2, '保存 API Key 失败'));
         }
@@ -167,7 +183,7 @@ export function CodexAuthCard() {
     } finally {
       setSavingKey(false);
     }
-  }, [apiKey, submitApiKey]);
+  }, [apiKey, submitApiKey, onLoginSuccess]);
 
   const handleSaveAccessToken = useCallback(async () => {
     const trimmed = accessToken.trim();
@@ -180,12 +196,13 @@ export function CodexAuthCard() {
       await submitAccessToken(trimmed);
       setAccessToken('');
       toast.success('Access Token 已保存到你的 codex 凭据');
+      onLoginSuccess?.();
     } catch (err) {
       toast.error(getErrorMessage(err, '保存 Access Token 失败'));
     } finally {
       setSavingToken(false);
     }
-  }, [accessToken, submitAccessToken]);
+  }, [accessToken, submitAccessToken, onLoginSuccess]);
 
   const handleLogout = useCallback(async () => {
     if (

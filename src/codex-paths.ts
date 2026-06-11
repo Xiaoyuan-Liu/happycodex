@@ -91,8 +91,9 @@ export interface CodexAuthStatus {
 
 /**
  * 从给定 codexHome 读 auth.json 的方式/刷新时间（纯读，不含路径策略）。
+ * 供登录端点对「写入目标 codexHome」做护栏判定——判定源==写入目标。
  */
-function readAuthAt(codexHome: string): {
+export function readCodexAuthAt(codexHome: string): {
   loggedIn: boolean;
   method: CodexAuthMethod | null;
   lastRefresh: string | null;
@@ -138,12 +139,12 @@ export function readCodexAuthStatus(userId?: string): CodexAuthStatus {
     const loginHint =
       `在服务端运行 \`codex login\`（或 \`codex login --api-key <key>\`）完成认证；` +
       `凭据写入 ${authPath} 后即对所有工作区生效（新会话 provision 时复制）。`;
-    const read = readAuthAt(codexHome);
+    const read = readCodexAuthAt(codexHome);
     return { ...read, codexHome, loginHint };
   }
 
   const userHome = userCodexHomeDir(userId);
-  const userRead = readAuthAt(userHome);
+  const userRead = readCodexAuthAt(userHome);
   if (userRead.loggedIn) {
     // 用户已自登：用自己的凭据。
     return {
@@ -158,7 +159,7 @@ export function readCodexAuthStatus(userId?: string): CodexAuthStatus {
   // 用户未登录：fallback 开启则回退共享态供查看；否则呈现"需自登"。
   if (perUserAuthFallbackEnabled()) {
     const shared = sharedCodexHomeDir();
-    const sharedRead = readAuthAt(shared);
+    const sharedRead = readCodexAuthAt(shared);
     return {
       ...sharedRead,
       codexHome: shared,
@@ -178,4 +179,33 @@ export function readCodexAuthStatus(userId?: string): CodexAuthStatus {
     hasUserAuth: false,
     usingShared: false,
   };
+}
+
+/** 登录写入目标：共享基线账号 vs per-user 隔离目录。 */
+export interface CodexLoginTarget {
+  codexHome: string;
+  scope: 'shared' | 'per-user';
+}
+
+/**
+ * 解析一次登录操作应写入的 CODEX_HOME。
+ *
+ * Bootstrap 期（调用者是 admin 且共享账号尚未配置）→ 写**共享** CODEX_HOME，
+ * 让全新机器 admin 的首登一举两得：既翻转 setup 门控（buildSetupStatus 读的就是
+ * 共享 auth.json），又满足 per-folder provision 的硬需求（copyIfMissing 共享
+ * auth.json，否则任何会话起不来）。这正是 happyclaw「判定源==写入目标」原则的等价物
+ * —— 否则 admin 在配置页登录成功写的是 per-user、共享仍空、needsSetup 永不翻 →
+ * AuthGuard 把 admin 钉死在 /setup/providers 形成死循环。
+ *
+ * 其余情况（共享已配置，或非 admin）→ per-user 隔离目录（各用户自登增强）。
+ * 仅 admin 能 seed 共享基线，普通用户永远写自己的目录（共享账号安全边界）。
+ */
+export function resolveCodexLoginTarget(
+  userId: string,
+  isAdmin: boolean,
+): CodexLoginTarget {
+  if (isAdmin && !readCodexAuthStatus().loggedIn) {
+    return { codexHome: sharedCodexHomeDir(), scope: 'shared' };
+  }
+  return { codexHome: userCodexHomeDir(userId), scope: 'per-user' };
 }

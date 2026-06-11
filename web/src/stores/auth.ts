@@ -60,7 +60,8 @@ interface AuthState {
   login: (username: string, password: string) => Promise<void>;
   register: (data: { username: string; password: string; display_name?: string; invite_code?: string }) => Promise<void>;
   logout: () => Promise<void>;
-  checkAuth: () => Promise<void>;
+  /** force=true 时绕过 in-flight 去重，强制拉取最新（setup 登录后验证门控翻转用）。 */
+  checkAuth: (force?: boolean) => Promise<void>;
   checkStatus: () => Promise<void>;
   setupAdmin: (username: string, password: string) => Promise<void>;
   changePassword: (currentPassword: string, newPassword: string) => Promise<void>;
@@ -131,8 +132,14 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     });
   },
 
-  checkAuth: async () => {
-    if (checkAuthInFlight) return checkAuthInFlight;
+  checkAuth: async (force = false) => {
+    // force（如 setup 登录后验证门控翻转）：先 await 任何 in-flight settle 再发新请求，
+    // 否则复用「写入凭据之前发出」的 stale promise 会读到旧 needsSetup=true，误报门控未过。
+    // 新请求的 set() 在旧的之后执行，最终以最新值收尾。
+    if (checkAuthInFlight) {
+      if (!force) return checkAuthInFlight;
+      await checkAuthInFlight.catch(() => {});
+    }
 
     checkAuthInFlight = (async () => {
       set({ checking: true });

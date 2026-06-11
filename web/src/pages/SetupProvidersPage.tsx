@@ -1,26 +1,33 @@
 /**
- * Codex 接入初始化占位页（happycodex 适配）。
+ * Codex 接入初始化向导（happycodex 适配）。
  *
  * Tombstone：上游 HappyClaw 此处是 STEP 2/2 的 Claude Provider 接入向导
  * （官方 OAuth / setup-token / API Key / 第三方 BASE_URL+TOKEN + 飞书配置），
- * 依赖已作废的 provider failover 体系与 /api/config/claude/* 路由，整页重写为占位页。
+ * 依赖已作废的 provider failover 体系与 /api/config/claude/* 路由。
  *
- * happycodex 的 codex 认证在服务端完成（`codex login` / ~/.codex/config.toml）；
- * Web 端接入向导待后端 routes/config 重写（另一条线）后补全。
- * 保留上游的路由与跳转骨架：未登录 → /login；非 admin → /chat；
- * setupStatus 不再 needsSetup → /settings?tab=claude。
+ * happycodex 改为在本页直接挂载 CodexAuthCard（浏览器 / 设备码 / API Key /
+ * Access Token 四法俱全），让全新机器 admin **纯浏览器**完成 codex 登录，不必再
+ * SSH 上服务器敲 `codex login`。配合后端 resolveCodexLoginTarget：bootstrap 期
+ * （admin + 共享账号未配置）的登录写**共享**基线账号，登录成功后 needsSetup 翻转、
+ * 门控自动放行。AuthGuard 仍把未完成 setup 的 admin 钉在本页（location≠/setup/providers
+ * 即重定向回来），但本页现在自带登录闭环，不再是死页。
+ *
+ * 路由骨架沿用上游：未登录 → /login；非 admin → /chat；needsSetup 翻 false → /settings?tab=claude。
  */
-import { useEffect, useState } from 'react';
-import { Loader2, RefreshCw, Terminal } from 'lucide-react';
+import { useCallback, useEffect, useState } from 'react';
+import { Loader2, RefreshCw, ShieldCheck, AlertTriangle } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 
 import { Button } from '@/components/ui/button';
+import { CodexAuthCard } from '../components/settings/CodexAuthCard';
 import { useAuthStore } from '../stores/auth';
 
 export function SetupProvidersPage() {
   const navigate = useNavigate();
   const { user, setupStatus, checkAuth, initialized } = useAuthStore();
   const [refreshing, setRefreshing] = useState(false);
+  // ③ 验证翻转守卫：登录写入成功但门控仍未过（多半凭据落了 per-user 而非共享）时提示。
+  const [gateStuck, setGateStuck] = useState(false);
 
   useEffect(() => {
     if (user === null && initialized === true) {
@@ -30,16 +37,30 @@ export function SetupProvidersPage() {
     }
   }, [user, initialized, navigate]);
 
+  // 门控翻 false → 进入正式后台（codex 配置页）。
   useEffect(() => {
     if (setupStatus && !setupStatus.needsSetup) {
       navigate('/settings?tab=claude', { replace: true });
     }
   }, [setupStatus, navigate]);
 
+  // 登录成功（CodexAuthCard 任一方式）后刷新门控；仍 needsSetup 则给出诊断提示。
+  const handleLoginSuccess = useCallback(async () => {
+    setGateStuck(false);
+    // force=true：绕过 in-flight 去重，确保读到「写入凭据之后」的门控状态（见 store.checkAuth）。
+    await checkAuth(true);
+    // checkAuth 已写回 store；读最新值判断是否真翻转（闭包内 setupStatus 是旧值）。
+    const fresh = useAuthStore.getState().setupStatus;
+    if (fresh && fresh.needsSetup) {
+      setGateStuck(true);
+    }
+    // 翻转成功的导航交给上面的 effect（监听 setupStatus.needsSetup）。
+  }, [checkAuth]);
+
   const handleRefresh = async () => {
     setRefreshing(true);
     try {
-      await checkAuth();
+      await handleLoginSuccess();
     } finally {
       setRefreshing(false);
     }
@@ -50,44 +71,36 @@ export function SetupProvidersPage() {
       <div className="w-full max-w-2xl mx-auto space-y-5 pt-12">
         <div className="text-center">
           <p className="text-xs font-semibold text-primary tracking-wider mb-2">STEP 2 / 2</p>
-          <h1 className="text-2xl font-bold text-foreground mb-2">Codex 接入初始化</h1>
-          <p className="text-sm text-muted-foreground">完成服务端 codex 配置后即可进入正式后台。</p>
+          <h1 className="text-2xl font-bold text-foreground mb-2">登录 Codex 账号</h1>
+          <p className="text-sm text-muted-foreground">
+            完成登录即解锁正式后台。作为首位管理员，你这次登录会写入
+            <span className="text-foreground font-medium"> 共享基线账号</span>
+            ，供所有工作区使用（之后每位成员仍可在配置页登录自己的账号）。
+          </p>
         </div>
 
-        <section className="bg-card rounded-xl border border-border shadow-sm p-5">
-          <div className="flex items-center gap-2 mb-3">
-            <Terminal className="w-4 h-4 text-primary" />
-            <h2 className="text-base font-semibold text-foreground">在服务端完成 codex 配置</h2>
+        <div className="flex items-center gap-2 justify-center text-xs text-muted-foreground">
+          <ShieldCheck className="w-3.5 h-3.5 text-primary" />
+          凭据仅写入本机 codex 目录（0600 权限），不经第三方
+        </div>
+
+        {gateStuck && (
+          <div className="flex items-start gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm text-amber-700 dark:text-amber-400">
+            <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
+            <div>
+              凭据已写入，但 setup 门控仍未通过。通常意味着凭据落进了 per-user 目录而非共享基线账号
+              （bootstrap 判定未命中）。请点「刷新状态」重试；若持续如此，需检查服务端共享
+              CODEX_HOME 是否可写。
+            </div>
           </div>
-          <div className="space-y-3 text-sm text-muted-foreground">
-            <p>
-              happycodex 通过本机 <code className="bg-muted px-1 rounded">codex</code> CLI 运行。
-              请在部署服务器上完成认证与模型配置：
-            </p>
-            <ol className="list-decimal list-inside space-y-1.5">
-              <li>
-                运行 <code className="bg-muted px-1 rounded">codex login</code>（或在
-                <code className="bg-muted px-1 rounded">~/.codex/config.toml</code> 配置 API 凭据）
-              </li>
-              <li>
-                按需在 <code className="bg-muted px-1 rounded">~/.codex/config.toml</code> 设置默认模型
-                （如 <code className="bg-muted px-1 rounded">gpt-5.1-codex</code>）
-              </li>
-              <li>重启 happycodex 服务，然后点击下方"刷新状态"</li>
-            </ol>
-            <p className="text-xs">
-              Web 端的 codex 配置界面尚未提供（后端 routes/config 重写中），本页为占位向导。
-            </p>
-          </div>
-        </section>
+        )}
+
+        <CodexAuthCard onLoginSuccess={handleLoginSuccess} />
 
         <div className="flex items-center justify-center gap-3">
-          <Button onClick={handleRefresh} disabled={refreshing}>
+          <Button onClick={handleRefresh} disabled={refreshing} variant="outline">
             {refreshing ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
             刷新状态
-          </Button>
-          <Button variant="outline" onClick={() => navigate('/chat', { replace: true })}>
-            进入后台
           </Button>
         </div>
       </div>

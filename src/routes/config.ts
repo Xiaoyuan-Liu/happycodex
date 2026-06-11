@@ -92,8 +92,9 @@ import path from 'path';
 import { spawn } from 'node:child_process';
 import {
   readCodexAuthStatus,
+  readCodexAuthAt,
   userCodexHomeDir,
-  hasUserCodexAuth,
+  resolveCodexLoginTarget,
   CODEX_AUTH_FILE,
 } from '../codex-paths.js';
 import {
@@ -241,27 +242,25 @@ configRoutes.post('/codex/auth/api-key', authMiddleware, async (c) => {
   if (!apiKey) {
     return c.json({ error: 'apiKey is required' }, 400);
   }
-  // 安全护栏：用户已有自己的 ChatGPT OAuth 登录态时拒绝静默覆盖（需 force=true）。
-  // 只看用户自己的 per-user 凭据（不读共享 fallback），避免「自己没登但共享是 OAuth」
-  // 误触 409。
-  if (hasUserCodexAuth(user.id)) {
-    const current = readCodexAuthStatus(user.id);
-    if (
-      current.hasUserAuth &&
-      current.method === 'chatgpt' &&
-      !force
-    ) {
-      return c.json(
-        {
-          error:
-            '你已有 ChatGPT 登录态（auth.json 含 OAuth tokens）。如确认要替换为 API key，请传 force=true。',
-        },
-        409,
-      );
-    }
+  // Bootstrap 期 admin 首登写共享基线账号（翻转 setup 门控）；否则写 per-user。
+  const { codexHome, scope } = resolveCodexLoginTarget(
+    user.id,
+    user.role === 'admin',
+  );
+  // 安全护栏：写入目标已是 ChatGPT OAuth 登录态时拒绝静默用 API key 覆盖（需 force=true）。
+  // 判定源 == 写入目标 codexHome —— 避免「护栏读 per-user、实际写 shared」的语义错位
+  // （bootstrap 期 admin 已有 per-user OAuth 但共享空时，旧逻辑会误以 per-user 状态 gate 共享写入）。
+  const targetAuth = readCodexAuthAt(codexHome);
+  if (targetAuth.loggedIn && targetAuth.method === 'chatgpt' && !force) {
+    return c.json(
+      {
+        error:
+          '该 codex 账号已有 ChatGPT 登录态（auth.json 含 OAuth tokens）。如确认要替换为 API key，请传 force=true。',
+      },
+      409,
+    );
   }
   try {
-    const codexHome = userCodexHomeDir(user.id);
     fs.mkdirSync(codexHome, { recursive: true });
     const authPath = path.join(codexHome, CODEX_AUTH_FILE);
     // 原子写 + 0600（对齐 codex login --api-key 产物；codex 必须明文读 auth.json）。
@@ -270,7 +269,7 @@ configRoutes.post('/codex/auth/api-key', authMiddleware, async (c) => {
     });
     appendClaudeConfigAudit(user.username, 'codex_auth_api_key_set', [
       'auth.json',
-    ], { userId: user.id, scope: 'per-user' });
+    ], { userId: user.id, scope });
     return c.json({
       success: true,
       status: sanitizeUserCodexAuth(readCodexAuthStatus(user.id)),
@@ -294,17 +293,21 @@ configRoutes.post('/codex/auth/access-token', authMiddleware, async (c) => {
   if (!accessToken) {
     return c.json({ error: 'accessToken is required' }, 400);
   }
-  if (hasUserCodexAuth(user.id) && !force) {
+  // Bootstrap 期 admin 首登写共享基线账号（翻转 setup 门控）；否则写 per-user。
+  const { codexHome, scope } = resolveCodexLoginTarget(
+    user.id,
+    user.role === 'admin',
+  );
+  // 护栏：写入目标已登录则拒绝静默覆盖（判定源==写入目标 codexHome）。
+  if (readCodexAuthAt(codexHome).loggedIn && !force) {
     return c.json(
       {
         error:
-          '你已有 codex 登录态。如确认要替换，请传 force=true。',
+          '该 codex 账号已有登录态。如确认要替换，请传 force=true。',
       },
       409,
     );
   }
-
-  const codexHome = userCodexHomeDir(user.id);
   try {
     fs.mkdirSync(codexHome, { recursive: true });
   } catch (err) {
@@ -355,7 +358,7 @@ configRoutes.post('/codex/auth/access-token', authMiddleware, async (c) => {
   }
   appendClaudeConfigAudit(user.username, 'codex_auth_access_token_set', [
     'auth.json',
-  ], { userId: user.id, scope: 'per-user' });
+  ], { userId: user.id, scope });
   return c.json({
     success: true,
     status: sanitizeUserCodexAuth(readCodexAuthStatus(user.id)),
@@ -371,13 +374,22 @@ configRoutes.post('/codex/auth/device/start', authMiddleware, async (c) => {
   const user = c.get('user') as AuthUser;
   try {
     const existing = getDeviceAuthState(user.id);
+    // Bootstrap 期 admin 首登 seed 共享基线（翻转 setup 门控）；否则写 per-user。
+    const { codexHome, scope } = resolveCodexLoginTarget(
+      user.id,
+      user.role === 'admin',
+    );
     const { broadcastCodexDeviceAuth } = await import('../web.js');
-    startDeviceAuth(user.id, (state) => {
-      broadcastCodexDeviceAuth(user.id, state);
-    });
+    startDeviceAuth(
+      user.id,
+      (state) => {
+        broadcastCodexDeviceAuth(user.id, state);
+      },
+      { codexHome },
+    );
     appendClaudeConfigAudit(user.username, 'codex_auth_device_start', [], {
       userId: user.id,
-      scope: 'per-user',
+      scope,
     });
     return c.json({ started: true, state: existing ?? { status: 'pending' } });
   } catch (err) {
@@ -395,13 +407,22 @@ configRoutes.post('/codex/auth/browser/start', authMiddleware, async (c) => {
   const user = c.get('user') as AuthUser;
   try {
     const existing = getDeviceAuthState(user.id);
+    // Bootstrap 期 admin 首登 seed 共享基线（翻转 setup 门控）；否则写 per-user。
+    const { codexHome, scope } = resolveCodexLoginTarget(
+      user.id,
+      user.role === 'admin',
+    );
     const { broadcastCodexDeviceAuth } = await import('../web.js');
-    startBrowserLogin(user.id, (state) => {
-      broadcastCodexDeviceAuth(user.id, state);
-    });
+    startBrowserLogin(
+      user.id,
+      (state) => {
+        broadcastCodexDeviceAuth(user.id, state);
+      },
+      { codexHome },
+    );
     appendClaudeConfigAudit(user.username, 'codex_auth_browser_start', [], {
       userId: user.id,
-      scope: 'per-user',
+      scope,
     });
     return c.json({ started: true, state: existing ?? { status: 'pending' } });
   } catch (err) {
