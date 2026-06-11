@@ -17,6 +17,7 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Button } from '@/components/ui/button';
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
+import { SettingsCard } from './SettingsCard';
 import { useCodexAuthStore } from '../../stores/codex-auth';
 import { getErrorMessage } from './types';
 
@@ -300,39 +301,33 @@ export function CodexAuthCard() {
         ? '当前回退到共享账号——登录后将改用你自己的账号'
         : '尚未登录 codex';
 
-  return (
-    <div className="rounded-xl border border-border bg-card overflow-hidden">
-      <div className="flex items-center justify-between px-5 py-4 border-b border-border bg-muted/50">
-        <div className="flex items-center gap-2">
-          <span
-            className={`inline-block w-2 h-2 rounded-full ${dotColor}`}
-          />
-          <div>
-            <h3 className="text-sm font-semibold text-foreground flex items-center gap-1.5">
-              <Terminal className="w-4 h-4 text-primary" />
-              Codex 认证
-            </h3>
-            <p className="text-xs text-muted-foreground mt-0.5">
-              {headerSubtitle}
-            </p>
-          </div>
-        </div>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => loadStatus().catch(() => {})}
-          disabled={loading}
-          title="刷新状态"
-        >
-          {loading ? (
-            <Loader2 className="size-4 animate-spin" />
-          ) : (
-            <RefreshCw className="size-4" />
-          )}
-        </Button>
-      </div>
+  const accountAction = (
+    <div className="flex items-center gap-2">
+      <span className={`inline-block w-2 h-2 rounded-full ${dotColor}`} />
+      <Button
+        variant="outline"
+        size="sm"
+        onClick={() => loadStatus().catch(() => {})}
+        disabled={loading}
+        title="刷新状态"
+      >
+        {loading ? (
+          <Loader2 className="size-4 animate-spin" />
+        ) : (
+          <RefreshCw className="size-4" />
+        )}
+      </Button>
+    </div>
+  );
 
-      <div className="px-5 py-4 space-y-4">
+  return (
+    <div className="space-y-4">
+      <SettingsCard
+        icon={Terminal}
+        title="Codex 账号"
+        desc={headerSubtitle}
+        action={accountAction}
+      >
         {/* 状态摘要 */}
         {status && (
           <div
@@ -580,21 +575,15 @@ export function CodexAuthCard() {
           </div>
         )}
 
-        {/* ─── 自定义模型 provider（配第三方模型，如 GLM）─── */}
-        <div className="border-t border-border pt-4 space-y-3">
-          <div className="flex items-center gap-1.5">
-            <Server className="w-4 h-4 text-primary" />
-            <h4 className="text-sm font-semibold text-foreground">
-              自定义模型 provider
-            </h4>
-          </div>
-          <p className="text-xs text-muted-foreground">
-            配置第三方模型（如 GLM）。codex 要求 provider 兼容 OpenAI
-            {' '}<span className="font-medium text-foreground">Responses API</span>。
-            保存后会写入你自己的 codex 配置并选用该模型。
-          </p>
+      </SettingsCard>
 
-          {/* 当前 provider 脱敏状态 */}
+      {/* ─── 自定义模型 Provider（配第三方模型，如 GLM）─── */}
+      <SettingsCard
+        icon={Server}
+        title="自定义模型 Provider"
+        desc="配置兼容 OpenAI Responses API 的第三方模型（如 GLM）；保存后写入你自己的 codex 配置并选用"
+      >
+        {/* 当前 provider 脱敏状态 */}
           {provider && (
             <div className="rounded-lg border border-border bg-muted/30 px-3 py-2.5 text-xs space-y-1">
               <div className="text-muted-foreground">
@@ -703,8 +692,7 @@ export function CodexAuthCard() {
               </Button>
             )}
           </div>
-        </div>
-      </div>
+      </SettingsCard>
     </div>
   );
 }
