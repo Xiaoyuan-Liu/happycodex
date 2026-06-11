@@ -16,3 +16,6 @@ log/
 
 # happyclaw 上游源码快照（gitignored、可刷新；见 docs/UPSTREAM-SYNC.md）
 /upstream-happyclaw/
+
+# 自托管运行配置（端口/公网域名/CORS 等，含部署私有值，绝不入库）
+.env
