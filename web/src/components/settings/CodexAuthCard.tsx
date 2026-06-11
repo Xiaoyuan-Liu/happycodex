@@ -7,7 +7,9 @@ import {
   Loader2,
   LogOut,
   RefreshCw,
+  Server,
   Terminal,
+  Trash2,
 } from 'lucide-react';
 import { toast } from 'sonner';
 
@@ -44,6 +46,7 @@ export function CodexAuthCard() {
     status,
     loading,
     device,
+    provider,
     loadStatus,
     submitApiKey,
     submitAccessToken,
@@ -51,6 +54,9 @@ export function CodexAuthCard() {
     logout,
     resetDevice,
     subscribeDeviceAuth,
+    loadProvider,
+    saveProvider,
+    deleteProvider,
   } = useCodexAuthStore();
 
   const [method, setMethod] = useState<LoginMethod>('chatgpt');
@@ -61,12 +67,36 @@ export function CodexAuthCard() {
   const [savingToken, setSavingToken] = useState(false);
   const [loggingOut, setLoggingOut] = useState(false);
 
+  // ── 自定义模型 provider 表单状态 ──
+  const [providerName, setProviderName] = useState('');
+  const [providerBaseUrl, setProviderBaseUrl] = useState('');
+  const [providerModel, setProviderModel] = useState('');
+  const [providerApiKey, setProviderApiKey] = useState('');
+  const [savingProvider, setSavingProvider] = useState(false);
+  const [deletingProvider, setDeletingProvider] = useState(false);
+
   // 初次加载状态。
   useEffect(() => {
     loadStatus().catch(() => {
       /* error 已落进 store.error */
     });
   }, [loadStatus]);
+
+  // 初次加载自定义 provider（脱敏）。
+  useEffect(() => {
+    loadProvider().catch(() => {
+      /* 未配置 / 加载失败：保持 provider=null，区块仍可新建 */
+    });
+  }, [loadProvider]);
+
+  // provider 加载后回填表单（apiKey 不回填——脱敏永不回明文）。
+  useEffect(() => {
+    if (provider) {
+      setProviderName(provider.name);
+      setProviderBaseUrl(provider.baseUrl);
+      setProviderModel(provider.model);
+    }
+  }, [provider]);
 
   // 订阅 codex_device_auth WS 事件（含重连恢复——后端 getState 重发当前 phase）。
   useEffect(() => {
@@ -161,6 +191,73 @@ export function CodexAuthCard() {
       setLoggingOut(false);
     }
   }, [logout]);
+
+  const handleSaveProvider = useCallback(async () => {
+    const name = providerName.trim();
+    const baseUrl = providerBaseUrl.trim();
+    const model = providerModel.trim();
+    const key = providerApiKey.trim();
+    if (!name) {
+      toast.error('请填写 provider 名称');
+      return;
+    }
+    if (!baseUrl) {
+      toast.error('请填写 base URL');
+      return;
+    }
+    if (!/^https:\/\//i.test(baseUrl)) {
+      toast.error('base URL 必须以 https:// 开头');
+      return;
+    }
+    if (!model) {
+      toast.error('请填写模型名称');
+      return;
+    }
+    // 新建时必须提供 apiKey；已有 provider 仅改 model/baseUrl 时可不重置 key。
+    if (!key && !provider?.hasApiKey) {
+      toast.error('请填写 API Key');
+      return;
+    }
+    setSavingProvider(true);
+    try {
+      await saveProvider({
+        name,
+        baseUrl,
+        model,
+        // 仅在用户填了新 key 时才上送，避免覆盖/重置旧 key。
+        ...(key ? { apiKey: key } : {}),
+      });
+      setProviderApiKey('');
+      toast.success('自定义模型 provider 已保存');
+    } catch (err) {
+      toast.error(getErrorMessage(err, '保存自定义 provider 失败'));
+    } finally {
+      setSavingProvider(false);
+    }
+  }, [providerName, providerBaseUrl, providerModel, providerApiKey, provider, saveProvider]);
+
+  const handleDeleteProvider = useCallback(async () => {
+    if (
+      !window.confirm(
+        '清除后将不再使用自定义模型 provider，codex 会回退到默认模型。继续？',
+      )
+    ) {
+      return;
+    }
+    setDeletingProvider(true);
+    try {
+      await deleteProvider();
+      setProviderName('');
+      setProviderBaseUrl('');
+      setProviderModel('');
+      setProviderApiKey('');
+      toast.success('已清除自定义模型 provider');
+    } catch (err) {
+      toast.error(getErrorMessage(err, '清除自定义 provider 失败'));
+    } finally {
+      setDeletingProvider(false);
+    }
+  }, [deleteProvider]);
 
   const copyToClipboard = useCallback(async (text: string, label: string) => {
     try {
@@ -453,6 +550,131 @@ export function CodexAuthCard() {
             </Button>
           </div>
         )}
+
+        {/* ─── 自定义模型 provider（配第三方模型，如 GLM）─── */}
+        <div className="border-t border-border pt-4 space-y-3">
+          <div className="flex items-center gap-1.5">
+            <Server className="w-4 h-4 text-primary" />
+            <h4 className="text-sm font-semibold text-foreground">
+              自定义模型 provider
+            </h4>
+          </div>
+          <p className="text-xs text-muted-foreground">
+            配置第三方模型（如 GLM）。codex 要求 provider 兼容 OpenAI
+            {' '}<span className="font-medium text-foreground">Responses API</span>。
+            保存后会写入你自己的 codex 配置并选用该模型。
+          </p>
+
+          {/* 当前 provider 脱敏状态 */}
+          {provider && (
+            <div className="rounded-lg border border-border bg-muted/30 px-3 py-2.5 text-xs space-y-1">
+              <div className="text-muted-foreground">
+                当前 provider：
+                <span className="font-medium text-foreground">{provider.name}</span>
+                <span className="ml-1 text-muted-foreground/70">
+                  （id: {provider.id}）
+                </span>
+              </div>
+              <div className="text-muted-foreground">
+                模型：
+                <span className="font-mono text-foreground">{provider.model}</span>
+              </div>
+              <div className="truncate text-muted-foreground">
+                base URL：
+                <span className="font-mono text-foreground">{provider.baseUrl}</span>
+              </div>
+              <div className="text-muted-foreground">
+                API Key：
+                {provider.hasApiKey ? (
+                  <span className="font-mono text-foreground">
+                    {provider.apiKeyMask ?? '已配置'}
+                  </span>
+                ) : (
+                  <span className="text-amber-500">未配置</span>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* 表单 */}
+          <div className="space-y-3">
+            <div className="space-y-1.5">
+              <Label className="text-xs text-muted-foreground">名称（name）</Label>
+              <Input
+                value={providerName}
+                onChange={(e) => setProviderName(e.target.value)}
+                disabled={savingProvider}
+                placeholder="例如 GLM"
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label className="text-xs text-muted-foreground">base URL</Label>
+              <Input
+                value={providerBaseUrl}
+                onChange={(e) => setProviderBaseUrl(e.target.value)}
+                disabled={savingProvider}
+                placeholder="https://…/v1"
+                className="font-mono"
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label className="text-xs text-muted-foreground">模型（model）</Label>
+              <Input
+                value={providerModel}
+                onChange={(e) => setProviderModel(e.target.value)}
+                disabled={savingProvider}
+                placeholder="例如 glm-4.6"
+                className="font-mono"
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label className="text-xs text-muted-foreground flex items-center gap-1.5">
+                <Key className="w-3.5 h-3.5" />
+                API Key
+              </Label>
+              <Input
+                type="password"
+                value={providerApiKey}
+                onChange={(e) => setProviderApiKey(e.target.value)}
+                disabled={savingProvider}
+                placeholder={
+                  provider?.hasApiKey
+                    ? '已保存，留空则保留原有 key'
+                    : '输入 provider 的 API Key'
+                }
+                className="font-mono"
+              />
+              <p className="text-xs text-muted-foreground">
+                加密保存，绝不回显明文。
+                {provider?.hasApiKey
+                  ? '仅修改名称 / base URL / 模型时可留空，将保留原有 key。'
+                  : ''}
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <Button onClick={handleSaveProvider} disabled={savingProvider}>
+              {savingProvider && <Loader2 className="size-4 animate-spin" />}
+              保存 provider
+            </Button>
+            {provider && (
+              <Button
+                variant="outline"
+                onClick={handleDeleteProvider}
+                disabled={deletingProvider}
+                title="清除自定义模型 provider，回退 codex 默认模型"
+              >
+                {deletingProvider ? (
+                  <Loader2 className="size-4 animate-spin" />
+                ) : (
+                  <Trash2 className="size-4" />
+                )}
+                清除
+              </Button>
+            )}
+          </div>
+        </div>
       </div>
     </div>
   );

@@ -48,6 +48,7 @@ import {
   getContainerEnvConfig,
   getEffectiveExternalDir,
   getSystemSettings,
+  getUserCodexProvider,
   shellQuoteEnvLines,
   type ClaudeProviderConfig,
   type ContainerEnvConfig,
@@ -73,7 +74,10 @@ import {
   WORKSPACE_SKILLS_DIRNAME,
 } from './skills-materializer.js';
 import { getChannelFromJid } from './channel-prefixes.js';
-import { FsCodexHomeProvisioner } from './runtime/multitenant/codex-home.js';
+import {
+  FsCodexHomeProvisioner,
+  type CodexModelProviderConfig,
+} from './runtime/multitenant/codex-home.js';
 import type { RegisteredGroup } from './types.js';
 import type { ContainerOutput } from './container-output.js';
 import {
@@ -178,6 +182,12 @@ export interface CodexHomeContextOptions {
    * 透传进 provisioner（照 projectDocMaxBytes 透传范式）。
    */
   authSourceDir?: string;
+  /**
+   * per-user 自定义模型 provider（不含 apiKey）：buildCodexHomeContext 按 owner
+   * 的 getUserCodexProvider 填充，透传进 provisioner 写 config.toml；apiKey 走
+   * buildAgentEnvLines 注入 env（CODEX_CUSTOM_API_KEY）。
+   */
+  modelProvider?: CodexModelProviderConfig;
 }
 
 /**
@@ -207,6 +217,9 @@ export async function provisionCodexHome(
     ...(context?.mcpServers ? { mcpServers: context.mcpServers } : {}),
     ...(context?.authSourceDir !== undefined
       ? { authSourceDir: context.authSourceDir }
+      : {}),
+    ...(context?.modelProvider
+      ? { modelProvider: context.modelProvider }
       : {}),
   });
   const folder = agentId
@@ -260,12 +273,36 @@ function buildCodexHomeContext(
   });
   const ownerId = group.created_by;
   const mcpServers = ownerId ? loadUserMcpServers(ownerId) : {};
+  // per-user 自定义模型 provider（不含 apiKey，apiKey 走 buildAgentEnvLines 注入 env）。
+  const modelProvider = resolveModelProvider(ownerId);
   return {
     agentsMd: plan.agentsMd,
     projectDocFallbackFilenames: plan.projectDocFallbackFilenames,
     projectDocMaxBytes: plan.projectDocMaxBytes,
     ...(Object.keys(mcpServers).length > 0 ? { mcpServers } : {}),
     authSourceDir: resolveAuthSourceDir(ownerId),
+    ...(modelProvider ? { modelProvider } : {}),
+  };
+}
+
+/**
+ * 解析 owner 的自定义模型 provider 写库描述（不含 apiKey）。
+ * - ownerId 缺失 / 未配置 → undefined（不触碰 config.toml 的 model/model_provider）。
+ * - apiKey 缺失（hasApiKey=false）→ 仍 undefined：写了 provider 段但无 key，codex 起不来；
+ *   宁可不切换 provider，回退默认账号（不引入"半配置"破窗）。
+ */
+function resolveModelProvider(
+  ownerId: string | undefined | null,
+): CodexModelProviderConfig | undefined {
+  if (!ownerId) return undefined;
+  const provider = getUserCodexProvider(ownerId);
+  if (!provider || !provider.apiKey) return undefined;
+  return {
+    id: provider.id,
+    name: provider.name,
+    baseUrl: provider.baseUrl,
+    model: provider.model,
+    wireApi: provider.wireApi,
   };
 }
 
@@ -349,8 +386,16 @@ const EMPTY_PROVIDER_CONFIG: ClaudeProviderConfig = {
  * —— 随 provider failover 作废删除；仅保留群组级 customEnv（沿用 buildContainerEnvLines 的
  * ENV_KEY_RE 校验 + DANGEROUS_ENV_VARS 拦截 + 控制字符剥离），以及与引擎无关的
  * AUTO_COMPACT_WINDOW / SUBAGENT_MODEL 系统设置注入（语义对齐上游）。
+ *
+ * ownerId 提供且该 owner 配了自定义模型 provider（含 apiKey）时，注入一行
+ * CODEX_CUSTOM_API_KEY=<解密 apiKey>——config.toml 的 [model_providers.<id>] env_key 据此
+ * 取 key（apiKey 不落 config.toml）。apiKey 已由 normalizeSecret 剥空白/非 ASCII，无换行；
+ * 容器侧再经 shellQuoteEnvLines 单引号转义，特殊字符不破坏 env 文件。
  */
-function buildAgentEnvLines(folder: string): string[] {
+function buildAgentEnvLines(
+  folder: string,
+  ownerId?: string | null,
+): string[] {
   const override = getContainerEnvConfig(folder);
   // 只透传 customEnv：override 中可能残留的 anthropic* 字段（旧配置文件）一律不进入 env。
   const customOnly: ContainerEnvConfig = override.customEnv
@@ -369,6 +414,15 @@ function buildAgentEnvLines(folder: string): string[] {
   // 子代理模型由 codex 继承主线程决定；注入保留上游 parity，待 codex 支持 per-agent model 时接线。
   if (sysSettings.subagentModel && sysSettings.subagentModel !== 'inherit') {
     lines.push(`SUBAGENT_MODEL=${sysSettings.subagentModel}`);
+  }
+
+  // per-user 自定义模型 provider 的 API key：仅当 owner 配了 provider 且有 key 时注入。
+  // 与 resolveModelProvider 同门控（provision 写了 [model_providers.<id>] env_key 引用此 env）。
+  if (ownerId) {
+    const provider = getUserCodexProvider(ownerId);
+    if (provider && provider.apiKey) {
+      lines.push(`CODEX_CUSTOM_API_KEY=${provider.apiKey}`);
+    }
   }
   return lines;
 }
@@ -514,10 +568,11 @@ export function buildVolumeMounts(
   });
 
   // Per-container environment file (keeps credentials out of process listings)
-  // codex 替换：仅 customEnv + 系统设置（无 provider env），见 buildAgentEnvLines。
+  // codex 替换：仅 customEnv + 系统设置 + per-user 自定义 provider 的 CODEX_CUSTOM_API_KEY
+  // （无 ANTHROPIC_* provider env），见 buildAgentEnvLines。
   const envDir = path.join(DATA_DIR, 'env', group.folder);
   fs.mkdirSync(envDir, { recursive: true });
-  const envLines = buildAgentEnvLines(group.folder);
+  const envLines = buildAgentEnvLines(group.folder, ownerId);
   if (envLines.length > 0) {
     const envFilePath = path.join(envDir, 'env');
     const quotedLines = shellQuoteEnvLines(envLines);
@@ -1087,8 +1142,10 @@ export async function runHostAgent(
   // tombstone（happycodex）：上游此处的 Provider Pool selection（host 模式 trySelectPoolProvider +
   // resetSession 清会话，upstream container-runner.ts:1469-1493）随 provider failover 删除。
 
-  // 配置层环境变量（codex 替换：仅 customEnv + 系统设置，无 ANTHROPIC_* provider 行）
-  const envLines = buildAgentEnvLines(group.folder);
+  // 配置层环境变量（codex 替换：仅 customEnv + 系统设置 + per-user 自定义 provider 的
+  // CODEX_CUSTOM_API_KEY，无 ANTHROPIC_* provider 行）。host 模式直接进 hostEnv 对象
+  // （无 shell 解析），apiKey 含特殊字符不破坏。
+  const envLines = buildAgentEnvLines(group.folder, group.created_by);
   for (const line of envLines) {
     const eqIdx = line.indexOf('=');
     if (eqIdx > 0) {

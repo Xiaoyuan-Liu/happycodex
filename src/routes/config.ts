@@ -74,6 +74,9 @@ import {
   getUserWhatsAppConfig,
   saveUserWhatsAppConfig,
   appendImConfigAudit,
+  toPublicCodexProvider,
+  saveUserCodexProvider,
+  deleteUserCodexProvider,
 } from '../runtime-config.js';
 import type { AuthUser, RegisteredGroup } from '../types.js';
 import { logger } from '../logger.js';
@@ -414,6 +417,96 @@ configRoutes.delete('/codex/auth', authMiddleware, (c) => {
   } catch (err) {
     logger.error({ err }, 'Failed to delete user codex auth.json');
     return c.json({ error: 'Failed to delete codex auth.json' }, 500);
+  }
+});
+
+// ─── Per-user Codex custom model provider（自定义第三方模型，如 GLM）─────
+//
+// per-user（authMiddleware，作用域 c.get('user').id）：每个用户管理自己的一个
+// active 自定义 codex provider（非列表）。落盘走 runtime-config 的
+// saveUserCodexProvider / toPublicCodexProvider / deleteUserCodexProvider
+// （apiKey AES-256-GCM 加密 + 0o600，userId 经 userImDir 白名单校验）。
+//   - GET    /codex/provider → toPublicCodexProvider（脱敏：hasApiKey + 末4位 mask，无明文）
+//   - PUT    /codex/provider → saveUserCodexProvider（apiKey 可选：未传保留旧 key）
+//   - DELETE /codex/provider → deleteUserCodexProvider（幂等）
+// wire_api 不在路由层暴露选择（默认 responses；saveUserCodexProvider 内部 normalize）。
+// 审计经 appendClaudeConfigAudit，只记 changedFields 名（绝不记 apiKey 值）。
+
+/** 当前用户自己的 codex 自定义 provider（脱敏，无 apiKey 明文）；未配置 → null。 */
+configRoutes.get('/codex/provider', authMiddleware, (c) => {
+  const user = c.get('user') as AuthUser;
+  try {
+    return c.json({ provider: toPublicCodexProvider(user.id) });
+  } catch (err) {
+    logger.error({ err }, 'Failed to read user codex provider');
+    return c.json({ error: 'Failed to read codex provider' }, 500);
+  }
+});
+
+/**
+ * 保存/更新当前用户的 codex 自定义 provider。
+ * body: { name, baseUrl, model, wireApi?, apiKey? }。
+ * - name/baseUrl/model 必填；baseUrl 必须 https（saveUserCodexProvider 内部校验抛错 → 400）。
+ * - apiKey 可选：未传 → 保留旧 key（仅改 model/baseUrl 不重置 key）；传空串 → 清空。
+ * 校验失败/payload 非法回 400（不泄漏 apiKey）；审计不记 key 值。
+ */
+configRoutes.put('/codex/provider', authMiddleware, async (c) => {
+  const user = c.get('user') as AuthUser;
+  const body = await c.req.json().catch(() => ({}));
+
+  const name = typeof body.name === 'string' ? body.name : '';
+  const baseUrl = typeof body.baseUrl === 'string' ? body.baseUrl : '';
+  const model = typeof body.model === 'string' ? body.model : '';
+  // wireApi 可选：仅当传了字符串才透传，否则交由 saveUserCodexProvider 默认 'responses'。
+  const wireApi =
+    body.wireApi === 'responses' || body.wireApi === 'chat'
+      ? body.wireApi
+      : undefined;
+  // apiKey 可选：未传（含非字符串）→ undefined（保留旧 key）；传字符串（含空串）→ 用新值。
+  const apiKey = typeof body.apiKey === 'string' ? body.apiKey : undefined;
+
+  if (!name.trim() || !baseUrl.trim() || !model.trim()) {
+    return c.json({ error: 'name、baseUrl、model 均为必填' }, 400);
+  }
+
+  try {
+    const saved = saveUserCodexProvider(user.id, {
+      name,
+      baseUrl,
+      model,
+      ...(wireApi !== undefined ? { wireApi } : {}),
+      ...(apiKey !== undefined ? { apiKey } : {}),
+    });
+    // 审计只记字段名（绝不记 apiKey 值）：apiKey 是否变更用布尔标记。
+    const changedFields = ['name', 'baseUrl', 'model'];
+    if (wireApi !== undefined) changedFields.push('wireApi');
+    if (apiKey !== undefined) changedFields.push('apiKey');
+    appendClaudeConfigAudit(user.username, 'codex_provider_set', changedFields, {
+      userId: user.id,
+      scope: 'per-user',
+      apiKeyChanged: apiKey !== undefined,
+    });
+    return c.json({ provider: saved });
+  } catch (err) {
+    const message =
+      err instanceof Error ? err.message : 'Invalid codex provider payload';
+    logger.warn({ err, userId: user.id }, 'Invalid user codex provider payload');
+    return c.json({ error: message }, 400);
+  }
+});
+
+/** 删除当前用户的 codex 自定义 provider（幂等：不存在不报错）。 */
+configRoutes.delete('/codex/provider', authMiddleware, (c) => {
+  const user = c.get('user') as AuthUser;
+  try {
+    deleteUserCodexProvider(user.id);
+    appendClaudeConfigAudit(user.username, 'codex_provider_deleted', [
+      'provider.json',
+    ], { userId: user.id, scope: 'per-user' });
+    return c.json({ success: true, provider: null });
+  } catch (err) {
+    logger.error({ err }, 'Failed to delete user codex provider');
+    return c.json({ error: 'Failed to delete codex provider' }, 500);
   }
 });
 

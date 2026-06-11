@@ -3020,6 +3020,267 @@ export function saveUserDiscordConfig(
   return normalized;
 }
 
+// ========== Codex Custom Model Provider（per-user 自定义第三方模型，如 GLM） ==========
+//
+// codex 自定义 provider 走 per-folder CODEX_HOME 的 config.toml [model_providers.<id>]，
+// 顶层 model + model_provider 选用之。apiKey 经 env_key="CODEX_CUSTOM_API_KEY" 由运行时
+// 注入（per-user provider + per-folder CODEX_HOME 隔离，固定 env 名安全）。
+// 落盘：data/config/user-im/{userId}/codex/provider.json，apiKey 用 encryptChannelSecret 加密，
+// 复用 Feishu/Telegram 同款 per-user 加密范式（writeSecretFile 0o600 + 同一 key 文件）。
+
+/** codex wire_api：codex 0.137.0 仅 "responses" 真正可用（"chat" 已废弃报错），默认 responses。 */
+export type CodexWireApi = 'responses' | 'chat';
+
+/** 一个用户一个 active provider（非列表）。apiKey 为运行时内部解密后的明文，绝不回前端。 */
+export interface CodexCustomProvider {
+  id: string;
+  name: string;
+  baseUrl: string;
+  model: string;
+  wireApi: CodexWireApi;
+  apiKey: string;
+}
+
+/** 脱敏视图：绝不含 apiKey 明文，只暴露存在性 + 末 4 位 mask（供前端展示当前配置）。 */
+export interface PublicCodexCustomProvider {
+  id: string;
+  name: string;
+  baseUrl: string;
+  model: string;
+  wireApi: CodexWireApi;
+  hasApiKey: boolean;
+  apiKeyMask: string | null; // 形如 "••••1234"；无 key 时 null
+  updatedAt: string | null;
+}
+
+interface CodexProviderSecretPayload {
+  apiKey: string;
+}
+
+interface StoredCodexProviderConfigV1 {
+  version: 1;
+  id: string;
+  name: string;
+  baseUrl: string;
+  model: string;
+  wireApi: CodexWireApi;
+  updatedAt: string;
+  secret: EncryptedSecrets;
+}
+
+/** name → provider id：[a-z0-9-] 小写 slug；空则回退 "custom"。 */
+function slugifyProviderId(input: unknown): string {
+  const raw = typeof input === 'string' ? input : '';
+  const slug = raw
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 64);
+  return slug || 'custom';
+}
+
+/** 控制字符（含 U+2028/2029）会破坏 config.toml 基本串（非法 TOML → codex 解析失败）。 */
+const TOML_UNSAFE_CONTROL_RE = /[\x00-\x1f\x7f\u2028\u2029]/;
+
+function normalizeProviderName(input: unknown): string {
+  if (typeof input !== 'string') {
+    throw new Error('Invalid field: name');
+  }
+  const value = input.trim();
+  if (!value) throw new Error('Invalid field: name');
+  if (value.length > 128) throw new Error('Field too long: name');
+  if (TOML_UNSAFE_CONTROL_RE.test(value)) throw new Error('Invalid field: name（含控制字符）');
+  return value;
+}
+
+/** codex provider base_url：必须是 https（红线）。复用 normalizeBaseUrl 的 URL 校验再加 https 约束。 */
+function normalizeCodexBaseUrl(input: unknown): string {
+  if (typeof input !== 'string') {
+    throw new Error('Invalid field: baseUrl');
+  }
+  const value = input.trim();
+  if (!value) throw new Error('Invalid field: baseUrl');
+  if (value.length > MAX_FIELD_LENGTH) {
+    throw new Error('Field too long: baseUrl');
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error('Invalid field: baseUrl');
+  }
+  if (parsed.protocol !== 'https:') {
+    throw new Error('Invalid field: baseUrl（必须是 https）');
+  }
+  return value;
+}
+
+function normalizeCodexModel(input: unknown): string {
+  if (typeof input !== 'string') {
+    throw new Error('Invalid field: model');
+  }
+  const value = input.trim();
+  if (!value) throw new Error('Invalid field: model');
+  if (value.length > 128) throw new Error('Field too long: model');
+  if (TOML_UNSAFE_CONTROL_RE.test(value)) throw new Error('Invalid field: model（含控制字符）');
+  return value;
+}
+
+function normalizeWireApi(input: unknown): CodexWireApi {
+  if (input === undefined || input === null || input === '') return 'responses';
+  if (input === 'responses' || input === 'chat') return input;
+  throw new Error('Invalid field: wireApi');
+}
+
+/** 读 per-user codex provider（apiKey 解密，供运行时内部使用）。无配置或解密失败 → null。 */
+export function getUserCodexProvider(userId: string): CodexCustomProvider | null {
+  const filePath = path.join(userImDir(userId), 'codex', 'provider.json');
+  try {
+    if (!fs.existsSync(filePath)) return null;
+    const content = fs.readFileSync(filePath, 'utf-8');
+    const parsed = JSON.parse(content) as Record<string, unknown>;
+    if (parsed.version !== 1) return null;
+
+    const stored = parsed as unknown as StoredCodexProviderConfigV1;
+    const secret =
+      decryptChannelSecret<CodexProviderSecretPayload>(stored.secret);
+    return {
+      id: slugifyProviderId(stored.id),
+      name: normalizeProviderName(stored.name),
+      baseUrl: normalizeCodexBaseUrl(stored.baseUrl),
+      model: normalizeCodexModel(stored.model),
+      wireApi: normalizeWireApi(stored.wireApi),
+      apiKey: secret.apiKey,
+    };
+  } catch (err) {
+    logger.warn({ err, userId }, 'Failed to read user Codex provider');
+    return null;
+  }
+}
+
+/** 脱敏当前 provider（绝不回 apiKey 明文）；无配置 → null。 */
+export function toPublicCodexProvider(
+  userId: string,
+): PublicCodexCustomProvider | null {
+  const filePath = path.join(userImDir(userId), 'codex', 'provider.json');
+  try {
+    if (!fs.existsSync(filePath)) return null;
+    const content = fs.readFileSync(filePath, 'utf-8');
+    const parsed = JSON.parse(content) as Record<string, unknown>;
+    if (parsed.version !== 1) return null;
+    const stored = parsed as unknown as StoredCodexProviderConfigV1;
+
+    let hasApiKey = false;
+    let apiKeyMask: string | null = null;
+    try {
+      const secret =
+        decryptChannelSecret<CodexProviderSecretPayload>(stored.secret);
+      const key = secret.apiKey || '';
+      hasApiKey = key.length > 0;
+      apiKeyMask = hasApiKey
+        ? '••••' + key.slice(-4)
+        : null;
+    } catch {
+      // 解密失败：视为无可用 key（不抛错、不泄漏密文）。
+      hasApiKey = false;
+      apiKeyMask = null;
+    }
+
+    return {
+      id: slugifyProviderId(stored.id),
+      name: normalizeProviderName(stored.name),
+      baseUrl: normalizeCodexBaseUrl(stored.baseUrl),
+      model: normalizeCodexModel(stored.model),
+      wireApi: normalizeWireApi(stored.wireApi),
+      hasApiKey,
+      apiKeyMask,
+      updatedAt: stored.updatedAt || null,
+    };
+  } catch (err) {
+    logger.warn({ err, userId }, 'Failed to read public Codex provider');
+    return null;
+  }
+}
+
+/**
+ * 保存 per-user codex provider。
+ * - apiKey 可选：未传（undefined）时保留旧 key（仅改 model/baseUrl 不重置 key）；
+ *   传空串则视为清空 key（hasApiKey 变 false）。
+ * - baseUrl 校验 https，slug 化 id，apiKey 加密，原子写 0o600。
+ */
+export function saveUserCodexProvider(
+  userId: string,
+  next: {
+    name: string;
+    baseUrl: string;
+    model: string;
+    wireApi?: CodexWireApi;
+    apiKey?: string;
+  },
+): PublicCodexCustomProvider {
+  const name = normalizeProviderName(next.name);
+  const id = slugifyProviderId(name);
+  const baseUrl = normalizeCodexBaseUrl(next.baseUrl);
+  const model = normalizeCodexModel(next.model);
+  const wireApi = normalizeWireApi(next.wireApi);
+
+  // apiKey 决议：未传 → 沿用旧 key；传了（含空串）→ 用新值（normalizeSecret 剥空白/非 ASCII）。
+  let apiKey: string;
+  if (next.apiKey === undefined) {
+    const existing = getUserCodexProvider(userId);
+    apiKey = existing?.apiKey ?? '';
+  } else {
+    apiKey = next.apiKey === '' ? '' : normalizeSecret(next.apiKey, 'apiKey');
+  }
+
+  const updatedAt = new Date().toISOString();
+  const payload: StoredCodexProviderConfigV1 = {
+    version: 1,
+    id,
+    name,
+    baseUrl,
+    model,
+    wireApi,
+    updatedAt,
+    secret: encryptChannelSecret<CodexProviderSecretPayload>({ apiKey }),
+  };
+
+  const dir = path.join(userImDir(userId), 'codex');
+  fs.mkdirSync(dir, { recursive: true });
+  const filePath = path.join(dir, 'provider.json');
+  writeSecretFile(filePath, JSON.stringify(payload, null, 2) + '\n');
+
+  return {
+    id,
+    name,
+    baseUrl,
+    model,
+    wireApi,
+    hasApiKey: apiKey.length > 0,
+    apiKeyMask: apiKey.length > 0 ? '••••' + apiKey.slice(-4) : null,
+    updatedAt,
+  };
+}
+
+/** 删除 per-user codex provider（幂等：不存在不报错）。 */
+export function deleteUserCodexProvider(userId: string): void {
+  const filePath = path.join(userImDir(userId), 'codex', 'provider.json');
+  try {
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+    }
+  } catch (err) {
+    logger.warn({ err, userId }, 'Failed to delete user Codex provider');
+  }
+}
+
+/** per-user 是否已配置 codex provider（provider.json 存在性，userId 经 userImDir 校验）。 */
+export function hasUserCodexProvider(userId: string): boolean {
+  const filePath = path.join(userImDir(userId), 'codex', 'provider.json');
+  return fs.existsSync(filePath);
+}
+
 // ─── System settings (plain JSON, no encryption) ─────────────────
 
 const SYSTEM_SETTINGS_FILE = path.join(

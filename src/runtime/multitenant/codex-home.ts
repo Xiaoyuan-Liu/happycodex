@@ -24,7 +24,7 @@ import {
   writeHooksJson,
   type BuildHooksOptions,
 } from './hooks-config.js';
-import { mergeMcpServersIntoToml, tomlString } from './mcp-toml.js';
+import { mergeMcpServersIntoToml, tomlKey, tomlString } from './mcp-toml.js';
 
 /** 必需的共享凭据文件名。 */
 const AUTH_FILE = 'auth.json';
@@ -101,6 +101,149 @@ export interface FsCodexHomeProvisionerOptions {
    * 预裁剪预算一致，避免大 AGENTS.md（如多技能索引）被 codex 静默截断。幂等写入。
    */
   projectDocMaxBytes?: number;
+  /**
+   * per-user 自定义模型 provider（如 GLM 等兼容 OpenAI Responses API 的第三方）。
+   * **不含 apiKey** —— provision 只写 config.toml 引用 env_key（固定 CODEX_CUSTOM_API_KEY）；
+   * apiKey 由 container-runner 经 buildAgentEnvLines 注入 env，与凭据落盘解耦。
+   * 提供时 provision 幂等写：顶层 model + model_provider，并合并 [model_providers.<id>] 段。
+   */
+  modelProvider?: CodexModelProviderConfig;
+}
+
+/** config.toml 写入用的自定义 provider 描述（不含 apiKey）。 */
+export interface CodexModelProviderConfig {
+  id: string;
+  name: string;
+  baseUrl: string;
+  model: string;
+  /** codex wire_api：默认 "responses"（codex 0.137.0 仅此可用）。 */
+  wireApi?: 'responses' | 'chat';
+}
+
+/** 固定 env_key：每用户一个 provider + per-folder CODEX_HOME 隔离，固定名安全。 */
+export const CODEX_CUSTOM_API_KEY_ENV = 'CODEX_CUSTOM_API_KEY';
+
+// ── 自定义 provider 的 config.toml 调和（行式编辑，与 mcp-toml 同约定，不引入 TOML 依赖）──
+const TOML_HEADER_RE = /^\s*\[/;
+const MODEL_PROVIDERS_HEADER_RE = /^\s*\[model_providers\.("(?:[^"\\]|\\.)*"|[^\].]+)\]\s*(?:#.*)?$/;
+const MANAGED_ENV_KEY_RE = new RegExp(
+  `^\\s*env_key\\s*=\\s*["']${CODEX_CUSTOM_API_KEY_ENV}["']`,
+);
+
+/**
+ * 剥离 happycodex 写入的自定义 provider 配置（其余内容原样保留）：
+ * - 移除 `[model_providers.<id>]` 段中 body 含 `env_key="CODEX_CUSTOM_API_KEY"` 者（含其前导一空行）；
+ * - 若顶层（首个表头前）`model_provider` 指向被移除的 id，则连同顶层 `model` 一并移除。
+ * 用户手工 provider（无该 env_key）与无关键不动。无 happycodex 段则原样返回。
+ */
+export function stripManagedModelProvider(content: string): string {
+  if (!content) return content;
+  const lines = content.split('\n');
+  const remove = new Array<boolean>(lines.length).fill(false);
+  const managedIds = new Set<string>();
+
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i]!.match(MODEL_PROVIDERS_HEADER_RE);
+    if (!m) continue;
+    let end = lines.length;
+    for (let j = i + 1; j < lines.length; j++) {
+      if (TOML_HEADER_RE.test(lines[j]!)) { end = j; break; }
+    }
+    const managed = lines.slice(i + 1, end).some((l) => MANAGED_ENV_KEY_RE.test(l));
+    if (managed) {
+      managedIds.add(m[1]!.replace(/^["']|["']$/g, ''));
+      for (let k = i; k < end; k++) remove[k] = true;
+      // 连带移除段头前的一空行（insert 时加的分隔），避免越积越多空行。
+      if (i > 0 && lines[i - 1]!.trim() === '') remove[i - 1] = true;
+    }
+    i = end - 1;
+  }
+  if (managedIds.size === 0) return content;
+
+  let firstHeader = lines.length;
+  for (let i = 0; i < lines.length; i++) {
+    if (TOML_HEADER_RE.test(lines[i]!)) { firstHeader = i; break; }
+  }
+  let mpManaged = false;
+  for (let i = 0; i < firstHeader; i++) {
+    const mm = lines[i]!.match(/^\s*model_provider\s*=\s*["']?([^"'#\s]+)["']?/);
+    if (mm) {
+      if (managedIds.has(mm[1]!)) { remove[i] = true; mpManaged = true; }
+      break;
+    }
+  }
+  if (mpManaged) {
+    for (let i = 0; i < firstHeader; i++) {
+      if (/^\s*model\s*=/.test(lines[i]!)) { remove[i] = true; break; }
+    }
+  }
+
+  const kept = lines.filter((_, i) => !remove[i]);
+  // 折叠连续空行（≥2 → 1），并去掉首尾多余空行，保证 strip∘insert 稳定。
+  return kept.join('\n').replace(/\n{3,}/g, '\n\n').replace(/^\n+/, '').replace(/\n+$/, '\n');
+}
+
+/**
+ * 从 content 移除：顶层（首个表头前）所有 `model` / `model_provider` 行，以及
+ * `[model_providers.<id>]` 段（裸名或带引号匹配 id）。供 insert 前清场——happycodex 配
+ * provider 时拥有顶层 model/model_provider 与该 id 段，覆盖任何既有（用户 pin 的 model
+ * 或同 id 的 user-authored 段），避免重复键 / 重复段头导致非法 TOML。
+ */
+function removeTopModelAndSection(content: string, id: string): string {
+  if (!content) return content;
+  const lines = content.split('\n');
+  const remove = new Array<boolean>(lines.length).fill(false);
+
+  let firstHeader = lines.length;
+  for (let i = 0; i < lines.length; i++) {
+    if (TOML_HEADER_RE.test(lines[i]!)) { firstHeader = i; break; }
+  }
+  for (let i = 0; i < firstHeader; i++) {
+    if (/^\s*model\s*=/.test(lines[i]!) || /^\s*model_provider\s*=/.test(lines[i]!)) {
+      remove[i] = true;
+    }
+  }
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i]!.match(MODEL_PROVIDERS_HEADER_RE);
+    if (!m) continue;
+    let end = lines.length;
+    for (let j = i + 1; j < lines.length; j++) {
+      if (TOML_HEADER_RE.test(lines[j]!)) { end = j; break; }
+    }
+    if (m[1]!.replace(/^["']|["']$/g, '') === id) {
+      for (let k = i; k < end; k++) remove[k] = true;
+      if (i > 0 && lines[i - 1]!.trim() === '') remove[i - 1] = true;
+    }
+    i = end - 1;
+  }
+  const kept = lines.filter((_, i) => !remove[i]);
+  return kept.join('\n').replace(/\n{3,}/g, '\n\n').replace(/^\n+/, '').replace(/\n+$/, '\n');
+}
+
+/**
+ * 写入自定义 provider：先清场（移除既有顶层 model/model_provider + 同 id 段），再把顶层
+ * model/model_provider 置最前（首个表头前，与其他顶层键共存）、`[model_providers.<id>]` 段
+ * （env_key 固定 CODEX_CUSTOM_API_KEY）追加末尾。须先经 stripManagedModelProvider 清掉旧的
+ * happycodex 管理段（含改名前的旧 id）。
+ */
+export function insertManagedModelProvider(
+  content: string,
+  provider: CodexModelProviderConfig,
+): string {
+  const cleaned = removeTopModelAndSection(content, provider.id);
+  const wireApi = provider.wireApi ?? 'responses';
+  const top =
+    `model = ${tomlString(provider.model)}\n` +
+    `model_provider = ${tomlString(provider.id)}\n`;
+  const section =
+    `[model_providers.${tomlKey(provider.id)}]\n` +
+    `name = ${tomlString(provider.name)}\n` +
+    `base_url = ${tomlString(provider.baseUrl)}\n` +
+    `env_key = ${tomlString(CODEX_CUSTOM_API_KEY_ENV)}\n` +
+    `wire_api = ${tomlString(wireApi)}\n`;
+  const base = cleaned.replace(/^\n+/, '').replace(/\n+$/, '');
+  const mid = base ? `${base}\n` : '';
+  return `${top}${mid}\n${section}`;
 }
 
 export class FsCodexHomeProvisioner implements ICodexHomeProvisioner {
@@ -116,6 +259,7 @@ export class FsCodexHomeProvisioner implements ICodexHomeProvisioner {
   private readonly agentsMd: FsCodexHomeProvisionerOptions['agentsMd'];
   private readonly projectDocFallbackFilenames: FsCodexHomeProvisionerOptions['projectDocFallbackFilenames'];
   private readonly projectDocMaxBytes: FsCodexHomeProvisionerOptions['projectDocMaxBytes'];
+  private readonly modelProvider: FsCodexHomeProvisionerOptions['modelProvider'];
 
   constructor(opts: FsCodexHomeProvisionerOptions) {
     this.dataDir = opts.dataDir;
@@ -128,6 +272,7 @@ export class FsCodexHomeProvisioner implements ICodexHomeProvisioner {
     this.agentsMd = opts.agentsMd;
     this.projectDocFallbackFilenames = opts.projectDocFallbackFilenames;
     this.projectDocMaxBytes = opts.projectDocMaxBytes;
+    this.modelProvider = opts.modelProvider;
   }
 
   async provision(folder: string): Promise<string> {
@@ -180,7 +325,49 @@ export class FsCodexHomeProvisioner implements ICodexHomeProvisioner {
       );
     }
 
+    // 8. per-user 自定义模型 provider：调和式写——总是调用（即便无 provider），以便在
+    //    删除/清 key 时剥离 config.toml 里残留的 happycodex 管理 provider 配置（否则
+    //    codex 仍引用 model_provider 但 env 不再注入 key → 会话起不来、删除不自愈）。
+    await this.provisionModelProvider(
+      path.join(codexHome, CONFIG_FILE),
+      this.modelProvider,
+    );
+
     return codexHome;
+  }
+
+  /**
+   * 调和式写自定义模型 provider 到 config.toml（非只追加——支持删除/改名/改 model 的收敛）：
+   * - 先剥离上一次 happycodex 写入的 provider 配置：靠 `env_key = "CODEX_CUSTOM_API_KEY"`
+   *   这个 happycodex 独有标记识别 `[model_providers.*]` 段并整段移除；若顶层
+   *   `model_provider` 指向被剥离的 id，连同同组的顶层 `model` 一并移除。用户手工写的
+   *   provider 段（无该 env_key）与无关顶层键不动。
+   * - provider 提供时再按当前值重写：顶层 `model`/`model_provider`（插到首个表头前，与
+   *   ensureProjectDocSettings 共存）+ `[model_providers.<id>]` 段（env_key 固定
+   *   CODEX_CUSTOM_API_KEY）。provider 缺失（删除/无 key）则只剥不写 → codex 回退默认账号。
+   * apiKey 绝不落盘（codex 运行时从 env_key 指向的 env 读取，由 buildAgentEnvLines 注入）。
+   * 幂等：strip 是 insert 的左逆，二次 provision 结果稳定（next===content 免写盘）。
+   */
+  private async provisionModelProvider(
+    configPath: string,
+    provider: CodexModelProviderConfig | undefined,
+  ): Promise<void> {
+    let content = '';
+    if (await this.exists(configPath)) {
+      content = await readFile(configPath, 'utf8');
+    }
+    if (!content && !provider) return; // 无文件且无 provider：无事可做。
+
+    // 调和：先剥离上一次 happycodex 写入的 provider 配置（靠 env_key=CODEX_CUSTOM_API_KEY
+    // 这个独有标记识别 [model_providers.*] 段；顶层 model_provider 指向被剥离的 id 时连同
+    // model 一并移除）。再按当前 provider 重写——删除→只剥不写、改名/改 model→旧的剥掉换新的。
+    const stripped = stripManagedModelProvider(content);
+    const next = provider
+      ? insertManagedModelProvider(stripped, provider)
+      : stripped;
+
+    if (next === content) return; // 无变化免写盘（幂等）。
+    await writeFile(configPath, next, 'utf8');
   }
 
   /**

@@ -17,6 +17,33 @@ import { wsManager } from '../api/ws';
 
 export type CodexAuthMethod = 'chatgpt' | 'api_key' | 'unknown';
 
+/** codex 自定义 provider 的 wire_api。codex 0.137.0 仅 "responses" 可用，默认 responses。 */
+export type CodexWireApi = 'responses' | 'chat';
+
+/**
+ * 脱敏后的自定义 codex provider（不含 apiKey 明文）。
+ * 对应后端 PublicCodexCustomProvider（src/runtime-config.ts）。
+ */
+export interface CodexProviderPublic {
+  id: string;
+  name: string;
+  baseUrl: string;
+  model: string;
+  wireApi: CodexWireApi;
+  hasApiKey: boolean;
+  apiKeyMask: string | null; // 形如 "••••1234"；无 key 时 null
+  updatedAt: string | null;
+}
+
+/** 保存自定义 provider 的入参；apiKey 可选（未传则保留旧 key，不重置）。 */
+export interface SaveCodexProviderInput {
+  name: string;
+  baseUrl: string;
+  model: string;
+  wireApi?: CodexWireApi;
+  apiKey?: string;
+}
+
 /** 脱敏后的认证状态（不含 token/key 明文）。对应后端 CodexAuthStatus 的安全子集。 */
 export interface CodexAuthStatusPublic {
   loggedIn: boolean;
@@ -65,6 +92,11 @@ interface CodexAuthState {
   error: string | null;
   device: CodexDeviceAuthState;
 
+  /** 当前用户的自定义 codex provider（脱敏）；null 表示未配置。 */
+  provider: CodexProviderPublic | null;
+  /** provider 加载/读取中（与认证 loading 分离，避免互相干扰）。 */
+  providerLoading: boolean;
+
   loadStatus: () => Promise<void>;
   submitApiKey: (apiKey: string, force?: boolean) => Promise<void>;
   submitAccessToken: (accessToken: string) => Promise<void>;
@@ -74,6 +106,13 @@ interface CodexAuthState {
   resetDevice: () => void;
   /** 订阅 codex_device_auth WS 事件，返回解订阅函数。 */
   subscribeDeviceAuth: () => () => void;
+
+  /** 读取当前用户的自定义 provider（GET /api/config/codex/provider）。 */
+  loadProvider: () => Promise<void>;
+  /** 保存/更新自定义 provider（PUT）；apiKey 可选（未传保留旧 key）。 */
+  saveProvider: (input: SaveCodexProviderInput) => Promise<void>;
+  /** 删除自定义 provider（DELETE），回退 codex 默认模型。 */
+  deleteProvider: () => Promise<void>;
 }
 
 const INITIAL_DEVICE: CodexDeviceAuthState = { phase: 'idle' };
@@ -83,6 +122,8 @@ export const useCodexAuthStore = create<CodexAuthState>((set, get) => ({
   loading: false,
   error: null,
   device: INITIAL_DEVICE,
+  provider: null,
+  providerLoading: false,
 
   loadStatus: async () => {
     set({ loading: true });
@@ -154,5 +195,29 @@ export const useCodexAuthStore = create<CodexAuthState>((set, get) => ({
       },
     );
     return unsubscribe;
+  },
+
+  loadProvider: async () => {
+    set({ providerLoading: true });
+    try {
+      // 后端在未配置时返回 null（200）；脱敏视图绝不含 apiKey 明文。
+      const data = await api.get<CodexProviderPublic | null>(
+        '/api/config/codex/provider',
+      );
+      set({ provider: data, providerLoading: false });
+    } catch (err) {
+      set({ providerLoading: false });
+      throw err;
+    }
+  },
+
+  saveProvider: async (input) => {
+    await api.put('/api/config/codex/provider', input);
+    await get().loadProvider();
+  },
+
+  deleteProvider: async () => {
+    await api.delete('/api/config/codex/provider');
+    await get().loadProvider();
   },
 }));

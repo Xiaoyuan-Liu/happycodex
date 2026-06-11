@@ -28,7 +28,7 @@ export function tomlString(s: string): string {
 }
 
 /** TOML 键：bare key 字符集直接用，否则加引号。 */
-function tomlKey(k: string): string {
+export function tomlKey(k: string): string {
   return /^[A-Za-z0-9_-]+$/.test(k) ? k : tomlString(k);
 }
 
