@@ -37,8 +37,12 @@ export const WEB_PORT = parseInt(process.env.WEB_PORT || '3000', 10);
 // When accessed over HTTPS: use __Host- prefix (requires Secure; Path=/; no Domain)
 // When accessed over HTTP (localhost dev or no TLS): use plain name
 // Determined per-request via isSecureRequest(), not at startup
-export const SESSION_COOKIE_NAME_SECURE = '__Host-happyclaw_session';
-export const SESSION_COOKIE_NAME_PLAIN = 'happyclaw_session';
+//
+// happycodex 专属 cookie 名（不沿用上游 happyclaw_session）：localhost 上 cookie 不区分端口，
+// 与同机另一端口跑的 happyclaw 共用 `happyclaw_session` 会互相覆盖 → 登录一个把另一个顶下线。
+// 改用 happycodex_session 后两者各自独立，可同机并存。
+export const SESSION_COOKIE_NAME_SECURE = '__Host-happycodex_session';
+export const SESSION_COOKIE_NAME_PLAIN = 'happycodex_session';
 const SESSION_SECRET_FILE = path.join(DATA_DIR, 'config', 'session-secret.key');
 
 function getOrCreateSessionSecret(): string {
