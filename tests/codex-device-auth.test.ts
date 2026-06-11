@@ -171,6 +171,34 @@ describe('startDeviceAuth — spawn 参数与安全', () => {
 });
 
 describe('stdout/stderr 解析 → pending', () => {
+  test('真实 ANSI 着色输出（codex 即便管道也带颜色码）→ 剥 ANSI 后 URL 干净、短码抓到', () => {
+    const updates: CodexDeviceAuthState[] = [];
+    startDeviceAuth('alice', (s) => updates.push(s));
+    // 实测 codex 0.137.0 --device-auth 的真实输出形态（含 \x1b[94m...\x1b[0m）。
+    lastChild().stdout.push(
+      '   \x1b[94mhttps://auth.openai.com/codex/device\x1b[0m\n' +
+        '2. Enter this one-time code \x1b[90m(expires in 15 minutes)\x1b[0m\n' +
+        '   \x1b[94mGMF7-O8PIP\x1b[0m\n',
+    );
+    const pending = updates.find((u) => u.status === 'pending')!;
+    expect(pending.verificationUri).toBe('https://auth.openai.com/codex/device');
+    expect(pending.userCode).toBe('GMF7-O8PIP');
+  });
+
+  test('URL 与短码跨 chunk 到达 → 累积缓冲后整体解析出两者', () => {
+    const updates: CodexDeviceAuthState[] = [];
+    startDeviceAuth('alice', (s) => updates.push(s));
+    const child = lastChild();
+    // 第一个 chunk 只有 URL（无码）→ 暂不推（等码）。
+    child.stdout.push('visit https://auth.openai.com/codex/device\n');
+    expect(updates.filter((u) => u.status === 'pending')).toHaveLength(0);
+    // 第二个 chunk 带来短码 → 累积后整体解析，推 pending 含两者。
+    child.stdout.push('enter code WXYZ-9876\n');
+    const pending = updates.find((u) => u.status === 'pending')!;
+    expect(pending.verificationUri).toBe('https://auth.openai.com/codex/device');
+    expect(pending.userCode).toBe('WXYZ-9876');
+  });
+
   test('stdout 打印 URL + 短码 → onUpdate(pending) 含 verificationUri/userCode/expiresInSec=900', () => {
     const updates: CodexDeviceAuthState[] = [];
     startDeviceAuth('alice', (s) => updates.push(s));

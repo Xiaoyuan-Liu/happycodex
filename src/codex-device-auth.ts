@@ -39,15 +39,24 @@ const DEVICE_AUTH_TIMEOUT_MS = 15 * 60 * 1000;
 const DEVICE_AUTH_EXPIRES_SEC = 900;
 
 /**
+ * ANSI 转义序列（颜色码等）。codex 即便输出到管道（非 TTY）也带 ANSI（实测
+ * `\x1b[94m...\x1b[0m`），不剥除会：① 污染 URL（`\x1b[0m` 被 percent-encode 进 URL）；
+ * ② 让短码的 `\b` 词边界失效（前面紧挨 ANSI 的 `m` 字符）→ userCode 抓不到。
+ */
+// eslint-disable-next-line no-control-regex
+const ANSI_ESCAPE_RE = /\x1b\[[0-9;]*[A-Za-z]/g;
+
+/**
  * 从一段输出里抓 verification URL + 紧邻的 user code。
  * codex 0.137.0 device-auth 打印形如 `https://auth.openai.com/codex/device` +
- * 一个短码（如 `ABCD-1234`）。用宽松正则：先抓首个 https URL，再抓一个看起来像
- * 短码的 token（4-12 个 [A-Z0-9-]，含至少一个字母或连字符，避免误抓纯数字端口/时间）。
+ * 一个短码（如 `ABCD-1234`）。先剥 ANSI 颜色码，再用宽松正则：抓首个 https URL，
+ * 再抓一个看起来像短码的 token，避免误抓纯数字端口/时间。
  */
-function parseVerification(text: string): {
+function parseVerification(rawText: string): {
   verificationUri?: string;
   userCode?: string;
 } {
+  const text = rawText.replace(ANSI_ESCAPE_RE, '');
   const out: { verificationUri?: string; userCode?: string } = {};
   const urlMatch = text.match(/https?:\/\/[^\s'"]+/);
   if (urlMatch) {
@@ -79,6 +88,8 @@ interface InFlight {
   state: CodexDeviceAuthState;
   timer: NodeJS.Timeout;
   onUpdate: CodexDeviceAuthUpdate;
+  /** 累积的 stdout/stderr 文本（URL 与短码可能跨 chunk，累积后整体解析）。 */
+  buffer: string;
   /** 是否已抓到并推过 pending（避免重复推 verification）。 */
   sawPending: boolean;
   /** 终结（authorized/expired/error）后置位，幂等防多次清理。 */
@@ -163,6 +174,7 @@ export function startDeviceAuth(
     state: { status: 'pending' },
     timer: setTimeout(() => {}, 0), // 占位，下面立即覆盖
     onUpdate,
+    buffer: '',
     sawPending: false,
     done: false,
   };
@@ -189,25 +201,34 @@ export function startDeviceAuth(
   }, DEVICE_AUTH_TIMEOUT_MS);
 
   // stdout/stderr 都可能承载 verification 信息（不同 codex 版本输出流不一）。
-  // 安全：只抓 URL + 短码（公开信息），绝不记录原始输出（可能含 token 回显）。
+  // 累积缓冲后整体解析：URL 与短码可能跨 chunk 到达。仅当 URL 与短码都抓到才推
+  // pending（codex device-auth 必同时打印两者；只有 URL 无码对用户无用）；缓冲含
+  // "code"/"验证码" 提示但仍无码时也容忍推 url-only 兜底。
+  // 安全：只抓 URL + 短码（公开信息），绝不记录原始 buffer（可能含 token 回显）。
   const onChunk = (chunk: Buffer): void => {
     if (record.done || record.sawPending) return;
-    const text = chunk.toString();
-    const { verificationUri, userCode } = parseVerification(text);
-    if (verificationUri) {
-      record.sawPending = true;
-      const state: CodexDeviceAuthState = {
-        status: 'pending',
-        verificationUri,
-        userCode,
-        expiresInSec: DEVICE_AUTH_EXPIRES_SEC,
-      };
-      record.state = state;
-      try {
-        onUpdate(state);
-      } catch (err) {
-        logger.warn({ err, userId }, 'codex device-auth: onUpdate threw on pending');
-      }
+    record.buffer += chunk.toString();
+    // 限制缓冲上限，防异常输出无界增长。
+    if (record.buffer.length > 64 * 1024) {
+      record.buffer = record.buffer.slice(-64 * 1024);
+    }
+    const { verificationUri, userCode } = parseVerification(record.buffer);
+    if (!verificationUri) return;
+    // 有 URL 但暂无码：再等后续 chunk（码通常紧随 URL）。除非缓冲已较大（码大概率
+    // 不会再来），则 url-only 兜底推出，避免永远卡在"正在获取"。
+    if (!userCode && record.buffer.length < 4096) return;
+    record.sawPending = true;
+    const state: CodexDeviceAuthState = {
+      status: 'pending',
+      verificationUri,
+      ...(userCode ? { userCode } : {}),
+      expiresInSec: DEVICE_AUTH_EXPIRES_SEC,
+    };
+    record.state = state;
+    try {
+      onUpdate(state);
+    } catch (err) {
+      logger.warn({ err, userId }, 'codex device-auth: onUpdate threw on pending');
     }
   };
   child.stdout?.on('data', onChunk);
