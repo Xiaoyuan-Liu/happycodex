@@ -270,6 +270,71 @@ describe('parseRunnerInput — IPC 工具路由上下文（ContainerInput.chatJi
   });
 });
 
+describe('parseRunnerInput — R6 加固：sandbox/approvalPolicy stdin 提权门控', () => {
+  test('默认（无 HAPPYCODEX_TRUST_STDIN_POLICY）：stdin 的 sandbox/approvalPolicy 一律丢弃', () => {
+    const input = parseRunnerInput(
+      JSON.stringify({
+        prompt: 'hi',
+        groupFolder: 'g1',
+        session: { sandbox: 'danger-full-access', approvalPolicy: 'never' },
+      }),
+      {}, // 无信任开关
+    );
+    expect(input.session.sandbox).toBeUndefined();
+    expect(input.session.approvalPolicy).toBeUndefined();
+  });
+
+  test('默认下顶层字段形式（ContainerInput 风格）的 sandbox 也被丢弃', () => {
+    const input = parseRunnerInput(
+      JSON.stringify({ prompt: 'hi', groupFolder: 'g1', sandbox: 'danger-full-access' }),
+      { HAPPYCODEX_TRUST_STDIN_POLICY: 'false' },
+    );
+    expect(input.session.sandbox).toBeUndefined();
+  });
+
+  test('运维显式 HAPPYCODEX_TRUST_STDIN_POLICY=true：放行（单租户/PoC）', () => {
+    const input = parseRunnerInput(
+      JSON.stringify({
+        prompt: 'hi',
+        groupFolder: 'g1',
+        session: { sandbox: 'workspace-write', approvalPolicy: 'on-request' },
+      }),
+      { HAPPYCODEX_TRUST_STDIN_POLICY: 'true' },
+    );
+    expect(input.session.sandbox).toBe('workspace-write');
+    expect(input.session.approvalPolicy).toBe('on-request');
+  });
+
+  test('开关大小写不敏感、仅 "true" 放行（"TRUE"/"1"/其它一律拒绝）', () => {
+    const honored = parseRunnerInput(
+      JSON.stringify({ prompt: 'x', groupFolder: 'g1', sandbox: 'read-only' }),
+      { HAPPYCODEX_TRUST_STDIN_POLICY: '  TRUE ' },
+    );
+    expect(honored.session.sandbox).toBe('read-only');
+    const denied = parseRunnerInput(
+      JSON.stringify({ prompt: 'x', groupFolder: 'g1', sandbox: 'read-only' }),
+      { HAPPYCODEX_TRUST_STDIN_POLICY: '1' },
+    );
+    expect(denied.session.sandbox).toBeUndefined();
+  });
+
+  test('门控不影响其它 session 字段（model/cwd/resumeThreadId 照常解析）', () => {
+    const input = parseRunnerInput(
+      JSON.stringify({
+        prompt: 'x',
+        groupFolder: 'g1',
+        session: { model: 'gpt-5.1-codex', cwd: '/w', sandbox: 'danger-full-access' },
+        sessionId: 'thread-7',
+      }),
+      {},
+    );
+    expect(input.session.model).toBe('gpt-5.1-codex');
+    expect(input.session.cwd).toBe('/w');
+    expect(input.session.resumeThreadId).toBe('thread-7');
+    expect(input.session.sandbox).toBeUndefined();
+  });
+});
+
 describe('applySessionEnvFallbacks — env 系统设置消费端（上游 parity）', () => {
   test('ANTHROPIC_MODEL：session.model 缺省时回退 env（上游 CLAUDE_MODEL 语义）', () => {
     const session: ThreadSessionConfig = {};

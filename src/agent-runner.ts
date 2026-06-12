@@ -236,7 +236,18 @@ function writeContainerOutput(out: ContainerOutput): Promise<void> {
  * - 兼容主仓 ContainerInput 的字段名：prompt / groupFolder（必有），以及 sessionId / model / cwd 等。
  * - 多余字段一律忽略；缺失字段给安全默认（folder 默认 'default'，prompt 默认空串）。
  */
-export function parseRunnerInput(raw: string): CodexRunnerInput {
+/**
+ * stdin 注入 codex sandbox/approvalPolicy 的信任开关（R6 加固）。
+ * 默认 false（多租户安全默认拒绝）；运维显式 HAPPYCODEX_TRUST_STDIN_POLICY=true 方放行。
+ */
+function trustStdinThreadPolicy(env: NodeJS.ProcessEnv): boolean {
+  return env.HAPPYCODEX_TRUST_STDIN_POLICY?.trim().toLowerCase() === 'true';
+}
+
+export function parseRunnerInput(
+  raw: string,
+  env: NodeJS.ProcessEnv = process.env,
+): CodexRunnerInput {
   let obj: Record<string, unknown>;
   try {
     const parsed: unknown = JSON.parse(raw);
@@ -266,10 +277,17 @@ export function parseRunnerInput(raw: string): CodexRunnerInput {
   if (model) session.model = model;
   const cwd = pick('cwd', isStr);
   if (cwd) session.cwd = cwd;
-  const approvalPolicy = pick('approvalPolicy', isStr) as ThreadSessionConfig['approvalPolicy'] | undefined;
-  if (approvalPolicy) session.approvalPolicy = approvalPolicy;
-  const sandbox = pick('sandbox', isStr) as ThreadSessionConfig['sandbox'] | undefined;
-  if (sandbox) session.sandbox = sandbox;
+  // 安全（R6 加固）：approvalPolicy/sandbox 是提权敏感字段——sandbox='danger-full-access'
+  // 会越过沙箱以 full access 跑命令、不继承 thread 沙箱策略。多租户部署下 stdin 可能被请求
+  // 内容影响，故默认**不**接受 stdin 注入这两项（交给受信运行时默认：codex-runner 自治默认
+  // approvalPolicy=never，sandbox 用 codex 默认）。生产 ContainerInput 本就不带这两个字段，
+  // 故默认拒绝零行为变化。需要时运维显式 HAPPYCODEX_TRUST_STDIN_POLICY=true 放行（单租户/PoC）。
+  if (trustStdinThreadPolicy(env)) {
+    const approvalPolicy = pick('approvalPolicy', isStr) as ThreadSessionConfig['approvalPolicy'] | undefined;
+    if (approvalPolicy) session.approvalPolicy = approvalPolicy;
+    const sandbox = pick('sandbox', isStr) as ThreadSessionConfig['sandbox'] | undefined;
+    if (sandbox) session.sandbox = sandbox;
+  }
   const baseInstructions = pick('baseInstructions', isStr);
   if (baseInstructions) session.baseInstructions = baseInstructions;
   const developerInstructions = pick('developerInstructions', isStr);
