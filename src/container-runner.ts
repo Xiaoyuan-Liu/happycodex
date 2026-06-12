@@ -275,12 +275,22 @@ function buildCodexHomeContext(
   const mcpServers = ownerId ? loadUserMcpServers(ownerId) : {};
   // per-user 自定义模型 provider（不含 apiKey，apiKey 走 buildAgentEnvLines 注入 env）。
   const modelProvider = resolveModelProvider(ownerId);
+  const authSource = resolveAuthSource(ownerId);
+  // R1 观测：会话将以**共享** codex 账号运行（用户无自登凭据 + fallback 开启）——
+  // 额度/计费/速率与他人混合。结构化 WARN 便于运维审计"谁在用共享账号"。默认 fallback=true
+  // 不破坏共享账号便利；需严格隔离设 HAPPYCODEX_PERUSER_AUTH_FALLBACK=false 强制各自自登。
+  if (authSource.scope === 'shared-fallback') {
+    logger.warn(
+      { ownerId, folder: group.folder },
+      'codex auth: 会话回退共享账号运行（额度/计费/速率与他人混合）',
+    );
+  }
   return {
     agentsMd: plan.agentsMd,
     projectDocFallbackFilenames: plan.projectDocFallbackFilenames,
     projectDocMaxBytes: plan.projectDocMaxBytes,
     ...(Object.keys(mcpServers).length > 0 ? { mcpServers } : {}),
-    authSourceDir: resolveAuthSourceDir(ownerId),
+    authSourceDir: authSource.dir,
     ...(modelProvider ? { modelProvider } : {}),
   };
 }
@@ -306,21 +316,34 @@ function resolveModelProvider(
   };
 }
 
+/** auth.json 复制源的选源 scope（供 R1 观测/审计）。 */
+export type AuthSourceScope =
+  | 'own'
+  | 'shared-fallback'
+  | 'shared-no-owner'
+  | 'self-required';
+
 /**
- * 计算 auth.json 复制源目录（per-user OAuth 选源）：
- * - owner 有 per-user 凭据 → 用其 userCodexHomeDir（用自己的账号）。
- * - 无 per-user 凭据 + fallback 开启 → sharedCodexHomeDir（回退共享账号）。
- * - 无 per-user 凭据 + fallback 关闭 → 故意指向不含 auth 的 per-user 目录：
+ * 计算 auth.json 复制源目录 + 选源 scope（per-user OAuth 选源）：
+ * - owner 有 per-user 凭据 → 用其 userCodexHomeDir（own，用自己的账号）。
+ * - 无 per-user 凭据 + fallback 开启 → sharedCodexHomeDir（shared-fallback：额度/计费/速率
+ *   与他人混合，调用方应 WARN 观测）。
+ * - 无 per-user 凭据 + fallback 关闭 → 故意指向不含 auth 的 per-user 目录（self-required）：
  *   provision 时 copyIfAbsent(auth.json, required) 抛"未登录"错，由编排层经现有
  *   agent_error 通路呈现为友好"请先登录"（强制每人自登，不新增分支）。
- * - ownerId 缺失（无 created_by）→ 回退 sharedCodexHomeDir。
+ * - ownerId 缺失（无 created_by）→ sharedCodexHomeDir（shared-no-owner）。
  */
-function resolveAuthSourceDir(ownerId: string | undefined | null): string {
-  if (!ownerId) return sharedCodexHomeDir();
-  if (hasUserCodexAuth(ownerId)) return userCodexHomeDir(ownerId);
+export function resolveAuthSource(ownerId: string | undefined | null): {
+  dir: string;
+  scope: AuthSourceScope;
+} {
+  if (!ownerId) return { dir: sharedCodexHomeDir(), scope: 'shared-no-owner' };
+  if (hasUserCodexAuth(ownerId)) {
+    return { dir: userCodexHomeDir(ownerId), scope: 'own' };
+  }
   return perUserAuthFallbackEnabled()
-    ? sharedCodexHomeDir()
-    : userCodexHomeDir(ownerId);
+    ? { dir: sharedCodexHomeDir(), scope: 'shared-fallback' }
+    : { dir: userCodexHomeDir(ownerId), scope: 'self-required' };
 }
 
 /**
