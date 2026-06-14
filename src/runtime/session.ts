@@ -47,6 +47,7 @@ import {
   type ThreadItem,
   type ThreadResumeParams,
   type ThreadStartParams,
+  type ThreadStatusChangedNotification,
   type TurnCompletedNotification,
   type TurnStartParams,
   type TurnStartResponse,
@@ -348,6 +349,19 @@ export class ThreadSession implements IThreadSession {
         if (p?.item) this.registerCollabAgents(p.item);
         break;
       }
+      case ServerNotif.threadStatusChanged: {
+        // 兜底完成（issue #1）：主线程报 idle 但本会话仍有在飞 turn —— 说明对应 turn/completed
+        // 丢失 / 带未知 turn.id / 被 threadId 过滤，inFlightTurns 永不清空 → CodexRunner 的
+        // finishPromise 永久挂起，直到 Host watchdog 30min 超时才被杀。主线程 idle = 服务端已无
+        // 活跃 turn（ThreadStatus 语义），据此把残留在飞 turn reconcile 成完成。子代理 thread 的
+        // idle 由 isMainThreadNotif 隔离（不动主线程在飞集合）；正常路径 turn/completed 已先清空
+        // → 此处为空操作。
+        const p = params as Partial<ThreadStatusChangedNotification> | undefined;
+        if (p?.status?.type === 'idle' && this.isMainThreadNotif(p.threadId)) {
+          this.reconcileInFlightOnIdle();
+        }
+        break;
+      }
       default:
         break;
     }
@@ -383,6 +397,24 @@ export class ThreadSession implements IThreadSession {
     }
     for (const handler of this.turnCompletedHandlers) {
       handler({ turnId, subtype });
+    }
+  }
+
+  /**
+   * 兜底完成（issue #1）：主线程进入 idle 时把仍残留的在飞 turn 全部 reconcile 成完成。
+   * 仅当 turn/completed 缺失导致 inFlightTurns 未清空时才有动作（正常路径 turn/completed 已先
+   * 清空 → 空操作）。subtype 用 'idle'，区别于正常完成（completed/failed/interrupted）与
+   * steer-reject 的 'interrupted'，供 CodexRunner 据此补发终态 result（mapper 不对 idle 产
+   * result 事件，下游需要它才能拿到 success 终态信封）。
+   */
+  private reconcileInFlightOnIdle(): void {
+    if (this.inFlightTurns.size === 0) return;
+    // 快照：completeTurn 会就地修改 inFlightTurns。
+    const stuck = Array.from(this.inFlightTurns);
+    // 对齐 turnCompleted 的一轮收尾：清空压缩缓冲（idle 后本轮不再有增量正文）。
+    this.accumText = '';
+    for (const turnId of stuck) {
+      this.completeTurn(turnId, 'idle');
     }
   }
 

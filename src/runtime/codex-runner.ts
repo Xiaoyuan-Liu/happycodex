@@ -92,6 +92,13 @@ export class CodexRunner implements ICodexRunner {
   private hadAnyTurn = false;
   /** 是否已被 shutdown，避免关闭后继续注入 / 重复关闭。 */
   private shuttingDown = false;
+  /**
+   * 本轮（最近一次 turn 开始以来）是否已有主线程终态 result 事件经 sink 流出。
+   * idle 兜底完成的去重依据：真实 turn/completed（即便 turn.id / threadId 失配，mapper 仍**无
+   * 条件**产 result 事件）已给出终态时，idle reconcile 不再合成第二条，避免双终态把已报的
+   * 失败/中断洗成 success（见 issue #1 加固）。onTurnStarted 重置、真实 result 出栈时置位。
+   */
+  private mainTerminalSeenThisTurn = false;
 
   constructor(deps: CodexRunnerDeps) {
     this.client = deps.client;
@@ -128,16 +135,50 @@ export class CodexRunner implements ICodexRunner {
     }
 
     session.onStreamEvent((ev) => {
+      // 观测真实主线程终态 result（mapper 从 turn/completed 产出，含 id/threadId 失配的"幽灵"
+      // turn）：用于 idle 兜底完成去重，避免双终态。子代理 result 不计（非主轮终态）。
+      if (ev.eventType === 'result' && ev.agentScope !== 'subagent') {
+        this.mainTerminalSeenThisTurn = true;
+      }
       this.sink(wrapStreamEvent(ev));
     });
 
     session.onTurnStarted(({ turnId }) => {
       this.hadAnyTurn = true;
       this.inFlightTurns.add(turnId);
+      // 新一轮开始：重置终态观测（去重只针对"本轮"）。
+      this.mainTerminalSeenThisTurn = false;
     });
 
-    session.onTurnCompleted(({ turnId }) => {
+    session.onTurnCompleted(({ turnId, subtype }) => {
       this.inFlightTurns.delete(turnId);
+      // 兜底完成（issue #1）：idle reconcile 的 turn 无对应 turn/completed 通知，mapper 未产
+      // 终态 result 事件 → 下游拿不到 success 终态信封（仅流式 text_delta + status:idle），
+      // 且 success(含正文) 才会提交游标。补发一条 result(completed)，使其与正常 turn/completed
+      // 路径等价（携本轮累积正文 → success + 提交游标）。三重收窄（见 issue #1 对抗 review）：
+      //   1) 本轮已有真实终态 result 流出（turn/completed 即便 id/threadId 失配，mapper 仍无条件
+      //      产 result）→ 不再合成，避免双终态把已报的失败/中断洗成 success。
+      //   2) shuttingDown/finished → 不合成，避免 teardown 期一条游离 idle 伪造 success。
+      // 残留：turn/completed 完全丢失、该轮真失败、且服务端仍干净 idle（非 systemError）的极少数
+      // 情形会被乐观判 completed —— 无终态信号可恢复真状态，且与 issue 期望"emit the final success
+      // result"一致（服务端可知的失败走 systemError，不在 idle 分支）。
+      if (
+        subtype === 'idle' &&
+        !this.mainTerminalSeenThisTurn &&
+        !this.shuttingDown &&
+        !this.finished
+      ) {
+        this.mainTerminalSeenThisTurn = true; // 多 turn 同时 reconcile 时也只补一条
+        this.sink(
+          wrapStreamEvent({
+            eventType: 'result',
+            subtype: 'completed',
+            agentScope: 'main',
+            ...(turnId ? { turnId } : {}),
+            ...(session.state.threadId ? { threadId: session.state.threadId } : {}),
+          }),
+        );
+      }
       this.maybeFinish();
     });
 

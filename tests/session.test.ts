@@ -404,6 +404,73 @@ describe('ThreadSession 鲁棒 turn 跟踪（回归 #3/#4/#5）', () => {
     client.emit('turn/started', { threadId: 'th_1', turn: { id: 'turn_dup' } }); // 通知重复 → 去重
     expect(started2).toEqual(['turn_dup']);
   });
+
+  it('#issue1 主线程 idle + 残留在飞 turn（turn/completed 丢失）→ reconcile 成完成（subtype idle）', async () => {
+    const { client, session } = await started('turn_live');
+    const completed: Array<{ turnId: string; subtype: string }> = [];
+    session.onTurnCompleted((i) => completed.push(i));
+
+    await session.sendUserMessage('go');
+    expect(session.state.activeTurnId).toBe('turn_live');
+
+    // turn/completed 从未到达；主线程报 idle → 兜底 reconcile。
+    client.emit('thread/status/changed', { threadId: 'th_1', status: { type: 'idle' } });
+    expect(session.state.activeTurnId).toBeNull(); // 在飞集合被清空
+    expect(completed).toEqual([{ turnId: 'turn_live', subtype: 'idle' }]);
+  });
+
+  it('#issue1 子代理 thread 的 idle 不 reconcile 主线程在飞 turn（isMainThreadNotif 隔离）', async () => {
+    const { client, session } = await started('turn_live');
+    const completed: Array<{ turnId: string; subtype: string }> = [];
+    session.onTurnCompleted((i) => completed.push(i));
+
+    await session.sendUserMessage('go');
+    expect(session.state.activeTurnId).toBe('turn_live');
+
+    // 子代理 thread 空闲：主线程 turn 仍在飞，绝不能被误判完成。
+    client.emit('thread/status/changed', { threadId: 'th_child', status: { type: 'idle' } });
+    expect(session.state.activeTurnId).toBe('turn_live');
+    expect(completed).toEqual([]);
+  });
+
+  it('#issue1 主线程 idle 但无在飞 turn（正常 turn/completed 已先到）→ 空操作，不重复触发', async () => {
+    const { client, session } = await started('turn_live');
+    const completed: Array<{ turnId: string; subtype: string }> = [];
+    session.onTurnCompleted((i) => completed.push(i));
+
+    await session.sendUserMessage('go');
+    client.emit('turn/completed', { threadId: 'th_1', turn: { id: 'turn_live', status: 'completed' } });
+    expect(completed).toEqual([{ turnId: 'turn_live', subtype: 'completed' }]);
+
+    // 随后到来的 idle：在飞集合已空 → 不再触发任何完成。
+    client.emit('thread/status/changed', { threadId: 'th_1', status: { type: 'idle' } });
+    expect(completed).toEqual([{ turnId: 'turn_live', subtype: 'completed' }]);
+  });
+
+  it('#issue1 idle reconcile 后迟到的 turn/completed 幂等（不二次触发 onTurnCompleted）', async () => {
+    const { client, session } = await started('turn_live');
+    const completed: Array<{ turnId: string; subtype: string }> = [];
+    session.onTurnCompleted((i) => completed.push(i));
+
+    await session.sendUserMessage('go');
+    client.emit('thread/status/changed', { threadId: 'th_1', status: { type: 'idle' } });
+    expect(completed).toEqual([{ turnId: 'turn_live', subtype: 'idle' }]);
+
+    // 迟到/重复的 turn/completed：turn 已不在飞集合 → completeTurn 幂等空操作。
+    client.emit('turn/completed', { threadId: 'th_1', turn: { id: 'turn_live', status: 'completed' } });
+    expect(completed).toEqual([{ turnId: 'turn_live', subtype: 'idle' }]);
+  });
+
+  it('#issue1 非 idle 的 thread/status/changed（active 等）不 reconcile 在飞 turn', async () => {
+    const { client, session } = await started('turn_live');
+    const completed: Array<{ turnId: string; subtype: string }> = [];
+    session.onTurnCompleted((i) => completed.push(i));
+
+    await session.sendUserMessage('go');
+    client.emit('thread/status/changed', { threadId: 'th_1', status: { type: 'active' } });
+    expect(session.state.activeTurnId).toBe('turn_live'); // active 不动在飞集合
+    expect(completed).toEqual([]);
+  });
 });
 
 describe('ThreadSession B1 compact', () => {
@@ -1125,6 +1192,104 @@ describe('CodexRunner app-server 崩溃自愈（回归 #12）', () => {
       .map((l) => JSON.parse(l.slice(OUTPUT_START_MARKER.length, l.length - OUTPUT_END_MARKER.length - 1)) as StreamEvent)
       .find((ev) => ev.eventType === 'result' && ev.subtype === 'failed');
     expect(failed).toBeUndefined(); // shutdown 是正常收尾，不伪造 failed
+  });
+});
+
+describe('CodexRunner idle 兜底完成（回归 issue #1）', () => {
+  function parse(line: string): StreamEvent {
+    return JSON.parse(
+      line.slice(OUTPUT_START_MARKER.length, line.length - OUTPUT_END_MARKER.length - 1),
+    ) as StreamEvent;
+  }
+
+  it('start→sendUserMessage 后 turn/completed 永不到、主线程报 idle → run() resolve 且补发 result(completed)', async () => {
+    const client = new FakeAppServerClient();
+    client.responses['thread/start'] = { thread: { id: 'th_idle', sessionId: 's', path: null } };
+    client.responses['turn/start'] = { turn: { id: 'turn_1' } }; // turn/start 响应已回，但 turn/completed 永不来
+    const lines: string[] = [];
+    const runner = new CodexRunner({
+      client,
+      config: {},
+      sink: (line) => lines.push(line),
+      mapper: new FakeMapper(),
+    });
+
+    let resolved = false;
+    const runPromise = runner.run({ prompt: 'p', groupFolder: 'g', session: {} }).then(() => {
+      resolved = true;
+    });
+    await vi.waitFor(() => expect(client.methods()).toContain('turn/start'));
+    expect(resolved).toBe(false); // turn 仍在飞
+
+    // 主线程报 idle：兜底 reconcile → run() 不再永久挂起。
+    client.emit('thread/status/changed', { threadId: 'th_idle', status: { type: 'idle' } });
+    await runPromise;
+    expect(resolved).toBe(true);
+
+    // 补发了一条 result(completed) 终态（下游据此产 success 信封）。
+    const result = lines.map(parse).find((ev) => ev.eventType === 'result');
+    expect(result).toMatchObject({ subtype: 'completed', turnId: 'turn_1', threadId: 'th_idle', agentScope: 'main' });
+  });
+
+  it('正常 turn/completed 先到 → idle 不再补发第二条 result（无双终态）', async () => {
+    const client = new FakeAppServerClient();
+    client.responses['thread/start'] = { thread: { id: 'th_ok', sessionId: 's', path: null } };
+    client.responses['turn/start'] = { turn: { id: 'turn_1' } };
+    const lines: string[] = [];
+    // 真实 StreamMapper：turn/completed → 1 条 result；idle → status:idle（非 result）。
+    const runner = new CodexRunner({ client, config: {}, sink: (l) => lines.push(l) });
+
+    const runPromise = runner.run({ prompt: 'p', groupFolder: 'g', session: {} });
+    await vi.waitFor(() => expect(client.methods()).toContain('turn/start'));
+
+    client.emit('turn/completed', { threadId: 'th_ok', turn: { id: 'turn_1', status: 'completed' } });
+    await runPromise;
+    // 完成后迟到的 idle：在飞集合已空 → reconcile 空操作，不补发 result。
+    client.emit('thread/status/changed', { threadId: 'th_ok', status: { type: 'idle' } });
+
+    const results = lines.map(parse).filter((ev) => ev.eventType === 'result');
+    expect(results).toHaveLength(1); // 只有 mapper 从 turn/completed 产的那一条
+    expect(results[0]).toMatchObject({ subtype: 'completed', turnId: 'turn_1' });
+  });
+
+  it('双终态去重：失配 id 的 turn/completed(failed) 已产真实 result → idle 不再合成 completed（不洗成 success）', async () => {
+    const client = new FakeAppServerClient();
+    client.responses['thread/start'] = { thread: { id: 'th_dt', sessionId: 's', path: null } };
+    client.responses['turn/start'] = { turn: { id: 'turn_live' } }; // 登记的在飞 turn
+    const lines: string[] = [];
+    // 真实 StreamMapper：mapper 无条件把 turn/completed 映射成 result（即便 id 不在飞集合）。
+    const runner = new CodexRunner({ client, config: {}, sink: (l) => lines.push(l) });
+
+    const runPromise = runner.run({ prompt: 'p', groupFolder: 'g', session: {} });
+    await vi.waitFor(() => expect(client.methods()).toContain('turn/start'));
+
+    // 服务端发 turn/completed 但 turn.id 失配（turn_ghost ≠ turn_live）：completeTurn 空操作（turn_live
+    // 仍在飞），但 mapper 仍产真实 result:failed → 下游已得失败终态。
+    client.emit('turn/completed', { threadId: 'th_dt', turn: { id: 'turn_ghost', status: 'failed' } });
+    // 随后主线程 idle：reconcile turn_live，但本轮已有真实终态 → 不再合成 completed。
+    client.emit('thread/status/changed', { threadId: 'th_dt', status: { type: 'idle' } });
+    await runPromise;
+
+    const results = lines.map(parse).filter((ev) => ev.eventType === 'result');
+    expect(results.map((r) => r.subtype)).toEqual(['failed']); // 只有真实 failed，无被洗成的 completed
+  });
+
+  it('收尾守卫：shutdown 后游离的主线程 idle 不合成 success（避免 teardown 伪造完成）', async () => {
+    const client = new FakeAppServerClient();
+    client.responses['thread/start'] = { thread: { id: 'th_sg', sessionId: 's', path: null } };
+    client.responses['turn/start'] = { turn: { id: 'turn_1' } };
+    const lines: string[] = [];
+    const runner = new CodexRunner({ client, config: {}, sink: (l) => lines.push(l), mapper: new FakeMapper() });
+
+    const runPromise = runner.run({ prompt: 'p', groupFolder: 'g', session: {} });
+    await vi.waitFor(() => expect(client.methods()).toContain('turn/start'));
+
+    runner.shutdown(); // shuttingDown 同步置位（dispose 异步，session 此刻仍订阅）
+    client.emit('thread/status/changed', { threadId: 'th_sg', status: { type: 'idle' } });
+    await runPromise;
+
+    const results = lines.map(parse).filter((ev) => ev.eventType === 'result');
+    expect(results).toEqual([]); // 收尾期不伪造任何终态 result
   });
 });
 
