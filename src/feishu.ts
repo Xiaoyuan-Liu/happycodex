@@ -1359,6 +1359,18 @@ export function createFeishuConnection(
         'Feishu message stored',
       );
     }
+    } catch (err) {
+      // 走到这里时该消息已被 dedup.markSeen 永久去重，且飞书 WS 不保证重投——
+      // 静默吞掉会让用户以为 bot 卡死。回一条简短提示引导用户重发（重发是新
+      // messageId，不受去重影响），并把异常完整记录下来。
+      logger.error(
+        { err, messageId, chatId, source },
+        'Feishu message intake failed after dedup markSeen',
+      );
+      // 仅实时消息提示重发；backfill 回填的旧消息失败不打扰用户。
+      if (source === 'ws') {
+        await sendTextToChat(chatId, '⚠️ 消息处理失败，请重发一次');
+      }
     } finally {
       processingLock.release(messageId);
     }

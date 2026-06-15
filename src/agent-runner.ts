@@ -53,7 +53,7 @@ import {
   errorOutput,
   type ContainerOutput,
 } from './container-output.js';
-import type { CodexRunnerInput, ThreadSessionConfig } from './contracts.js';
+import type { CodexRunnerInput, InjectContext, ThreadSessionConfig } from './contracts.js';
 
 // ───────────────────────── 路径解析（env 覆盖 + 默认 data/ 根） ─────────────────────────
 //
@@ -195,6 +195,10 @@ class FixedFolderToolBridge implements ToolBridge {
   }
   memoryGet(_folder: string, relPath: string): Promise<string | null> {
     return this.inner.memoryGet(this.memoryFolder, relPath);
+  }
+  /** #F1r：把 per-turn 上下文转发到内层 IPC bridge（chatJid/taskId 字段所在）。 */
+  setTurnContext(ctx: InjectContext): void {
+    this.inner.setTurnContext?.(ctx);
   }
 }
 
@@ -387,9 +391,6 @@ async function main(): Promise<void> {
   // 可选工具层（Stage 3 / A4）：IpcToolBridge 写输出侧 messages/ tasks/ + 记忆 + 请求-响应回执。
   // FixedFolderToolBridge 把工具调用钉到 env 解析出的 per-folder 目标（见适配器注释）。
   let tools: { registry: ToolRegistry; bridge: ToolBridge } | undefined;
-  // A4：保留内层 bridge 引用 —— IPC input 消息带 sourceJid 时就地更新 per-channel 工具的
-  // 当前聊天标识（对齐上游主循环对 mcpToolsConfig.chatJid 的就地变更）。
-  let innerBridge: IpcToolBridge | null = null;
   if (enableTools) {
     const registry = new ToolRegistry();
     // 对齐上游：HAPPYCLAW_DISABLE_MEMORY_LAYER === 'true' 时跳过 memory 工具注册
@@ -412,7 +413,6 @@ async function main(): Promise<void> {
       ...(input.isScheduledTask ? { isScheduledTask: true } : {}),
       ...(input.messageTaskId ? { currentTaskId: input.messageTaskId } : {}),
     });
-    innerBridge = inner;
     const bridge = new FixedFolderToolBridge(inner, ws.bridgeIpcFolder, ws.bridgeMemoryFolder);
     tools = { registry, bridge };
     log(
@@ -484,11 +484,13 @@ async function main(): Promise<void> {
 
   const inputLoop = new IpcInputLoop(inputDir, {
     onMessage: (msg: IpcInputMessage) => {
-      // A4：images 随消息透传到 session turn input；sourceJid 就地更新 per-channel 工具的
-      // 当前聊天标识（对齐上游主循环：mcpToolsConfig.chatJid = nextMessage.sourceJid）。
-      if (msg.sourceJid && innerBridge) innerBridge.setChatJid(msg.sourceJid);
+      // #F1r：per-message 上下文（sourceJid 路由 + 上游 7e49a65 的 taskId 任务身份）随 inject 透传，
+      // 由 CodexRunner 在该消息开启的 turn 的 onTurnStarted 绑定到 bridge——不再在此就地写共享字段。
+      // 就地写会在「同 tick 多消息 / 长 turn 期间 steer」时被下一条消息在本 turn 消费前覆写：
+      // 定时任务输出丢 taskId（notify 跳过）或被错 stamp（串台）。见 docs/UPSTREAM-SYNC.md #F1r。
+      // images 随消息透传到 session turn input。
       log(`inject message (${msg.text.length} chars, ${msg.images?.length ?? 0} images)`);
-      runner.inject(msg.text, msg.images);
+      runner.inject(msg.text, msg.images, { taskId: msg.taskId, sourceJid: msg.sourceJid });
     },
     onClose: () => beginShutdown('_close sentinel', true),
     onInterrupt: () => interruptCurrentTurn(),

@@ -305,6 +305,14 @@ export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
         replyToMsgId: inner.getLastMessageId(chatId),
         replyInThread: target.replyInThread,
         onCardCreated,
+        // 降级可观测性：卡片连续更新失败进入 error 态时记一条 warn。
+        // 终态收口与静态消息兜底分别由 schedulePatch 的 best-effort patch
+        // 和 index.ts 的 result 路径负责，这里只补日志。
+        onFallback: () =>
+          logger.warn(
+            { chatId: target.chatId },
+            'Feishu streaming card degraded to static fallback',
+          ),
       };
       return new StreamingCardController(opts);
     },

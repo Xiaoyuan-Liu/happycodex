@@ -43,6 +43,7 @@ import {
 import * as path from 'node:path';
 
 import { detectImageMimeTypeFromBase64Strict } from '../../image-detector.js';
+import type { InjectContext } from '../../contracts.js';
 import { INSTALL_SKILL_POLL_TIMEOUT_MS } from './types.js';
 import type {
   ToolBridge,
@@ -109,7 +110,8 @@ export class IpcToolBridge implements ToolBridge {
   private chatJid: string;
   private readonly isAdminHome: boolean;
   private readonly isScheduledTask: boolean;
-  private readonly currentTaskId: string;
+  // 非 readonly：warm-runner 经 IPC 注入的每条消息按其 taskId 就地更新（见 setCurrentTaskId）。
+  private currentTaskId: string;
   private readonly pollIntervalMs: number;
   private readonly pollTimeoutMs: number;
   private readonly installPollTimeoutMs: number;
@@ -133,6 +135,23 @@ export class IpcToolBridge implements ToolBridge {
    */
   setChatJid(jid: string): void {
     if (jid) this.chatJid = jid;
+  }
+
+  /**
+   * #F1r：把「一条注入消息开启的 turn」的 per-turn 上下文绑定到本 bridge。由 CodexRunner 在
+   * onTurnStarted（**仅新 turn 触发，steer 不触发**）调用——故同 turn 内（含 steer 并入的后续
+   * 消息）工具读到的 taskId/chatJid 稳定，不被并发到达的下一条消息覆写（修复 review #F1r 的
+   * 「共享可变字段在 turn 消费前被覆写」竞态）。
+   *
+   * 两字段语义不同（对齐上游主循环逐字段处理）：
+   *  - taskId：per-turn 身份，**无条件覆写**（上游 `mcpToolsConfig.currentTaskId = nextMessage.taskId`）。
+   *    普通消息无 taskId → 清零，否则其 send_message 会被错误归因到前一 turn 的任务、串台 notify。
+   *  - sourceJid：**持久路由绑定，仅真值才更新**（上游 `if (sourceJid) mcpToolsConfig.chatJid = ...`）。
+   *    消息可能不带 sourceJid（如 Web 内部注入），此时保留既有 chatJid 绑定（清空会让工具诚实失败）。
+   */
+  setTurnContext(ctx: InjectContext): void {
+    this.currentTaskId = ctx.taskId ?? '';
+    if (ctx.sourceJid) this.setChatJid(ctx.sourceJid);
   }
 
   /** 取路由 chatJid；未绑定 → 抛错（对应工具诚实失败，绝不写主进程会静默丢弃的请求）。 */

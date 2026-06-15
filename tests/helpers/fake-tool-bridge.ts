@@ -12,6 +12,7 @@ import type {
   DiscordHistoryOptions,
   DiscordHistoryMessage,
 } from '../../src/runtime/tools/types.js';
+import type { InjectContext } from '../../src/contracts.js';
 
 export interface RecordedCall {
   op: string;
@@ -110,5 +111,12 @@ export class FakeToolBridge implements ToolBridge {
   async discordGetServerInfo(folder: string): Promise<unknown | null> {
     this.record('discordGetServerInfo', folder);
     return this.discordGuild;
+  }
+
+  /** #F1r：记录 per-turn 上下文绑定，供 CodexRunner turn-绑定测试断言。 */
+  readonly turnContexts: InjectContext[] = [];
+  setTurnContext(ctx: InjectContext): void {
+    this.record('setTurnContext', ctx);
+    this.turnContexts.push(ctx);
   }
 }

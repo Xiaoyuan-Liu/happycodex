@@ -80,13 +80,17 @@ function _optimizeMarkdownStyle(text: string, cardVersion = 2): string {
     );
 
     // ── 5. Restore code blocks with <br> wrapping ──────────────────
+    // Replacer function, NOT a string: code blocks routinely contain `$&`,
+    // `$'`, `$1` (shell/regex/perl snippets) which the string form of
+    // String.replace treats as GetSubstitution patterns — corrupting and
+    // duplicating content.
     codeBlocks.forEach((block, i) => {
-      r = r.replace(`${MARK}${i}___`, `\n<br>\n${block}\n<br>\n`);
+      r = r.replace(`${MARK}${i}___`, () => `\n<br>\n${block}\n<br>\n`);
     });
   } else {
     // ── 5. Restore code blocks (no <br>) ───────────────────────────
     codeBlocks.forEach((block, i) => {
-      r = r.replace(`${MARK}${i}___`, block);
+      r = r.replace(`${MARK}${i}___`, () => block);
     });
   }
 

@@ -37,6 +37,12 @@ export interface IpcInputMessage {
   text: string;
   images?: Array<{ data: string; mimeType?: string }>;
   sourceJid?: string;
+  /**
+   * 定时任务身份（上游 7e49a65）：群组模式下定时任务注入「运行中容器」时，IPC payload
+   * 携带 taskId；消费侧据此把 agent 的 send_message 输出归因到任务记录，host 才会按
+   * notify_channels 广播。缺失（普通用户消息）时不 stamp。生产侧见 group-queue.sendMessage。
+   */
+  taskId?: string;
 }
 
 /** sentinel 文件名（严格对齐主仓 _close / _interrupt / _drain）。 */
@@ -81,6 +87,10 @@ export function drainIpcInput(dir: string): IpcInputMessage[] {
         }
         if (typeof data.sourceJid === 'string') {
           msg.sourceJid = data.sourceJid;
+        }
+        // 上游 7e49a65：定时任务注入运行中容器时携带 taskId，透传到消费侧用于任务归因 + notify。
+        if (typeof data.taskId === 'string') {
+          msg.taskId = data.taskId;
         }
         messages.push(msg);
       }

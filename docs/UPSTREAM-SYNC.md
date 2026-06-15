@@ -11,7 +11,7 @@ Claude Agent SDK，其余能力对齐 happyclaw。**不做自动 merge**——�
 - **不基于本机的 fork**：本地 `/Users/bytedance/Workspace/code_agnet/happyclaw` 是用户自己的 fork
   开发目录（有额外分支/改动），仅在调研期被只读参考过，**不作为追踪源、其文件不被本项目改动**。
 - 追踪分支：`upstream/main`。
-- **当前基线水位线**：`2599989`（riba2534/happyclaw main，2026-06-08 fetch）。
+- **当前基线水位线**：`804a9e0`（riba2534/happyclaw main，2026-06-15 fetch）。
 - 可浏览源码快照：`upstream-happyclaw/`（gitignored，486 文件 ~27M，纯源码，
   不含 data/dist/node_modules/备份）。
 
@@ -54,6 +54,7 @@ rm -rf upstream-happyclaw && mkdir upstream-happyclaw && \
 | CR#1 | 请求-响应 IPC（list_tasks 等）结果写回硬编码 `data/ipc/{folder}/tasks`，请求来自 agents/{aid}/ 或 tasks-run/{id}/ 子命名空间时轮询方永远收不到回执（假超时） | `src/index.ts:5570-5574` 等写回点 | `src/ipc-paths.ts` resolveIpcResultPath（锚定请求所在 tasks 目录）+ index.ts 全部写回点接入；tests/ipc-result-routing.test.ts 钉死 |
 | CR#2 | send_file/send_image 路径校验纯词法（startsWith），工作区内 symlink 可外读/外发任意主机文件 | `src/index.ts:5865-5866`（消费端）；agent-runner mcp-tools 生产端同 | 两侧独立 realpath 物理校验：producer `ipc-bridge.resolveWorkspaceFile`、consumer `ipc-paths.isRealPathWithinRoots` |
 | CR#8 | send_file 相对路径消费端恒锚 `GROUPS_DIR/{folder}`，host+customCwd 群组（生产端按注入的 customCwd 产出相对路径）发文件永远 not found | `src/container-runner.ts:1326/1584`（注入）vs `src/index.ts:5861`（消费） | `src/ipc-paths.ts` resolveSendFileAnchor（与 container-runner 注入同源的 customCwd 映射） |
+| CR#9 | WS upgrade 的 `warnedRejectedOrigins` Set 无界增长：Origin 校验在鉴权之前，未认证攻击者用海量不同 Origin 头刷 `/ws` upgrade 即可撑爆内存（同 diff 已给 snapshotTombstones / recentIpcSends 封顶，独漏此处）| `src/web.ts`（804a9e0 同源，无上界）| `MAX_WARNED_ORIGINS=500` + Set 插入序 FIFO 淘汰（与 MAX_SNAPSHOT_TOMBSTONES / recentIpcSends 同范式）。2026-06-15 sync review #F4 发现 |
 
 ## happycodex 自有扩展（非上游 1:1）
 
@@ -66,9 +67,93 @@ codex 引擎特有、上游 happyclaw 无对应物的功能，记此以便区分
 
 ## 迁移水位线 / 台账
 
-- **基线**：riba2534/happyclaw main @ `2599989`（2026-06-08）= 当前已对照基线。
-- **已 port**：R1 流式 / R2 运行中注入 / R3 工具+多租户 / R4 审批 + Stage5（compact /
-  sub-agent / hooks）= happycodex Stage 0–5（standalone 引擎本体，未接主仓）。
+- **基线**：riba2534/happyclaw main @ `804a9e0`（2026-06-15）= 当前已对照基线。
+- **已 port（引擎语义）**：R1 流式 / R2 运行中注入 / R3 工具+多租户 / R4 审批 + Stage5
+  （compact / sub-agent / hooks）= happycodex Stage 0–5（standalone 引擎本体，未接主仓）。
 - **待办**：A 接主仓（引擎 swap + 真实 IPC/sessions/memory + 旁路 Claude env/provider）。
-- **下次**：`git fetch upstream` 后评估 `2599989..新HEAD` 的 happyclaw 新功能逐条是否需 port，
+- **下次**：`git fetch upstream` 后评估 `804a9e0..新HEAD` 的 happyclaw 新功能逐条是否需 port，
   并更新本基线水位线。
+
+### 同步批次记录
+
+| 批次 | 区间 | commit 数 | 内容 | port 方式 |
+|---|---|---|---|---|
+| 2026-06-15 | `2599989..804a9e0` | 12 | 飞书流式卡片链路（8）+ WS Origin/CORS 安全（3）+ 群组定时任务身份（1） | 见下 |
+
+**2026-06-15 批次（`2599989..804a9e0`，全部属共享宿主层，非引擎本体）**：
+
+- **簇 A 飞书流式卡片**（`a8443a3` `5c8c54b` `ed694c1` `55836ce` `f2fa444` `dac0832`
+  `e5d4a25` `6c3f12b`）：卡死/刷屏复合根因（CardKit 串行化 + QPS 节流 + frozen-prefix
+  增量拆卡）、续卡首行吞字、C1–C5 高危（残留链/终态收口/终态守卫/字节预算拆卡/重试去重）、
+  6 个次级问题、collapsible_panel rgba→枚举色、字节预算（CJK）拆卡。涉及
+  feishu-streaming-card / feishu-cards/sections / feishu-markdown-style / feishu /
+  group-queue / im-channel / index / web。8 源文件与上游基线近乎一致（仅 codex 适配），
+  `git apply --3way` 干净落地。
+- **簇 B WS Origin/CORS**（`cbbeacc` `c7fd0ff` `804a9e0`）：happycodex 经 `ed775b8` 继承
+  了 CSWSH Origin 校验，故同样含「同源请求被 403 / 默认拒绝断流式卡」缺陷。最终态 =
+  CORS 默认 `''` + upgrade 同源放行（origin host==Host）+ `warnedRejectedOrigins`
+  单次诊断日志（落到 web.ts；cbbeacc 的默认 `'*'` 是被 804a9e0 废弃的中间态，未落地）。
+- **簇 C 群组定时任务身份**（`7e49a65`）：`GroupQueue.sendMessage` 增第 6 位 `taskId`，
+  IPC 注入 payload 带 taskId 才能让 resolveTaskRoutingDecision 归因、notify 不丢。
+
+**codex 接缝适配（本批迁移时偏离上游 1:1 的点）**：
+
+| 上游 | happycodex | 位置 |
+|---|---|---|
+| `se.parentToolUseId`（SDK Task 树过滤子代理） | `se.agentScope === 'subagent'`（冻结契约维度，session.decorateScope 注入） | index.ts feedStreamEventToCard thinking_delta / agent 路径 accText 累积 |
+| `broadcastStreamEvent({ ..., sessionId })` | `{ ..., threadId }`（StreamEvent 契约字段；sendMessage messageMeta 仍用 sessionId） | index.ts C5 status:idle 广播 |
+| 上游 C5 单块 willRetryAfterFailure 抑制 agent_error | 与 happycodex 自有「no-reply 空轮安静重试」块（consecutiveNoReplyExits）合并：no-reply 块在先并 return，C5 套到其后通用 agent_error 路径 | index.ts（3way 唯一冲突点，手工解决） |
+| 数组下标直接访问 | `!` 非空断言（noUncheckedIndexedAccess） | feishu-streaming-card pickSliceEnd 分组循环 |
+| 7e49a65 **消费侧**：上游基线 container/agent-runner 主循环已有 `mcpToolsConfig.currentTaskId = nextMessage.taskId` 就地变更，故上游本 commit 只需改生产者 | happycodex codex 运行时此前缺失该消费侧，本次**补齐**（否则只 port 生产者 = 7e49a65 实质未生效，notify 仍失效；对抗 review #F1 暴露）：IpcInputMessage 加 taskId + drainIpcInput 解析；IpcToolBridge.currentTaskId 改可变 + setCurrentTaskId（无条件覆写，常规消息清零防串台）；agent-runner onMessage 每条注入消息 setCurrentTaskId(msg.taskId) | src/runtime/ipc-input.ts、src/runtime/tools/ipc-bridge.ts、src/agent-runner.ts |
+
+测试：新增 `tests/feishu-multicard-rollover.test.ts`、`tests/feishu-markdown-style.test.ts`、
+`tests/group-queue-task-injection.test.ts`（后者 tmp 路径 happyclaw→happycodex 避免同机撞目录；
+含生产者断言 + drainIpcInput 消费侧端到端断言，钉死 taskId 线格式契约）。
+全量 1328 测试通过（含新增；`stale-detector` 为既有 timing-flaky，隔离连跑 5/5 绿）。
+
+### 本批次对抗式 review（5 lens × refute-biased 核实，12 条全 CONFIRMED/PLAUSIBLE）
+
+迁移后跑了一轮多 agent 对抗审查（5 lens）+ 一轮 skeptic 复审（专审 #F1 修复）。**修复**：#F1
+（7e49a65 消费侧漏 port，见上表）、#F2/#F3（新测试 `payloads[0].*` 缺 `!` 断言 → tsc 挂，已 hoist
+`const p = payloads[0]!`）、#F4（见下「主动修复」CR#9）、#F6（补消费侧端到端测试）、**#F1r**
+（skeptic 复审发现 #F1 引入的 turn 上下文竞态 → 架构级修复，见下）。**记录未修**：见下「已知继承缺陷」。
+
+#### #F1r 架构修复：per-turn 上下文绑定（消除 taskId/chatJid 覆写竞态）
+
+skeptic 复审发现 #F1 的消费侧把 taskId 设到 IpcToolBridge 的**共享可变字段**，而 send_message
+在工具执行时刻才读它。happycodex 是「逐条 inject + 异步 injectChain + turn/steer 运行中注入」
+（非上游的「批内合并单 turn + 串行 query」）：定时任务 turn 尚未执行 send_message 前，又有第二条
+消息（同 tick 多 drain / 长 turn 期间 steer）触发覆写 → 任务输出丢 taskId（notify 跳过）或串台。
+**同类竞态对 chatJid 也早已存在（pre-existing）**。
+
+**根因修复**（把 per-channel 上下文绑定到 turn 生命周期，而非消息到达时刻）：
+- 上下文（taskId + sourceJid）经 `inject(text, images, ctx)` 透传（`InjectContext`，contracts.ts）。
+- CodexRunner 在 injectChain 链节内、`sendUserMessage` 前置 `pendingInjectCtx`；**onTurnStarted
+  （仅新 turn 触发，steer 不触发）**消费它 → `bridge.setTurnContext(ctx)`，随即清空。
+- 关键不变量：steer 并入活跃 turn 不 fire onTurnStarted → **活跃 turn 的上下文不被后续到达的
+  消息覆写**（对齐上游「合并 turn 保留其 taskId」）。冷启动经构造函数 seed，不受影响。
+- `IpcToolBridge.setTurnContext`：taskId 无条件覆写（per-turn）、sourceJid only-on-truthy（持久绑定）；
+  `FixedFolderToolBridge.setTurnContext` 转发到内层。onMessage 不再就地写共享字段。
+- 触点：`src/contracts.ts`（InjectContext + ICodexRunner.inject）、`src/runtime/tools/types.ts`
+  （ToolBridge.setTurnContext?）、`src/runtime/tools/ipc-bridge.ts`、`src/runtime/codex-runner.ts`
+  （pendingInjectCtx + onTurnStarted 绑定）、`src/agent-runner.ts`（onMessage 经 inject 透传 + 转发）。
+- 测试：`tests/ipc-bridge.test.ts`（setTurnContext 语义 4 例）+ `tests/session.test.ts`（新 turn 绑定 /
+  steer 不覆写 1 例）。
+
+#### 已知继承缺陷（review 发现 · 上游 804a9e0 同源 · 本批未修）
+
+下列均为**忠实继承自上游、非本次迁移引入**的缺陷。本批刻意不修：① upstream-tracking 模型
+要求最小化分叉（修了即偏离，抬高未来 merge 成本）；② 多为 LOW；③ #F5 改键有过度抑制风险，
+需独立设计。记此供后续按需评估（修则升级为上方「主动修复」CR 表条目）。
+
+| 编号 | 严重度 | 缺陷 | 位置 | 备注 |
+|---|---|---|---|---|
+| #F5 | high | C5 的 IPC send_message 跨重试去重对**绝大多数群是 no-op**：`isRetryDuplicateIpcSend` 用 `web:${folder}` / `folder` 查 retryCount，但 queue 真实 key 是 chatJid（普通 web 群 = `web:<uuid>`，folder 是独立人类可读名），二者不等 → inRetry 恒 false。仅 admin home（folder='main'→`web:main`==jid）碰巧命中 | `src/index.ts:682-684`（上游/main:739 同源）| 修需 folder→chatJid 反查；但使去重真生效会引入「合法重复被误抑制」风险，须独立设计 |
+| #F7/#F8 | medium | `willRetryAfterFailure` 返回 `retryCount < MAX_RETRIES`(5)，而 scheduleRetry 先 `++` 再判 `> MAX_RETRIES` 才放弃 → 最后一次（retryCount=5）硬错误失败时**同时**发 `agent_error` 与 `agent_max_retries` 两条系统消息（C5 想消除的末端重复）| `src/group-queue.ts:132` + `src/index.ts:4105`（上游字节一致）| sendSystemMessage 无去重；边界 off-by-one |
+| #F9 | low | WS 同源放行 `new URL(origin).host === host` 只比 host:port、丢弃 scheme → `http://victim`（SSL-strip MITM / 同主机明文监听）被当作 `https://victim` 同源放行，削弱 CSWSH 纵深防御 | `src/web.ts:987`（上游同源）| 主防御仍是 SameSite=Strict + 签名 cookie；需 MITM 前提 |
+| #F10 | low | `recentIpcSends` 对已存在 key 的 `.set()` 只更新 value、不刷新插入位（JS Map 语义）→ 高频下被反复刷新的指纹会先于真正陈旧条目被 FIFO 淘汰，进一步削弱（本就 #F5 几乎不生效的）去重窗口 | `src/index.ts:685`（上游同源）| 仅 >500 指纹时触发；与 #F5 叠加 |
+| #F11 | low | `registerStreamingSession` fire-and-forget `existing.abort()` 后同步迭代清理 messageId 映射；abort 异步终态渲染若走 rollover/renderTerminalTail 新建续卡，其 messageId 在清理循环跑完后才注册 → 永不回收 → messageId→chatJid Map 缓慢泄漏 | `src/feishu-streaming-card.ts:2979`（上游同源）| 仅近卡上限长回复被替换时；慢泄漏 |
+| #F12 | low | `pickSliceEnd` 字节预算二分以 UTF-16 code unit 为索引 → 边界落在星空面字符（emoji）代理对中间，冻结卡尾 + 续卡首各现一个 �（CJK/BMP 安全）| `src/feishu-streaming-card.ts:1556` + finalize 兜底 `:2758`（上游同源）| 仅 ~16KB 字节边界恰含 emoji 时 |
+
+> #F1r（skeptic 复审发现的 #F1 turn 上下文竞态）**已在本批架构修复**，详见上「#F1r 架构修复」节，
+> 不在此「未修」表内。该修复顺带消除了 chatJid 的同类 pre-existing 竞态。
