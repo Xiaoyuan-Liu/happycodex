@@ -148,7 +148,7 @@ skeptic 复审发现 #F1 的消费侧把 taskId 设到 IpcToolBridge 的**共享
 
 | 编号 | 严重度 | 缺陷 | 位置 | 备注 |
 |---|---|---|---|---|
-| #F5 | high | C5 的 IPC send_message 跨重试去重对**绝大多数群是 no-op**：`isRetryDuplicateIpcSend` 用 `web:${folder}` / `folder` 查 retryCount，但 queue 真实 key 是 chatJid（普通 web 群 = `web:<uuid>`，folder 是独立人类可读名），二者不等 → inRetry 恒 false。仅 admin home（folder='main'→`web:main`==jid）碰巧命中 | `src/index.ts:682-684`（上游/main:739 同源）| 修需 folder→chatJid 反查；但使去重真生效会引入「合法重复被误抑制」风险，须独立设计 |
+| #F5 | high | C5 的 IPC send_message 跨重试去重对**绝大多数群是 no-op**：`isRetryDuplicateIpcSend` 用 `web:${folder}` / `folder` 查 retryCount，但 queue 真实 key 是 chatJid（普通 web 群 = `web:<uuid>`，folder 是独立人类可读名），二者不等 → inRetry 恒 false。仅 admin home（folder='main'→`web:main`==jid）碰巧命中 | `src/index.ts:682-684`（上游/main:739 同源）| **决策（2026-06-15）：不主动修，待上游 happyclaw 修复后对照跟进**。已在 upstream-happyclaw/ 804a9e0 快照核验四前提（inRetry 错配 key、getRetryCount 按 chatJid、sourceGroup=folder、jid=web:uuid）与上游同源同触发 → 确系上游 bug、非迁移引入；最小分叉原则下不抢先各改一套。届时修法：folder→chatJid 反查，并须验证「合法周期任务相同文案 / 用户要求重发」在重试轮外不被误抑制 |
 | #F7/#F8 | medium | `willRetryAfterFailure` 返回 `retryCount < MAX_RETRIES`(5)，而 scheduleRetry 先 `++` 再判 `> MAX_RETRIES` 才放弃 → 最后一次（retryCount=5）硬错误失败时**同时**发 `agent_error` 与 `agent_max_retries` 两条系统消息（C5 想消除的末端重复）| `src/group-queue.ts:132` + `src/index.ts:4105`（上游字节一致）| sendSystemMessage 无去重；边界 off-by-one |
 | #F9 | low | WS 同源放行 `new URL(origin).host === host` 只比 host:port、丢弃 scheme → `http://victim`（SSL-strip MITM / 同主机明文监听）被当作 `https://victim` 同源放行，削弱 CSWSH 纵深防御 | `src/web.ts:987`（上游同源）| 主防御仍是 SameSite=Strict + 签名 cookie；需 MITM 前提 |
 | #F10 | low | `recentIpcSends` 对已存在 key 的 `.set()` 只更新 value、不刷新插入位（JS Map 语义）→ 高频下被反复刷新的指纹会先于真正陈旧条目被 FIFO 淘汰，进一步削弱（本就 #F5 几乎不生效的）去重窗口 | `src/index.ts:685`（上游同源）| 仅 >500 指纹时触发；与 #F5 叠加 |
