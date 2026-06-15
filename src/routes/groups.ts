@@ -15,6 +15,7 @@ import {
   hasHostExecutionPermission,
   canAccessGroup,
   canModifyGroup,
+  canControlGroupResource,
   canDeleteGroup,
   canManageGroupMembers,
   MAX_GROUP_NAME_LEN,
@@ -918,9 +919,13 @@ groupRoutes.post('/:jid/stop', authMiddleware, async (c) => {
   // Resource-level ACL: the owner (canModifyGroup) can always stop; a shared
   // member may stop only a run they started themselves (the queue's current-run
   // initiator), not the owner's. Mirrors the delete-message owner-or-sender model.
+  // Shared with /interrupt and the terminal WS gate via canControlGroupResource.
   if (
-    !canModifyGroup({ id: authUser.id, role: authUser.role }, { ...group, jid }) &&
-    deps.queue.getActiveRunInitiator(jid) !== authUser.id
+    !canControlGroupResource(
+      { id: authUser.id, role: authUser.role },
+      { ...group, jid },
+      deps.queue.getActiveRunInitiator(jid),
+    )
   ) {
     return c.json(
       { error: 'Only the workspace owner or the run initiator can stop it' },
@@ -954,17 +959,18 @@ groupRoutes.post('/:jid/interrupt', authMiddleware, async (c) => {
     return c.json({ error: 'Group not found' }, 404);
   }
   // Resource-level ACL (see /stop): owner OR the run's initiator. Uses the full
-  // (possibly virtual #agent:) jid so an agent-conversation run resolves to its
-  // own runner. Agent/task runs carry no message initiator (getActiveRunInitiator
-  // excludes activeRunnerIsTask) → owner-only. Known safe-direction limitation:
-  // a member who started their own agent/task run can't interrupt it — only the
-  // owner can; revisit if member-initiated agent interrupt is wanted (see PR notes).
+  // (possibly virtual #agent:) jid for the initiator lookup so an agent-conversation
+  // run resolves to its own runner, but baseJid for ownership. Agent/task runs carry
+  // no message initiator (getActiveRunInitiator excludes activeRunnerIsTask) →
+  // owner-only. Known safe-direction limitation: a member who started their own
+  // agent/task run can't interrupt it — only the owner can; revisit if
+  // member-initiated agent interrupt is wanted (see PR notes).
   if (
-    !canModifyGroup(
+    !canControlGroupResource(
       { id: authUser.id, role: authUser.role },
       { ...group, jid: baseJid },
-    ) &&
-    deps.queue.getActiveRunInitiator(jid) !== authUser.id
+      deps.queue.getActiveRunInitiator(jid),
+    )
   ) {
     return c.json(
       { error: 'Only the workspace owner or the run initiator can interrupt it' },

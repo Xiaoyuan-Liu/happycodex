@@ -137,6 +137,100 @@ export function writeFileAtomic(
   }
 }
 
+/**
+ * 防符号链接的原子写（O_NOFOLLOW + O_EXCL）。
+ *
+ * 与 writeFileAtomic 的区别：后者 unlink+O_CREAT，在 unlink 与 open 之间仍有"重新预放
+ * symlink"竞态窗口，O_CREAT 会跟随它写到目标外。当写入路径位于**不可信方可写**的目录
+ * （如 agent 容器内 bind-mount 的工作区）时，恶意方可预放 `<target>` 或 `<target>.tmp`
+ * 为符号链接，把 host 进程的写引到 root 外/他人文件。本函数：
+ *   1) 先 lstat 目标，若已是 symlink 直接拒绝（不覆写、不跟随）；
+ *   2) tmp 用 O_WRONLY|O_CREAT|O_TRUNC|O_EXCL|O_NOFOLLOW 创建——已存在或为 symlink 即失败，
+ *      杜绝预放；写完 rename 覆盖目标（目录项替换，不跟随目标 symlink）；
+ *   3) 任何失败都 unlink tmp，避免下次 O_EXCL 永久 EEXIST 锁死。
+ * Windows 无 O_NOFOLLOW → 退回 'wx'（O_EXCL）创建 + 前置 lstat 守 leaf。
+ * 源范式见 src/routes/files.ts PUT；供需要在不可信目录安全落盘的调用方复用。
+ */
+export function writeFileAtomicNoFollow(
+  targetPath: string,
+  data: string | Buffer,
+  opts: { mode?: number } = {},
+): void {
+  const mode = opts.mode ?? 0o644;
+  // 目标若已是符号链接 → 拒绝（不覆写其本体所指）。ENOENT（不存在）正常放行。
+  try {
+    if (fs.lstatSync(targetPath).isSymbolicLink()) {
+      throw new Error('Refusing to write through a symbolic link');
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+  }
+  const tmp = `${targetPath}.tmp`;
+  const noFollow = (fs.constants as { O_NOFOLLOW?: number }).O_NOFOLLOW;
+  let renameOk = false;
+  try {
+    if (noFollow !== undefined) {
+      const flags =
+        fs.constants.O_WRONLY |
+        fs.constants.O_CREAT |
+        fs.constants.O_TRUNC |
+        fs.constants.O_EXCL |
+        noFollow;
+      // 首次创建失败若是 EEXIST（残留 tmp：上次写入崩溃遗留的普通文件）或 ELOOP（tmp 是预放的
+      // 符号链接，被 O_NOFOLLOW 拒绝）→ unlink 后重试一次：unlink 移除残留/预放物（不跟随），
+      // 重试仍用 O_EXCL|O_NOFOLLOW 创建全新 regular tmp。攻击者若在窗口内再次预放 symlink，
+      // 重试仍被 O_NOFOLLOW 拒 → fail-closed。与 Windows 分支的自愈一致，避免崩溃残留 tmp 把
+      // 下一次合法写入永久锁在 EEXIST。
+      let fd: number | null = null;
+      try {
+        try {
+          fd = fs.openSync(tmp, flags, mode);
+        } catch (err) {
+          const code = (err as NodeJS.ErrnoException).code;
+          if (code !== 'EEXIST' && code !== 'ELOOP') throw err;
+          try {
+            fs.unlinkSync(tmp);
+          } catch {
+            /* ignore */
+          }
+          fd = fs.openSync(tmp, flags, mode);
+        }
+        fs.writeFileSync(fd, data);
+      } finally {
+        if (fd !== null) {
+          try {
+            fs.closeSync(fd);
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+    } else {
+      // Windows fallback：'wx' = O_EXCL，避免覆写预放的 tmp；残留 tmp 删后重试一次。
+      try {
+        fs.writeFileSync(tmp, data, { flag: 'wx', mode });
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'EEXIST') {
+          fs.unlinkSync(tmp);
+          fs.writeFileSync(tmp, data, { flag: 'wx', mode });
+        } else {
+          throw err;
+        }
+      }
+    }
+    fs.renameSync(tmp, targetPath);
+    renameOk = true;
+  } finally {
+    if (!renameOk) {
+      try {
+        fs.unlinkSync(tmp);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+}
+
 /** Create IPC directories for an agent. */
 export function ensureAgentDirectories(
   folder: string,

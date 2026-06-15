@@ -15,6 +15,7 @@ import {
 import { getAllRegisteredGroups, getUserById } from '../db.js';
 import { logger } from '../logger.js';
 import { GROUPS_DIR, DATA_DIR } from '../config.js';
+import { writeFileAtomicNoFollow } from '../utils.js';
 import type { AuthUser } from '../types.js';
 
 const memoryRoutes = new Hono<{ Variables: Variables }>();
@@ -52,6 +53,30 @@ function isWithinRoot(targetPath: string, rootPath: string): boolean {
   );
 }
 
+/**
+ * 符号链接逃逸防护（issue #2 P1）：词法 isWithinRoot 只比较字符串路径，不防 symlink。
+ * 把一个绝对路径解析成 fs 实际会触达的**真实落点**：沿路径向上找到最近的已存在祖先、
+ * 对其 realpathSync（展开其中所有 symlink），再把不存在的剩余后缀原样拼回。
+ *
+ * 调用方据此真实落点做"容器内"与"归属"两类判定，从而同时拦截：
+ *   - host 逃逸：末级或某祖先是 symlink 指向允许 root 外（realpath 落到 root 外）；
+ *   - 跨租户逃逸：symlink 指向另一租户 folder（realpath 落到他人 folder → 归属判定基于
+ *     真实 folder 而非词法 folder，故能识破）。
+ * 对齐 file-manager.ts validateAndResolvePath 的祖先 realpath 思路。导出供单测。
+ */
+export function resolveRealMemoryPath(absolutePath: string): string {
+  let existing = absolutePath;
+  const tail: string[] = [];
+  while (!fs.existsSync(existing)) {
+    const parent = path.dirname(existing);
+    if (parent === existing) return absolutePath; // 触顶仍不存在（cwd 必存在，正常不至此）
+    tail.unshift(path.basename(existing));
+    existing = parent;
+  }
+  const base = fs.realpathSync(existing);
+  return tail.length > 0 ? path.join(base, ...tail) : base;
+}
+
 function normalizeRelativePath(input: unknown): string {
   if (typeof input !== 'string') {
     throw new Error('path must be a string');
@@ -74,44 +99,62 @@ function resolveMemoryPath(
   absolutePath: string;
   writable: boolean;
 } {
+  // 符号链接逃逸防护（issue #2 P1）：先把词法绝对路径解析成 fs 真实落点（展开 symlink），
+  // 后续"容器内/归属"判定与实际 fs 读写都基于这个真实路径——否则一个落在 root 内的 symlink
+  // 会让词法判定通过、fs 却写到 root 外（host 逃逸）或他人 folder（跨租户逃逸）。
+  //
+  // 已闭合：所有在校验时点已存在的 symlink（叶或祖先；指向 root 外或他人 folder）——resolveRealMemoryPath
+  // 展开后由下方容器内/归属校验拒绝；写入侧的 `.tmp` 预放 symlink 由 writeFileAtomicNoFollow 的
+  // O_NOFOLLOW 拦截。
+  // 已知残留（与全代码库一致，见 src/routes/files.ts 同款注释）：校验之后、fs 操作之前，并发的
+  // agent 进程把某个**中间目录**换成 symlink 的 TOCTOU 竞态——O_NOFOLLOW 只护叶子、不护中间段，
+  // 彻底闭合需 openat 逐段遍历（Node 原生不支持，且本仓 files.ts/file-manager.ts 均未做）。窗口为
+  // 同步调用间的亚毫秒间隙，仅可被独立容器进程以紧致循环概率性命中，非确定性原语；超出本 issue
+  // 范围，若威胁模型需要应作为独立的 openat 加固项跟踪。
   const absolute = path.resolve(process.cwd(), relativePath);
-  const inGroups = isWithinRoot(absolute, GROUPS_DIR);
-  const inMemoryData = isWithinRoot(absolute, MEMORY_DATA_DIR);
+  const real = resolveRealMemoryPath(absolute);
+  // 允许 root 也按同法解析（DATA_DIR 可能位于 symlink 下，如 macOS /tmp；fresh install 时
+  // 目录尚不存在亦能解析其已存在祖先），保证与 real 同一坐标系比较。
+  const groupsRoot = resolveRealMemoryPath(GROUPS_DIR);
+  const memoryRoot = resolveRealMemoryPath(MEMORY_DATA_DIR);
+  const userGlobalRoot = resolveRealMemoryPath(USER_GLOBAL_DIR);
+
+  const inGroups = isWithinRoot(real, groupsRoot);
+  const inMemoryData = isWithinRoot(real, memoryRoot);
   const writable = inGroups || inMemoryData;
 
   if (!writable) {
+    // 真实落点不在任何允许 root 内 → host 逃逸 / 越界。
     throw new Error('Memory path out of allowed scope');
   }
 
-  // User ownership check for non-admin
+  // User ownership check for non-admin —— 基于真实落点的 folder，而非词法 folder
+  // （否则 folderA/link -> folderB 会用词法 folderA 通过归属、真实写入 folderB）。
   if (user.role !== 'admin') {
     // user-global/{userId}/... — member can only access their own
-    if (isWithinRoot(absolute, USER_GLOBAL_DIR)) {
-      const relToUserGlobal = path.relative(USER_GLOBAL_DIR, absolute);
-      const ownerUserId = relToUserGlobal.split(path.sep)[0];
+    if (isWithinRoot(real, userGlobalRoot)) {
+      const ownerUserId = path.relative(userGlobalRoot, real).split(path.sep)[0];
       if (ownerUserId !== user.id) {
         throw new Error('Memory path out of allowed scope');
       }
     }
     // data/groups/{folder}/... — check group ownership
     else if (inGroups) {
-      const relToGroups = path.relative(GROUPS_DIR, absolute);
-      const folder = relToGroups.split(path.sep)[0] ?? '';
+      const folder = path.relative(groupsRoot, real).split(path.sep)[0] ?? '';
       if (!isUserOwnedFolder(user, folder)) {
         throw new Error('Memory path out of allowed scope');
       }
     }
     // data/memory/{folder}/... — check group ownership
     else if (inMemoryData) {
-      const relToMemory = path.relative(MEMORY_DATA_DIR, absolute);
-      const folder = relToMemory.split(path.sep)[0] ?? '';
+      const folder = path.relative(memoryRoot, real).split(path.sep)[0] ?? '';
       if (!isUserOwnedFolder(user, folder)) {
         throw new Error('Memory path out of allowed scope');
       }
     }
   }
 
-  return { absolutePath: absolute, writable };
+  return { absolutePath: real, writable };
 }
 
 /** Check if a folder belongs to the user (via registered_groups). */
@@ -199,7 +242,7 @@ function classifyMemorySource(
   };
 }
 
-function readMemoryFile(
+export function readMemoryFile(
   relativePath: string,
   user: AuthUser,
 ): MemoryFilePayload {
@@ -242,7 +285,7 @@ function isBlockedMemoryPath(normalizedPath: string): boolean {
   return false;
 }
 
-function writeMemoryFile(
+export function writeMemoryFile(
   relativePath: string,
   content: string,
   user: AuthUser,
@@ -260,9 +303,10 @@ function writeMemoryFile(
   }
 
   fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
-  const tempPath = `${absolutePath}.tmp`;
-  fs.writeFileSync(tempPath, content, 'utf-8');
-  fs.renameSync(tempPath, absolutePath);
+  // 符号链接逃逸防护（issue #2 P1）：absolutePath 已是真实落点，但其 `.tmp` 兄弟（后缀确定）
+  // 可能被预放成 symlink——普通 writeFileSync(tmp) 会跟随它把内容写到 root 外/他人文件。
+  // writeFileAtomicNoFollow 拒绝 symlink 目标、并以 O_NOFOLLOW|O_EXCL 创建 tmp 杜绝预放。
+  writeFileAtomicNoFollow(absolutePath, content);
 
   const stat = fs.statSync(absolutePath);
   return {
@@ -277,7 +321,7 @@ function writeMemoryFile(
 // Directories to skip when scanning group workspaces for memory files
 const WALK_SKIP_DIRS = new Set(['logs', '.claude', 'conversations', 'downloads', 'node_modules']);
 
-function walkFiles(
+export function walkFiles(
   baseDir: string,
   maxDepth: number,
   limit: number,
@@ -294,6 +338,10 @@ function walkFiles(
   }
   for (const entry of entries) {
     if (out.length >= limit) break;
+    // 符号链接逃逸防护（issue #2 P1）：不跟随符号链接——symlink-to-dir 会被
+    // isDirectory() 判否而当作"文件"push、symlink-to-file 直接 push，二者经 search
+    // 的 readMemoryFile 跟随即读到 root 外宿主机文件（且会污染 list 结果）。整体跳过。
+    if (entry.isSymbolicLink()) continue;
     const fullPath = path.join(baseDir, entry.name);
     if (entry.isDirectory()) {
       if (WALK_SKIP_DIRS.has(entry.name)) continue;
@@ -309,7 +357,7 @@ function isMemoryCandidateFile(filePath: string): boolean {
   return MEMORY_SOURCE_EXTENSIONS.has(ext);
 }
 
-function listMemorySources(user: AuthUser): MemorySource[] {
+export function listMemorySources(user: AuthUser): MemorySource[] {
   const files = new Set<string>();
   const isAdmin = user.role === 'admin';
   const groups = getAllRegisteredGroups();
@@ -388,13 +436,20 @@ function listMemorySources(user: AuthUser): MemorySource[] {
     const relativePath = path
       .relative(process.cwd(), absolutePath)
       .replace(/\\/g, '/');
-    const exists = fs.existsSync(absolutePath);
+    // 符号链接逃逸防护（issue #2 P1）：用 lstat 而非 stat——statSync 跟随 symlink 会把
+    // 宿主机/他人文件的 size/mtime 泄露进 /sources 列表。步骤 1-2 直接 add 的 CLAUDE.md
+    // 不经 walkFiles 的 symlink 过滤，故此处兜底：条目本身是 symlink 直接丢弃。
     let updatedAt: string | null = null;
     let size = 0;
-    if (exists) {
-      const stat = fs.statSync(absolutePath);
-      updatedAt = stat.mtime.toISOString();
-      size = stat.size;
+    let exists = false;
+    try {
+      const lst = fs.lstatSync(absolutePath);
+      if (lst.isSymbolicLink()) continue; // 不把 symlink 目标的元数据暴露给调用方
+      exists = true;
+      updatedAt = lst.mtime.toISOString();
+      size = lst.size;
+    } catch {
+      // ENOENT：尚未创建的源仍列出（exists:false），沿用原行为。
     }
 
     const classified = classifyMemorySource(relativePath);
