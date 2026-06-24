@@ -5,7 +5,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdtemp, rm, mkdir, writeFile, readFile, access } from 'node:fs/promises';
+import { mkdtemp, rm, mkdir, writeFile, readFile, access, utimes } from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -78,7 +78,7 @@ describe('FsCodexHomeProvisioner — provision 正常路径', () => {
 });
 
 describe('FsCodexHomeProvisioner — 幂等', () => {
-  it('provision 两次不覆盖已有 auth.json（保留 per-folder 自己刷新的 token）', async () => {
+  it('provision 两次不覆盖更新的目标 auth.json（保留 per-folder 自己刷新的 token）', async () => {
     await writeFile(path.join(sharedCodexHome, 'auth.json'), AUTH_CONTENT, 'utf8');
     const prov = new FsCodexHomeProvisioner({ dataDir, sharedCodexHome });
 
@@ -87,6 +87,8 @@ describe('FsCodexHomeProvisioner — 幂等', () => {
     // 模拟 per-folder 自己刷新了 token，写入了不同内容。
     const refreshed = '{"tokens":{"access":"per-folder-refreshed"}}';
     await writeFile(path.join(codexHome, 'auth.json'), refreshed, 'utf8');
+    await utimes(path.join(sharedCodexHome, 'auth.json'), new Date('2026-01-01T00:00:00Z'), new Date('2026-01-01T00:00:00Z'));
+    await utimes(path.join(codexHome, 'auth.json'), new Date('2026-01-01T00:00:10Z'), new Date('2026-01-01T00:00:10Z'));
 
     // 再次 provision —— 不应被源覆盖。
     const codexHome2 = await prov.provision(FOLDER);
@@ -95,6 +97,24 @@ describe('FsCodexHomeProvisioner — 幂等', () => {
     const after = await readFile(path.join(codexHome, 'auth.json'), 'utf8');
     expect(after).toBe(refreshed);
     expect(after).not.toBe(AUTH_CONTENT);
+  });
+
+  it('源 auth.json 更新后会覆盖旧目标 auth.json（设备码重登传播到旧会话）', async () => {
+    const original = '{"tokens":{"access":"old-source"}}';
+    const renewed = '{"tokens":{"access":"renewed-source"}}';
+    await writeFile(path.join(sharedCodexHome, 'auth.json'), original, 'utf8');
+    const prov = new FsCodexHomeProvisioner({ dataDir, sharedCodexHome });
+
+    const codexHome = await prov.provision(FOLDER);
+    expect(await readFile(path.join(codexHome, 'auth.json'), 'utf8')).toBe(original);
+
+    await writeFile(path.join(sharedCodexHome, 'auth.json'), renewed, 'utf8');
+    await utimes(path.join(codexHome, 'auth.json'), new Date('2026-01-01T00:00:00Z'), new Date('2026-01-01T00:00:00Z'));
+    await utimes(path.join(sharedCodexHome, 'auth.json'), new Date('2026-01-01T00:00:10Z'), new Date('2026-01-01T00:00:10Z'));
+
+    await prov.provision(FOLDER);
+
+    expect(await readFile(path.join(codexHome, 'auth.json'), 'utf8')).toBe(renewed);
   });
 
   it('config.toml 同样幂等：已有不被源覆盖', async () => {
