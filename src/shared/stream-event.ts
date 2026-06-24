@@ -65,6 +65,8 @@ export interface StreamEvent {
 
   /** happycodex 扩展：result 事件的本轮成败 subtype（completed / interrupted / failed）。 */
   subtype?: 'completed' | 'interrupted' | 'failed';
+  /** app-server error 通知是否会由 Codex 内部重试；仅用于错误/状态事件。 */
+  willRetry?: boolean;
 
   /** status 事件：线程/turn 状态文本（对齐上游 statusText）。 */
   statusText?: string;

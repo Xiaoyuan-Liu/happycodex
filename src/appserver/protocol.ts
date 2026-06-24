@@ -72,6 +72,7 @@ export const ClientNotif = {
 
 // ───────────────────────── server→client 通知名常量（流式事件） ─────────────────────────
 export const ServerNotif = {
+  error: 'error',
   threadStarted: 'thread/started',
   threadClosed: 'thread/closed',
   threadStatusChanged: 'thread/status/changed',
@@ -91,6 +92,36 @@ export const ServerNotif = {
   /** B3：Hook 执行完成。 */
   hookCompleted: 'hook/completed',
 } as const;
+
+export type CodexErrorInfo =
+  | 'contextWindowExceeded'
+  | 'usageLimitExceeded'
+  | 'serverOverloaded'
+  | 'cyberPolicy'
+  | { httpConnectionFailed: { httpStatusCode: number | null } }
+  | { responseStreamConnectionFailed: { httpStatusCode: number | null } }
+  | 'internalServerError'
+  | 'unauthorized'
+  | 'badRequest'
+  | 'threadRollbackFailed'
+  | 'sandboxError'
+  | { responseStreamDisconnected: { httpStatusCode: number | null } }
+  | { responseTooManyFailedAttempts: { httpStatusCode: number | null } }
+  | { activeTurnNotSteerable: { turnKind: string } }
+  | 'other';
+
+export interface TurnError {
+  message: string;
+  codexErrorInfo: CodexErrorInfo | null;
+  additionalDetails: string | null;
+}
+
+export interface ErrorNotification {
+  error: TurnError;
+  willRetry: boolean;
+  threadId: string;
+  turnId: string;
+}
 
 /** server→client 请求名常量（审批回环 + dynamicTools 调用；turn 会阻塞直到客户端回复）。 */
 export const ServerReq = {

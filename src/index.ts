@@ -171,6 +171,7 @@ import type {
 } from './im-manager.js';
 import { GroupQueue } from './group-queue.js';
 import { GENERIC_AGENT_FAILURE_MESSAGE } from './container-output.js';
+import { isNonRetryableAgentError, preferAgentError } from './agent-error.js';
 import { shutdownAllDeviceAuth } from './codex-device-auth.js';
 import { startSchedulerLoop, triggerTaskNow } from './task-scheduler.js';
 import {
@@ -3708,7 +3709,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
           if (result.status === 'error') {
             hadError = true;
-            if (result.error) lastError = result.error;
+            lastError = preferAgentError(lastError, result.error);
           }
         } catch (err) {
           logger.error({ group: group.name, err }, 'onOutput callback failed');
@@ -3973,7 +3974,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     // replied successfully, a subsequent timeout is not a real error and
     // rolling back would cause the same messages to be re-processed,
     // leading to duplicate replies.
-    const errorDetail = output.error || lastError || '未知错误';
+    const errorDetail = preferAgentError(lastError, output.error) || '未知错误';
 
     // 上下文溢出错误：跳过重试，提交游标，通知用户
     if (errorDetail.startsWith('context_overflow:')) {
@@ -4083,6 +4084,16 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         'No-reply (empty) agent turn — retrying quietly (suppressing per-retry agent_error)',
       );
       return false; // 安静重试，不弹 agent_error
+    }
+
+    if (isNonRetryableAgentError(errorDetail)) {
+      sendSystemMessage(chatJid, 'agent_error', errorDetail);
+      logger.warn(
+        { group: group.name, error: errorDetail },
+        'Non-retryable agent error (no reply sent), notifying user and committing cursor',
+      );
+      commitCursor();
+      return true;
     }
 
     // C5（上游 55836ce）：还会重试的中间轮次不广播 agent_error —— 每轮一条错误消息叠加
@@ -6854,7 +6865,7 @@ async function processAgentConversation(
 
     if (output.status === 'error') {
       hadError = true;
-      if (output.error) lastError = output.error;
+      lastError = preferAgentError(lastError, output.error);
     }
   };
 
@@ -7161,6 +7172,20 @@ async function processAgentConversation(
           'Failed to save interrupted partial agent text',
         );
       }
+    }
+
+    if (hadError && !cursorCommitted && !lastAgentReplyMsgId && !agentStreamingAccText.trim()) {
+      const errorDetail =
+        lastError === GENERIC_AGENT_FAILURE_MESSAGE || !lastError
+          ? '本轮未能产出回复。请稍后重试；如果持续失败，请检查 Codex 登录状态。'
+          : lastError;
+      sendSystemMessage(virtualChatJid, 'agent_error', errorDetail);
+      clearStreamingSnapshot(virtualChatJid);
+      commitCursor();
+      logger.warn(
+        { chatJid, agentId, error: errorDetail },
+        'Agent conversation error without reply; sent visible system message',
+      );
     }
 
     // ── Spawn result injection: write final output back to the source chat ──

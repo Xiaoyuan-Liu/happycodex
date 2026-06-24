@@ -52,6 +52,7 @@ export interface ContainerOutput {
   sdkMessageUuid?: string;
   sourceKind?: Exclude<MessageSourceKind, 'user_command'>;
   finalizationReason?: 'completed' | 'interrupted' | 'error';
+  willRetry?: boolean;
 }
 
 // ───────────────────────── 映射器状态（显式传入传出，保持纯函数） ─────────────────────────
@@ -127,6 +128,7 @@ export function mapStreamEventToOutputs(
             result: null,
             error: ev.statusText ?? GENERIC_AGENT_FAILURE_MESSAGE,
             finalizationReason: 'error',
+            willRetry: ev.willRetry,
             ...(ev.turnId ? { turnId: ev.turnId } : {}),
           }),
         ],

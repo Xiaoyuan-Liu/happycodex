@@ -10,6 +10,7 @@ import {
   extractHookStatus,
   extractToolName,
   extractToolOk,
+  formatTurnError,
   mapTurnStatus,
   normalizeTokenUsage,
   stringifyStatus,
@@ -265,6 +266,54 @@ describe('StreamMapper — thread / turn lifecycle', () => {
     expect(map(ServerNotif.turnCompleted, { turn: { id: 't', status: 'weird' } })[0]).toMatchObject({ subtype: 'completed' });
     expect(map(ServerNotif.turnCompleted, { turn: { id: 't' } })[0]).toMatchObject({ subtype: 'completed' });
   });
+
+  it('error 通知 willRetry=false → result failed，并保留真实错误详情', () => {
+    const out = map(ServerNotif.error, {
+      threadId: 'th',
+      turnId: 'tn_err',
+      willRetry: false,
+      error: {
+        message: 'Your access token could not be refreshed because your refresh token was already used.',
+        codexErrorInfo: 'unauthorized',
+        additionalDetails: 'Please log out and sign in again.',
+      },
+    });
+
+    expect(out).toEqual([
+      {
+        eventType: 'result',
+        subtype: 'failed',
+        statusText:
+          'Your access token could not be refreshed because your refresh token was already used.\n\nPlease log out and sign in again.',
+        turnId: 'tn_err',
+        threadId: 'th',
+        willRetry: false,
+      },
+    ]);
+  });
+
+  it('error 通知 willRetry=true → status retrying，不提前产终态 result', () => {
+    const out = map(ServerNotif.error, {
+      threadId: 'th',
+      turnId: 'tn_retry',
+      willRetry: true,
+      error: {
+        message: 'transient transport error',
+        codexErrorInfo: 'serverOverloaded',
+        additionalDetails: null,
+      },
+    });
+
+    expect(out).toEqual([
+      {
+        eventType: 'status',
+        statusText: 'retrying:transient transport error',
+        turnId: 'tn_retry',
+        threadId: 'th',
+        willRetry: true,
+      },
+    ]);
+  });
 });
 
 describe('StreamMapper — status / usage', () => {
@@ -356,6 +405,17 @@ describe('StreamMapper — status / usage', () => {
       },
     });
     expect(out[0]).toMatchObject({ eventType: 'usage', turnId: 'tn_x', threadId: 'th_x' });
+  });
+});
+
+describe('StreamMapper — error formatting', () => {
+  it('formatTurnError 合并 message 与 additionalDetails，避免重复', () => {
+    expect(formatTurnError({ message: 'boom', additionalDetails: 'detail' })).toBe(
+      'boom\n\ndetail',
+    );
+    expect(formatTurnError({ message: 'boom detail', additionalDetails: 'detail' })).toBe(
+      'boom detail',
+    );
   });
 });
 
