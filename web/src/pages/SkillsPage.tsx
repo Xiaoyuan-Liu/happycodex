@@ -52,6 +52,16 @@ export function SkillsPage() {
     await installSkill(pkg);
   };
 
+  const handleRefresh = async () => {
+    await loadSkills();
+    const latestError = useSkillsStore.getState().error;
+    if (latestError) {
+      toast.error(`刷新失败：${latestError}`);
+      return;
+    }
+    toast.success('技能列表已刷新');
+  };
+
   return (
     <div className="min-h-full bg-background">
       <div className="max-w-7xl mx-auto">
@@ -62,9 +72,9 @@ export function SkillsPage() {
             subtitle={`用户级 ${userSkills.length}${externalSkills.length > 0 ? ` · 宿主机 ${externalSkills.length}` : ''} · 项目级 ${projectSkills.length} · 启用 ${enabledCount}`}
             actions={
               <div className="flex items-center gap-3">
-                <Button variant="outline" onClick={loadSkills} disabled={loading}>
+                <Button variant="outline" onClick={handleRefresh} disabled={loading}>
                   <RefreshCw size={18} className={loading ? 'animate-spin' : ''} />
-                  刷新
+                  {loading ? '刷新中...' : '刷新'}
                 </Button>
                 <Button onClick={() => setShowInstallDialog(true)}>
                   <Plus size={18} />
