@@ -8462,34 +8462,66 @@ function buildOnAgentMessage(): (baseChatJid: string, agentId: string) => void {
       !!lastSourceJid && getChannelType(lastSourceJid) !== null;
 
     if (isImSource) {
-      // Force close running process then enqueue fresh start.
-      // Use a stable taskId so rapid-fire IM messages deduplicate into a
-      // single queued restart instead of N separate restarts.
-      logger.info({ virtualChatJid, taskId: `agent-im-restart:${agentId}` });
-      queue.closeStdin(virtualChatJid);
-      const taskId = `agent-im-restart:${agentId}`;
-      logger.debug(
-        { virtualChatJid, taskId },
-        'Agent IM restart: closing stdin and enqueuing task',
-      );
-      queue.enqueueTask(virtualChatJid, taskId, async () => {
-        logger.debug(
-          { homeChatJid, agentId },
-          'Agent IM restart: starting processAgentConversation',
-        );
-        logger.info(
-          { homeChatJid, agentId, taskId },
-          'sub-agent task IPC received',
-        );
-        try {
-          await processAgentConversation(homeChatJid, agentId);
-        } catch (err) {
-          logger.error(
-            { err, homeChatJid, agentId },
-            'Agent IM restart: processAgentConversation failed',
-          );
+      const sameImRoute = !!lastSourceJid && agent?.last_im_jid === lastSourceJid;
+      const formatted =
+        missedMessages.length > 0 ? formatMessages(missedMessages, false) : '';
+      const images = collectMessageImages(virtualChatJid, missedMessages);
+      const imagesForAgent = images.length > 0 ? images : undefined;
+
+      const sendResult =
+        sameImRoute && formatted
+          ? queue.sendMessage(
+              virtualChatJid,
+              formatted,
+              imagesForAgent,
+              undefined,
+              lastSourceJid,
+            )
+          : 'no_active';
+
+      if (sendResult === 'sent') {
+        const lastProcessed = missedMessages[missedMessages.length - 1];
+        if (lastProcessed) {
+          advanceNextPullCursorOnly(virtualChatJid, {
+            timestamp: lastProcessed.timestamp,
+            id: lastProcessed.id,
+          });
         }
-      });
+        logger.info(
+          { virtualChatJid, agentId, sourceJid: lastSourceJid },
+          'Piped same-route IM message to active conversation agent',
+        );
+      } else {
+        // Force close running process then enqueue fresh start when the IM route
+        // changed, or when no active warm runner accepted the IPC message.
+        // Use a stable taskId so rapid-fire IM messages deduplicate into a
+        // single queued restart instead of N separate restarts.
+        logger.info({ virtualChatJid, taskId: `agent-im-restart:${agentId}` });
+        queue.closeStdin(virtualChatJid);
+        const taskId = `agent-im-restart:${agentId}`;
+        logger.debug(
+          { virtualChatJid, taskId, sameImRoute, sendResult },
+          'Agent IM restart: closing stdin and enqueuing task',
+        );
+        queue.enqueueTask(virtualChatJid, taskId, async () => {
+          logger.debug(
+            { homeChatJid, agentId },
+            'Agent IM restart: starting processAgentConversation',
+          );
+          logger.info(
+            { homeChatJid, agentId, taskId },
+            'sub-agent task IPC received',
+          );
+          try {
+            await processAgentConversation(homeChatJid, agentId);
+          } catch (err) {
+            logger.error(
+              { err, homeChatJid, agentId },
+              'Agent IM restart: processAgentConversation failed',
+            );
+          }
+        });
+      }
     } else {
       // Web-origin: try to pipe into running agent process
       logger.debug(
@@ -8516,7 +8548,15 @@ function buildOnAgentMessage(): (baseChatJid: string, agentId: string) => void {
             lastAgentSourceJid,
           )
         : 'no_active';
-      if (sendResult === 'no_active') {
+      if (sendResult === 'sent') {
+        const lastProcessed = missedMessages[missedMessages.length - 1];
+        if (lastProcessed) {
+          advanceNextPullCursorOnly(virtualChatJid, {
+            timestamp: lastProcessed.timestamp,
+            id: lastProcessed.id,
+          });
+        }
+      } else {
         const taskId = `agent-conv:${agentId}:${Date.now()}`;
         queue.enqueueTask(virtualChatJid, taskId, async () => {
           await processAgentConversation(homeChatJid, agentId);
