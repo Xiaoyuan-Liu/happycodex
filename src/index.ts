@@ -96,6 +96,7 @@ import {
   touchImContextBindingActivity,
   updateAgentContextInfo,
   backfillEmptyAllowlistsForUser,
+  backfillMissingFeishuOwnersForUser,
 } from './db.js';
 // feishu.js deprecated exports are no longer needed; imManager handles all connections
 import { imManager } from './im-manager.js';
@@ -8074,13 +8075,20 @@ function learnFeishuOwner(
     ownerRef.value = senderOpenId;
     saveFeishuOwnerOpenId(userId, senderOpenId);
   }
-  const backfilled = backfillEmptyAllowlistsForUser(userId, ownerOpenId);
-  for (const jid of backfilled) {
+  const allowlistBackfilled = backfillEmptyAllowlistsForUser(userId, ownerOpenId);
+  const ownerBackfilled = backfillMissingFeishuOwnersForUser(userId, ownerOpenId);
+  for (const jid of new Set([...allowlistBackfilled, ...ownerBackfilled])) {
     const fresh = getRegisteredGroup(jid);
     if (fresh) registeredGroups[jid] = fresh;
   }
   logger.info(
-    { userId, senderOpenId, ownerOpenId, backfilledCount: backfilled.length },
+    {
+      userId,
+      senderOpenId,
+      ownerOpenId,
+      allowlistBackfilledCount: allowlistBackfilled.length,
+      ownerBackfilledCount: ownerBackfilled.length,
+    },
     'Feishu owner open_id auto-detected from P2P message',
   );
 }

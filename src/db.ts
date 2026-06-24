@@ -2704,6 +2704,53 @@ export function backfillEmptyAllowlistsForUser(
 }
 
 /**
+ * Backfill missing `owner_im_id` for Feishu chats that were already restricted
+ * to the detected owner. This repairs rows created before the first P2P owner
+ * learn, where sender_allowlist was later backfilled but owner_im_id stayed
+ * NULL, causing owner-only commands such as /clear to be rejected.
+ */
+export function backfillMissingFeishuOwnersForUser(
+  userId: string,
+  ownerOpenId: string,
+): string[] {
+  const rows = db
+    .prepare(
+      `SELECT jid, sender_allowlist
+       FROM registered_groups
+       WHERE jid LIKE 'feishu:%'
+         AND created_by = ?
+         AND owner_im_id IS NULL
+         AND sender_allowlist IS NOT NULL`,
+    )
+    .all(userId) as Array<{ jid: string; sender_allowlist: string }>;
+
+  const jids = rows
+    .filter((row) => {
+      try {
+        const parsed = JSON.parse(row.sender_allowlist) as unknown;
+        return (
+          Array.isArray(parsed) &&
+          parsed.every((v) => typeof v === 'string') &&
+          parsed.includes(ownerOpenId)
+        );
+      } catch {
+        return false;
+      }
+    })
+    .map((row) => row.jid);
+
+  if (jids.length === 0) return [];
+  const stmt = db.prepare(
+    'UPDATE registered_groups SET owner_im_id = ? WHERE jid = ?',
+  );
+  const tx = db.transaction((targets: string[]) => {
+    for (const jid of targets) stmt.run(ownerOpenId, jid);
+  });
+  tx(jids);
+  return jids;
+}
+
+/**
  * Clear `sender_allowlist` for a single group (set to NULL = unrestricted).
  * Used as a manual escape hatch from the owner-locked trap.
  */
