@@ -5,9 +5,9 @@
  * （官方 OAuth / setup-token / API Key / 第三方 BASE_URL+TOKEN + 飞书配置），
  * 依赖已作废的 provider failover 体系与 /api/config/claude/* 路由。
  *
- * happycodex 改为在本页直接挂载 CodexAuthCard（浏览器 / 设备码 / API Key /
- * Access Token 四法俱全），让全新机器 admin **纯浏览器**完成 codex 登录，不必再
- * SSH 上服务器敲 `codex login`。配合后端 resolveCodexLoginTarget：bootstrap 期
+ * happycodex 改为在本页直接挂载 CodexAuthCard（设备码 / API Key /
+ * Access Token），让全新机器 admin 可通过 Web 完成 codex 登录，不必再
+ * SSH 上服务器敲 `codex login --device-auth`。配合后端 resolveCodexLoginTarget：bootstrap 期
  * （admin + 共享账号未配置）的登录写**共享**基线账号，登录成功后 needsSetup 翻转、
  * 门控自动放行。AuthGuard 仍把未完成 setup 的 admin 钉在本页（location≠/setup/providers
  * 即重定向回来），但本页现在自带登录闭环，不再是死页。

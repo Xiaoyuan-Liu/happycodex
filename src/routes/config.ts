@@ -99,7 +99,6 @@ import {
 } from '../codex-paths.js';
 import {
   startDeviceAuth,
-  startBrowserLogin,
   getDeviceAuthState,
   cancelDeviceAuth,
 } from '../codex-device-auth.js';
@@ -395,39 +394,6 @@ configRoutes.post('/codex/auth/device/start', authMiddleware, async (c) => {
   } catch (err) {
     logger.error({ err }, 'Failed to start codex device-auth');
     return c.json({ error: 'Failed to start codex device authorization' }, 500);
-  }
-});
-
-/**
- * 触发标准浏览器登录（`codex login`，本机推荐）：codex 起 localhost:1455 回调服务、自动开
- * 浏览器，并把授权 URL 经 WS codex_device_auth 推前端作兜底。授权完成 → auth.json 落 per-user
- * 目录 → authorized。仅在浏览器与服务同机（本机部署）可用；远程请用 device-auth。
- */
-configRoutes.post('/codex/auth/browser/start', authMiddleware, async (c) => {
-  const user = c.get('user') as AuthUser;
-  try {
-    const existing = getDeviceAuthState(user.id);
-    // Bootstrap 期 admin 首登 seed 共享基线（翻转 setup 门控）；否则写 per-user。
-    const { codexHome, scope } = resolveCodexLoginTarget(
-      user.id,
-      user.role === 'admin',
-    );
-    const { broadcastCodexDeviceAuth } = await import('../web.js');
-    startBrowserLogin(
-      user.id,
-      (state) => {
-        broadcastCodexDeviceAuth(user.id, state);
-      },
-      { codexHome },
-    );
-    appendClaudeConfigAudit(user.username, 'codex_auth_browser_start', [], {
-      userId: user.id,
-      scope,
-    });
-    return c.json({ started: true, state: existing ?? { status: 'pending' } });
-  } catch (err) {
-    logger.error({ err }, 'Failed to start codex browser login');
-    return c.json({ error: 'Failed to start codex browser login' }, 500);
   }
 });
 

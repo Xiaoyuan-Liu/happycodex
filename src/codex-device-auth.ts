@@ -46,32 +46,14 @@ const DEVICE_AUTH_EXPIRES_SEC = 900;
 // eslint-disable-next-line no-control-regex
 const ANSI_ESCAPE_RE = /\x1b\[[0-9;]*[A-Za-z]/g;
 
-/** 登录模式：device=设备码（远程友好，需账户开关）；browser=标准浏览器回调（本机推荐）。 */
-export type CodexLoginMode = 'device' | 'browser';
-
 /**
  * 从 codex 输出里抓 verification URL（+ device 模式的 user code）。先剥 ANSI 颜色码。
  * - device：`https://auth.openai.com/codex/device` + 短码（如 `ABCD-1234`）。URL 剥 query
  *   （只需端点）、抓短码。
- * - browser：`codex login` 打印 `https://auth.openai.com/oauth/authorize?...` 完整授权 URL
- *   （含 redirect_uri/code_challenge/state 等 PKCE 参数，**保留 query 不可剥**，这正是用户要
- *   在浏览器打开的地址）+ 一行 `http://localhost:1455` 本地回调服务地址（要跳过它）。无短码。
  */
-function parseVerification(
-  rawText: string,
-  mode: CodexLoginMode,
-): { verificationUri?: string; userCode?: string } {
+function parseVerification(rawText: string): { verificationUri?: string; userCode?: string } {
   const text = rawText.replace(ANSI_ESCAPE_RE, '');
   const out: { verificationUri?: string; userCode?: string } = {};
-
-  if (mode === 'browser') {
-    // 优先 authorize URL（跳过 http://localhost:1455 本地服务地址）；保留完整 query。
-    const m =
-      text.match(/https:\/\/[^\s'"]*authorize[^\s'"]*/) ??
-      text.match(/https:\/\/[^\s'"]+/);
-    if (m) out.verificationUri = m[0].replace(/[.,);'"]+$/, '');
-    return out;
-  }
 
   // device 模式：剥 query + 抓短码。
   const urlMatch = text.match(/https?:\/\/[^\s'"]+/);
@@ -137,9 +119,7 @@ function killTree(child: ChildProcess, signal: NodeJS.Signals = 'SIGTERM'): void
 /**
  * 启动（或复用）某 userId 的 codex 登录流程。
  *
- * - mode='device'：`codex login --device-auth`，解析 URL + 短码（远程友好，需账户设备码开关）。
- * - mode='browser'：`codex login`（标准浏览器回调，本机推荐）——codex 起 localhost:1455 回调服务、
- *   自动开浏览器，并打印授权 URL；我们把 URL 经 WS 推前端作兜底。本机浏览器+服务同机时回调直达。
+ * - `codex login --device-auth`，解析 URL + 短码（远程友好，需账户设备码开关）。
  * - 同一 userId 已有 in-flight：kill 旧进程后重新 start（用户重试时不残留僵尸）。
  * - 非法 userId 由 userCodexHomeDir 抛错（调用方应已校验或捕获）。
  * - onUpdate 推送序列：pending（抓到 URL[/码]后）→ authorized | error | expired。
@@ -147,9 +127,8 @@ function killTree(child: ChildProcess, signal: NodeJS.Signals = 'SIGTERM'): void
 export function startCodexLogin(
   userId: string,
   onUpdate: CodexDeviceAuthUpdate,
-  opts: { mode?: CodexLoginMode; codexBin?: string; codexHome?: string } = {},
+  opts: { codexBin?: string; codexHome?: string } = {},
 ): void {
-  const mode: CodexLoginMode = opts.mode ?? 'device';
   // 复用 / 抢占：先终结旧流程（不向旧 onUpdate 再推，直接清理）。
   const existing = inflight.get(userId);
   if (existing && !existing.done) {
@@ -175,7 +154,7 @@ export function startCodexLogin(
     return;
   }
 
-  const args = mode === 'browser' ? ['login'] : ['login', '--device-auth'];
+  const args = ['login', '--device-auth'];
   let child: ChildProcess;
   try {
     child = spawn(codexBin, args, {
@@ -234,11 +213,11 @@ export function startCodexLogin(
     if (record.buffer.length > 64 * 1024) {
       record.buffer = record.buffer.slice(-64 * 1024);
     }
-    const { verificationUri, userCode } = parseVerification(record.buffer, mode);
+    const { verificationUri, userCode } = parseVerification(record.buffer);
     if (!verificationUri) return;
     // device 模式：有 URL 但暂无码 → 再等后续 chunk（码通常紧随 URL）；缓冲已较大则 url-only
-    // 兜底，避免永远卡在"正在获取"。browser 模式无短码，抓到 URL 即推。
-    if (mode === 'device' && !userCode && record.buffer.length < 4096) return;
+    // 兜底，避免永远卡在"正在获取"。
+    if (!userCode && record.buffer.length < 4096) return;
     record.sawPending = true;
     const state: CodexDeviceAuthState = {
       status: 'pending',
@@ -287,16 +266,7 @@ export function startDeviceAuth(
   onUpdate: CodexDeviceAuthUpdate,
   opts: { codexBin?: string; codexHome?: string } = {},
 ): void {
-  startCodexLogin(userId, onUpdate, { ...opts, mode: 'device' });
-}
-
-/** 标准浏览器登录（`codex login`，本机推荐；localhost:1455 回调）。 */
-export function startBrowserLogin(
-  userId: string,
-  onUpdate: CodexDeviceAuthUpdate,
-  opts: { codexBin?: string; codexHome?: string } = {},
-): void {
-  startCodexLogin(userId, onUpdate, { ...opts, mode: 'browser' });
+  startCodexLogin(userId, onUpdate, opts);
 }
 
 /**
