@@ -449,7 +449,14 @@ export function listMemorySources(user: AuthUser): MemorySource[] {
     // 目录**（如 conversations/）是 symlink 时，候选词法在 root 内、叶子又是真实文件，会把 root
     // 外文件的 name/size/mtime 泄露进 /sources。把真实落点解析出来，要求其仍在允许 root 内（与
     // read/write 侧 resolveRealMemoryPath 同一坐标系），否则丢弃。
-    const real = resolveRealMemoryPath(absolutePath);
+    let real: string;
+    try {
+      real = resolveRealMemoryPath(absolutePath);
+    } catch {
+      // 祖先不可读(EACCES) 或 existsSync/realpathSync 间祖先被并发删除(ENOENT)：
+      // 跳过该候选即可，口径同下方叶子 lstat 的 try/catch，勿让单条 realpath 失败拖垮整张列表。
+      continue;
+    }
     if (!isWithinRoot(real, realGroupsRoot) && !isWithinRoot(real, realMemoryRoot)) {
       continue;
     }
