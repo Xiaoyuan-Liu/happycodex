@@ -679,8 +679,13 @@ function isRetryDuplicateIpcSend(
   const now = Date.now();
   const exp = recentIpcSends.get(key);
   // 仅在该 group 处于重试重放时，已见过的指纹才视为重复并抑制。
-  const inRetry = queue.getRetryCount(`web:${sourceGroup}`) > 0
-    || queue.getRetryCount(sourceGroup) > 0;
+  // sourceGroup 是 folder，而 retryCount 以**真实 chatJid** 记账：旧实现用 `web:${folder}`
+  // 与 `folder` 猜键，仅 admin home（folder=jid=web:main）碰巧命中，普通群（web:<uuid>）/
+  // IM 群（feishu:oc_xxx）恒 false → 去重对绝大多数群是 no-op（#F5）。改为取该 folder 的全部
+  // 真实 JID，任一处于重试重放即视为窗口内。对齐上游 happyclaw 修复（getJidsByFolder）。
+  const inRetry = getJidsByFolder(sourceGroup).some(
+    (jid) => queue.getRetryCount(jid) > 0,
+  );
   const isDup = !!(exp && exp > now) && inRetry;
   recentIpcSends.set(key, now + IPC_SEND_DEDUP_TTL_MS);
   // 容量控制：Map 迭代为插入序，先进先出淘汰
