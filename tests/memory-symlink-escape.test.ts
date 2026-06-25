@@ -128,6 +128,28 @@ describe('memory API 符号链接逃逸防护（issue #2 P1，端到端）', () 
     // 无论如何，结果里不得出现泄露的宿主文件大小。
     expect(sources.some((s) => s.size === leakedSize && leakedSize > 0)).toBe(false);
   });
+
+  test('④b list：conversations/ 中间目录为 symlink 指向宿主目录 → 不泄露外部文件名/size', () => {
+    // bob/conversations -> 宿主目录（含 .md）。readdir 跟随该中间目录 symlink，
+    // 叶子 lstat 只看文件本身（真实文件，非 symlink）→ 旧实现会把外部 size/mtime 泄露。
+    fs.writeFileSync(path.join(outside, 'leak.md'), 'X'.repeat(4242));
+    const leakedSize = fs.statSync(path.join(outside, 'leak.md')).size;
+    fs.symlinkSync(outside, path.join(GROUPS_DIR, 'bob', 'conversations'));
+    const sources = listMemorySources(BOB);
+    expect(sources.some((s) => s.path.endsWith('/conversations/leak.md'))).toBe(false);
+    expect(sources.some((s) => s.size === leakedSize && leakedSize > 0)).toBe(false);
+  });
+
+  test('② 系统目录写禁令：bob 经 bob/link -> bob/logs 写 → 真实落点在 logs 被拒（不绕过禁令）', () => {
+    fs.mkdirSync(path.join(GROUPS_DIR, 'bob', 'logs'), { recursive: true });
+    fs.symlinkSync(path.join(GROUPS_DIR, 'bob', 'logs'), path.join(GROUPS_DIR, 'bob', 'link'));
+    expect(() => writeMemoryFile('data/groups/bob/link/pwn.md', 'x', BOB)).toThrow(/system path/);
+    expect(fs.existsSync(path.join(GROUPS_DIR, 'bob', 'logs', 'pwn.md'))).toBe(false);
+  });
+
+  test('② 系统目录写禁令：直接写 logs/ → 拒绝（回归保护）', () => {
+    expect(() => writeMemoryFile('data/groups/bob/logs/x.md', 'x', ADMIN)).toThrow(/system path/);
+  });
 });
 
 describe('resolveRealMemoryPath / walkFiles 单元（issue #2）', () => {

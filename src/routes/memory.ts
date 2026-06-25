@@ -274,15 +274,15 @@ export function readMemoryFile(
 // 记忆路径中禁止写入的系统子目录（CLAUDE.md 除外，它是记忆文件）
 const MEMORY_BLOCKED_DIRS = ['logs', '.claude', 'conversations'];
 
-function isBlockedMemoryPath(normalizedPath: string): boolean {
-  const parts = normalizedPath.split('/');
-  // 路径格式: data/groups/{folder}/{subpath...} 或 data/memory/{folder}/{subpath...}
-  // 检查 data/groups/{folder}/ 下的系统子目录
-  if (parts[0] === 'data' && parts[1] === 'groups' && parts.length >= 4) {
-    const subPath = parts[3] ?? '';
-    if (MEMORY_BLOCKED_DIRS.includes(subPath)) return true;
-  }
-  return false;
+// 符号链接逃逸防护（issue #2 P1）：系统子目录写禁令必须基于**真实落点**判断，而非词法路径。
+// 若校验 normalizedPath，同租户 symlink（如 bob/link -> bob/logs）写 bob/link/x.md 会被看成
+// 系统目录段为 'link' 而放行，真实却落进 logs/，绕过禁令。这里用已展开 symlink 的真实绝对路径，
+// 取其相对 GROUPS_DIR 的第一段系统目录（{folder}/{subDir}/...）判定。
+function isBlockedMemoryWritePath(realAbsolutePath: string): boolean {
+  const groupsRoot = resolveRealMemoryPath(GROUPS_DIR);
+  if (!isWithinRoot(realAbsolutePath, groupsRoot)) return false;
+  const subDir = path.relative(groupsRoot, realAbsolutePath).split(path.sep)[1] ?? '';
+  return MEMORY_BLOCKED_DIRS.includes(subDir);
 }
 
 export function writeMemoryFile(
@@ -295,7 +295,8 @@ export function writeMemoryFile(
   if (!writable) {
     throw new Error('Memory file is read-only');
   }
-  if (isBlockedMemoryPath(normalized)) {
+  // absolutePath 已是 resolveMemoryPath 展开 symlink 后的真实落点 → 基于它判系统目录写禁令。
+  if (isBlockedMemoryWritePath(absolutePath)) {
     throw new Error('Cannot write to system path');
   }
   if (Buffer.byteLength(content, 'utf-8') > MAX_MEMORY_FILE_LENGTH) {
@@ -415,7 +416,16 @@ export function listMemorySources(user: AuthUser): MemorySource[] {
   // 5. Scan conversations/ directories (read-only archives)
   for (const folder of accessibleFolders) {
     const convDir = path.join(GROUPS_DIR, folder, 'conversations');
-    if (!fs.existsSync(convDir)) continue;
+    // 符号链接逃逸防护（issue #2 P1）：conversations/ 本身被换成 symlink 指向 root 外时，
+    // readdir 会跟随它枚举宿主目录、把外部文件名带进列表；下方 per-entry lstat 只看叶子、
+    // 看不出中间目录是 symlink。故扫描前先 lstat 该目录，是 symlink 或非目录直接跳过。
+    let convStat: fs.Stats;
+    try {
+      convStat = fs.lstatSync(convDir);
+    } catch {
+      continue; // 不存在或不可读
+    }
+    if (convStat.isSymbolicLink() || !convStat.isDirectory()) continue;
     try {
       const entries = fs.readdirSync(convDir, { withFileTypes: true });
       for (const entry of entries) {
@@ -428,10 +438,21 @@ export function listMemorySources(user: AuthUser): MemorySource[] {
   }
 
   const sources: MemorySource[] = [];
+  const realGroupsRoot = resolveRealMemoryPath(GROUPS_DIR);
+  const realMemoryRoot = resolveRealMemoryPath(MEMORY_DATA_DIR);
   for (const absolutePath of files) {
     const inGroups = isWithinRoot(absolutePath, GROUPS_DIR);
     const inMemoryData = isWithinRoot(absolutePath, MEMORY_DATA_DIR);
     if (!inGroups && !inMemoryData) continue;
+
+    // 符号链接逃逸防护（issue #2 P1）：词法 isWithinRoot + 叶子 lstat 仍漏一种——某个**中间
+    // 目录**（如 conversations/）是 symlink 时，候选词法在 root 内、叶子又是真实文件，会把 root
+    // 外文件的 name/size/mtime 泄露进 /sources。把真实落点解析出来，要求其仍在允许 root 内（与
+    // read/write 侧 resolveRealMemoryPath 同一坐标系），否则丢弃。
+    const real = resolveRealMemoryPath(absolutePath);
+    if (!isWithinRoot(real, realGroupsRoot) && !isWithinRoot(real, realMemoryRoot)) {
+      continue;
+    }
 
     const relativePath = path
       .relative(process.cwd(), absolutePath)
