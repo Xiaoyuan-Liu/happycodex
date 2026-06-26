@@ -21,6 +21,7 @@ import {
   hasHostExecutionPermission,
   canAccessGroup,
   canModifyGroup,
+  canControlGroupResource,
   getCachedSessionWithUser,
   invalidateSessionCache,
 } from './web-context.js';
@@ -1396,6 +1397,27 @@ function setupWebSocket(server: any): WebSocketServer {
                   type: 'terminal_error',
                   chatJid,
                   error: '无权访问该群组终端',
+                }),
+              );
+              return;
+            }
+            // Resource-level ACL (issue #2): a terminal grants an interactive shell
+            // inside the container and can take over an existing owner terminal —
+            // strictly more powerful than stop/interrupt, so it must use the SAME
+            // owner-or-run-initiator rule, not access-only. A shared member with mere
+            // canAccessGroup must NOT get a shell in (or seize) the owner's container.
+            if (
+              !canControlGroupResource(
+                { id: session.user_id, role: session.role },
+                groupWithJid,
+                deps.queue.getActiveRunInitiator(chatJid),
+              )
+            ) {
+              ws.send(
+                JSON.stringify({
+                  type: 'terminal_error',
+                  chatJid,
+                  error: '只有工作区所有者或当前运行发起者可使用终端',
                 }),
               );
               return;

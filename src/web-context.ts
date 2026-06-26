@@ -353,6 +353,26 @@ export function canModifyGroup(
 }
 
 /**
+ * Resource-level ACL for destructive / shell-granting group ops (stop, interrupt,
+ * terminal). Stricter than canAccessGroup: the owner (canModifyGroup) always
+ * passes; a shared member passes only for the run THEY initiated (the queue's
+ * current run initiator). Access-only members are denied — a shared member must
+ * not stop, interrupt, or open an interactive shell in the owner's container.
+ *
+ * Callers pass the already-resolved run initiator id (queue.getActiveRunInitiator)
+ * because the jid used for initiator lookup may differ from the canModifyGroup jid
+ * (e.g. interrupt uses the virtual #agent: jid for the run, baseJid for ownership).
+ */
+export function canControlGroupResource(
+  user: { id: string; role: UserRole },
+  group: RegisteredGroup & { jid: string },
+  runInitiatorId: string | null,
+): boolean {
+  if (canModifyGroup(user, group)) return true;
+  return runInitiatorId !== null && runInitiatorId === user.id;
+}
+
+/**
  * Check if a user can manage members (add/remove) of a group.
  * - Home groups cannot have members managed.
  * - Only the group creator (owner) can manage members.
