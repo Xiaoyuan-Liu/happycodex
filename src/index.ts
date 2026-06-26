@@ -96,6 +96,7 @@ import {
   touchImContextBindingActivity,
   updateAgentContextInfo,
   backfillEmptyAllowlistsForUser,
+  backfillMissingFeishuOwnersForUser,
 } from './db.js';
 // feishu.js deprecated exports are no longer needed; imManager handles all connections
 import { imManager } from './im-manager.js';
@@ -171,6 +172,7 @@ import type {
 import { GroupQueue } from './group-queue.js';
 import { createIpcSendDedup } from './ipc-dedup.js';
 import { GENERIC_AGENT_FAILURE_MESSAGE } from './container-output.js';
+import { isNonRetryableAgentError, preferAgentError } from './agent-error.js';
 import { shutdownAllDeviceAuth } from './codex-device-auth.js';
 import { startSchedulerLoop, triggerTaskNow } from './task-scheduler.js';
 import {
@@ -3682,7 +3684,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
           if (result.status === 'error') {
             hadError = true;
-            if (result.error) lastError = result.error;
+            lastError = preferAgentError(lastError, result.error);
           }
         } catch (err) {
           logger.error({ group: group.name, err }, 'onOutput callback failed');
@@ -3947,7 +3949,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     // replied successfully, a subsequent timeout is not a real error and
     // rolling back would cause the same messages to be re-processed,
     // leading to duplicate replies.
-    const errorDetail = output.error || lastError || '未知错误';
+    const errorDetail = preferAgentError(lastError, output.error) || '未知错误';
 
     // 上下文溢出错误：跳过重试，提交游标，通知用户
     if (errorDetail.startsWith('context_overflow:')) {
@@ -4057,6 +4059,16 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         'No-reply (empty) agent turn — retrying quietly (suppressing per-retry agent_error)',
       );
       return false; // 安静重试，不弹 agent_error
+    }
+
+    if (isNonRetryableAgentError(errorDetail)) {
+      sendSystemMessage(chatJid, 'agent_error', errorDetail);
+      logger.warn(
+        { group: group.name, error: errorDetail },
+        'Non-retryable agent error (no reply sent), notifying user and committing cursor',
+      );
+      commitCursor();
+      return true;
     }
 
     // C5（上游 55836ce）：还会重试的中间轮次不广播 agent_error —— 每轮一条错误消息叠加
@@ -6828,7 +6840,7 @@ async function processAgentConversation(
 
     if (output.status === 'error') {
       hadError = true;
-      if (output.error) lastError = output.error;
+      lastError = preferAgentError(lastError, output.error);
     }
   };
 
@@ -7135,6 +7147,20 @@ async function processAgentConversation(
           'Failed to save interrupted partial agent text',
         );
       }
+    }
+
+    if (hadError && !cursorCommitted && !lastAgentReplyMsgId && !agentStreamingAccText.trim()) {
+      const errorDetail =
+        lastError === GENERIC_AGENT_FAILURE_MESSAGE || !lastError
+          ? '本轮未能产出回复。请稍后重试；如果持续失败，请检查 Codex 登录状态。'
+          : lastError;
+      sendSystemMessage(virtualChatJid, 'agent_error', errorDetail);
+      clearStreamingSnapshot(virtualChatJid);
+      commitCursor();
+      logger.warn(
+        { chatJid, agentId, error: errorDetail },
+        'Agent conversation error without reply; sent visible system message',
+      );
     }
 
     // ── Spawn result injection: write final output back to the source chat ──
@@ -8049,13 +8075,20 @@ function learnFeishuOwner(
     ownerRef.value = senderOpenId;
     saveFeishuOwnerOpenId(userId, senderOpenId);
   }
-  const backfilled = backfillEmptyAllowlistsForUser(userId, ownerOpenId);
-  for (const jid of backfilled) {
+  const allowlistBackfilled = backfillEmptyAllowlistsForUser(userId, ownerOpenId);
+  const ownerBackfilled = backfillMissingFeishuOwnersForUser(userId, ownerOpenId);
+  for (const jid of new Set([...allowlistBackfilled, ...ownerBackfilled])) {
     const fresh = getRegisteredGroup(jid);
     if (fresh) registeredGroups[jid] = fresh;
   }
   logger.info(
-    { userId, senderOpenId, ownerOpenId, backfilledCount: backfilled.length },
+    {
+      userId,
+      senderOpenId,
+      ownerOpenId,
+      allowlistBackfilledCount: allowlistBackfilled.length,
+      ownerBackfilledCount: ownerBackfilled.length,
+    },
     'Feishu owner open_id auto-detected from P2P message',
   );
 }
@@ -8429,34 +8462,66 @@ function buildOnAgentMessage(): (baseChatJid: string, agentId: string) => void {
       !!lastSourceJid && getChannelType(lastSourceJid) !== null;
 
     if (isImSource) {
-      // Force close running process then enqueue fresh start.
-      // Use a stable taskId so rapid-fire IM messages deduplicate into a
-      // single queued restart instead of N separate restarts.
-      logger.info({ virtualChatJid, taskId: `agent-im-restart:${agentId}` });
-      queue.closeStdin(virtualChatJid);
-      const taskId = `agent-im-restart:${agentId}`;
-      logger.debug(
-        { virtualChatJid, taskId },
-        'Agent IM restart: closing stdin and enqueuing task',
-      );
-      queue.enqueueTask(virtualChatJid, taskId, async () => {
-        logger.debug(
-          { homeChatJid, agentId },
-          'Agent IM restart: starting processAgentConversation',
-        );
-        logger.info(
-          { homeChatJid, agentId, taskId },
-          'sub-agent task IPC received',
-        );
-        try {
-          await processAgentConversation(homeChatJid, agentId);
-        } catch (err) {
-          logger.error(
-            { err, homeChatJid, agentId },
-            'Agent IM restart: processAgentConversation failed',
-          );
+      const sameImRoute = !!lastSourceJid && agent?.last_im_jid === lastSourceJid;
+      const formatted =
+        missedMessages.length > 0 ? formatMessages(missedMessages, false) : '';
+      const images = collectMessageImages(virtualChatJid, missedMessages);
+      const imagesForAgent = images.length > 0 ? images : undefined;
+
+      const sendResult =
+        sameImRoute && formatted
+          ? queue.sendMessage(
+              virtualChatJid,
+              formatted,
+              imagesForAgent,
+              undefined,
+              lastSourceJid,
+            )
+          : 'no_active';
+
+      if (sendResult === 'sent') {
+        const lastProcessed = missedMessages[missedMessages.length - 1];
+        if (lastProcessed) {
+          advanceNextPullCursorOnly(virtualChatJid, {
+            timestamp: lastProcessed.timestamp,
+            id: lastProcessed.id,
+          });
         }
-      });
+        logger.info(
+          { virtualChatJid, agentId, sourceJid: lastSourceJid },
+          'Piped same-route IM message to active conversation agent',
+        );
+      } else {
+        // Force close running process then enqueue fresh start when the IM route
+        // changed, or when no active warm runner accepted the IPC message.
+        // Use a stable taskId so rapid-fire IM messages deduplicate into a
+        // single queued restart instead of N separate restarts.
+        logger.info({ virtualChatJid, taskId: `agent-im-restart:${agentId}` });
+        queue.closeStdin(virtualChatJid);
+        const taskId = `agent-im-restart:${agentId}`;
+        logger.debug(
+          { virtualChatJid, taskId, sameImRoute, sendResult },
+          'Agent IM restart: closing stdin and enqueuing task',
+        );
+        queue.enqueueTask(virtualChatJid, taskId, async () => {
+          logger.debug(
+            { homeChatJid, agentId },
+            'Agent IM restart: starting processAgentConversation',
+          );
+          logger.info(
+            { homeChatJid, agentId, taskId },
+            'sub-agent task IPC received',
+          );
+          try {
+            await processAgentConversation(homeChatJid, agentId);
+          } catch (err) {
+            logger.error(
+              { err, homeChatJid, agentId },
+              'Agent IM restart: processAgentConversation failed',
+            );
+          }
+        });
+      }
     } else {
       // Web-origin: try to pipe into running agent process
       logger.debug(
@@ -8483,7 +8548,15 @@ function buildOnAgentMessage(): (baseChatJid: string, agentId: string) => void {
             lastAgentSourceJid,
           )
         : 'no_active';
-      if (sendResult === 'no_active') {
+      if (sendResult === 'sent') {
+        const lastProcessed = missedMessages[missedMessages.length - 1];
+        if (lastProcessed) {
+          advanceNextPullCursorOnly(virtualChatJid, {
+            timestamp: lastProcessed.timestamp,
+            id: lastProcessed.id,
+          });
+        }
+      } else {
         const taskId = `agent-conv:${agentId}:${Date.now()}`;
         queue.enqueueTask(virtualChatJid, taskId, async () => {
           await processAgentConversation(homeChatJid, agentId);

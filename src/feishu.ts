@@ -1005,13 +1005,15 @@ export function createFeishuConnection(
     const resolvedSenderName = senderName || getSenderName(senderOpenId);
     const resolvedChatName = chatType === 'p2p' ? '飞书私聊' : '飞书群聊';
 
-    // 先注册会话，确保 resolveGroupFolder 能正确解析 folder（含首条文件消息场景）
-    onNewChat?.(chatJid, resolvedChatName);
-
     // P2P 消息：通知调用方用于自动检测 owner open_id
     if (chatType === 'p2p' && senderOpenId && onP2pSender) {
       onP2pSender(senderOpenId);
     }
+
+    // 先注册会话，确保 resolveGroupFolder 能正确解析 folder（含首条文件消息场景）。
+    // P2P owner 学习必须先于注册，否则首次私聊会生成 owner_im_id=NULL
+    // 的 Feishu workspace，导致 /clear 等 owner-only 命令被拒绝。
+    onNewChat?.(chatJid, resolvedChatName);
 
     let attachmentsJson: string | undefined;
 

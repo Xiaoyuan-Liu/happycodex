@@ -40,6 +40,8 @@ import {
   type ContainerOutput,
   type ContainerOutputMapperState,
 } from '../src/container-output.js';
+import { ServerNotif } from '../src/appserver/protocol.js';
+import { StreamMapper } from '../src/runtime/stream-mapper.js';
 import type { StreamEvent } from '../src/shared/stream-event.js';
 
 // ─── helpers ─────────────────────────────────────────────────────────
@@ -57,6 +59,23 @@ function mapEvents(events: StreamEvent[]): ContainerOutput[] {
     const res = mapStreamEventToOutputs(state, ev);
     state = res.state;
     outputs.push(...res.outputs);
+  }
+  return outputs;
+}
+
+/** 把 app-server 原始通知走完整引擎映射链路，得到进程边界实际输出信封。 */
+function mapServerNotifications(
+  notifications: Array<{ method: string; params: unknown }>,
+): ContainerOutput[] {
+  const mapper = new StreamMapper();
+  let state: ContainerOutputMapperState = createContainerOutputState();
+  const outputs: ContainerOutput[] = [];
+  for (const n of notifications) {
+    for (const ev of mapper.map(n.method, n.params)) {
+      const res = mapStreamEventToOutputs(state, ev);
+      state = res.state;
+      outputs.push(...res.outputs);
+    }
   }
   return outputs;
 }
@@ -195,6 +214,37 @@ describe('attachStdoutHandler × mapStreamEventToOutputs — 协议对拍', () =
     const last = h.received[h.received.length - 1];
     expect(last?.status).toBe('error');
     expect(last?.error).toBe('boom');
+  });
+
+  test('app-server error 通知 → 保留真实 TurnError，不降级成 agent failed', async () => {
+    const h = createParserHarness();
+    const envelopes = mapServerNotifications([
+      {
+        method: ServerNotif.error,
+        params: {
+          threadId: 'thread-auth',
+          turnId: 'turn-auth',
+          willRetry: false,
+          error: {
+            message:
+              'Your access token could not be refreshed because your refresh token was already used.',
+            codexErrorInfo: 'unauthorized',
+            additionalDetails: 'Please log out and sign in again.',
+          },
+        },
+      },
+    ]);
+    for (const out of envelopes) h.stream.write(wrap(out));
+    await h.settle();
+
+    expect(h.state.hasSuccessOutput).toBe(false);
+    expect(h.state.newSessionId).toBe('thread-auth');
+    const last = h.received[h.received.length - 1];
+    expect(last?.status).toBe('error');
+    expect(last?.newSessionId).toBe('thread-auth');
+    expect(last?.error).toContain('refresh token was already used');
+    expect(last?.error).toContain('Please log out and sign in again.');
+    expect(last?.error).not.toBe('agent failed');
   });
 
   test('closed 信封（_close/_drain 收尾）→ hasClosedOutput', async () => {

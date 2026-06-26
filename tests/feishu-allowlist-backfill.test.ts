@@ -24,6 +24,7 @@ const {
   deleteRegisteredGroup,
   findEmptyAllowlistFeishuGroupsForUser,
   backfillEmptyAllowlistsForUser,
+  backfillMissingFeishuOwnersForUser,
   clearSenderAllowlist,
 } = await import('../src/db.js');
 
@@ -50,6 +51,9 @@ beforeEach(() => {
     'feishu:locked-1',
     'feishu:locked-2',
     'feishu:already-set',
+    'feishu:missing-owner',
+    'feishu:missing-owner-other-allowed',
+    'feishu:has-owner',
     'feishu:unrestricted',
     'feishu:other-user-locked',
     'telegram:also-locked',
@@ -63,6 +67,7 @@ function makeGroup(
   jid: string,
   userId: string,
   allowlist: string[] | null | undefined,
+  ownerImId?: string,
 ) {
   setRegisteredGroup(jid, {
     name: jid,
@@ -70,6 +75,7 @@ function makeGroup(
     added_at: new Date().toISOString(),
     created_by: userId,
     sender_allowlist: allowlist,
+    owner_im_id: ownerImId,
   });
 }
 
@@ -167,6 +173,37 @@ describe('backfillEmptyAllowlistsForUser', () => {
     expect(getRegisteredGroup('feishu:locked-1')?.sender_allowlist).toEqual([
       OWNER_A,
     ]);
+  });
+});
+
+describe('backfillMissingFeishuOwnersForUser', () => {
+  test('sets owner_im_id when an existing Feishu allowlist already contains ownerOpenId', () => {
+    makeGroup('feishu:missing-owner', USER_A, [OWNER_A]);
+
+    const result = backfillMissingFeishuOwnersForUser(USER_A, OWNER_A);
+
+    expect(result).toEqual(['feishu:missing-owner']);
+    expect(getRegisteredGroup('feishu:missing-owner')?.owner_im_id).toBe(OWNER_A);
+  });
+
+  test('does not touch unrestricted groups, other users, other channels, or already-owned groups', () => {
+    makeGroup('feishu:unrestricted', USER_A, null);
+    makeGroup('feishu:other-user-locked', USER_B, [OWNER_A]);
+    makeGroup('telegram:also-locked', USER_A, [OWNER_A]);
+    makeGroup('feishu:has-owner', USER_A, [OWNER_A], OWNER_B);
+
+    expect(backfillMissingFeishuOwnersForUser(USER_A, OWNER_A)).toEqual([]);
+    expect(getRegisteredGroup('feishu:unrestricted')?.owner_im_id).toBeUndefined();
+    expect(getRegisteredGroup('feishu:other-user-locked')?.owner_im_id).toBeUndefined();
+    expect(getRegisteredGroup('telegram:also-locked')?.owner_im_id).toBeUndefined();
+    expect(getRegisteredGroup('feishu:has-owner')?.owner_im_id).toBe(OWNER_B);
+  });
+
+  test('does not claim when allowlist does not contain ownerOpenId', () => {
+    makeGroup('feishu:missing-owner-other-allowed', USER_A, [OWNER_B]);
+
+    expect(backfillMissingFeishuOwnersForUser(USER_A, OWNER_A)).toEqual([]);
+    expect(getRegisteredGroup('feishu:missing-owner-other-allowed')?.owner_im_id).toBeUndefined();
   });
 });
 

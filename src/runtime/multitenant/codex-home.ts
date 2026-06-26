@@ -3,7 +3,8 @@
  *
  * 为每个 folder 准备隔离的 CODEX_HOME（`{dataDir}/sessions/{folder}/.codex`），并从共享
  * codex home（已登录的单账号）复制 `auth.json`（必需）与 `config.toml`（可选）进去。
- * 复制是幂等的：per-folder 已存在的文件不覆盖 —— 保留各 folder 自己的 token 刷新结果。
+ * auth.json 会在源凭据更新后同步到旧 per-folder home；若 per-folder 自己刷新出更新的
+ * auth.json，则不覆盖。config.toml 等其他文件仍是 copy-if-absent。
  *
  * 已知限制（standalone PoC）：
  *   共享单账号下，每个 per-folder 的 auth.json 由各自进程独立 refresh，多个 folder 同时
@@ -11,7 +12,7 @@
  *   无协调）。PoC 阶段可容忍；生产应集中一个 refresh owner（留待"接主仓"阶段）。
  */
 
-import { mkdir, copyFile, access, readFile, writeFile, rm } from 'node:fs/promises';
+import { mkdir, copyFile, access, readFile, writeFile, rm, stat } from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
 import * as path from 'node:path';
 
@@ -281,13 +282,13 @@ export class FsCodexHomeProvisioner implements ICodexHomeProvisioner {
     // 1. 确保 per-folder CODEX_HOME 存在。
     await mkdir(codexHome, { recursive: true });
 
-    // 2. 复制凭据（幂等：per-folder 已有则不覆盖）。
+    // 2. 同步凭据。源 auth 更新（如设备码重新登录）后要刷新旧 per-folder 副本；
+    //    但 per-folder 自己刷新出的更新 auth 不能被旧源覆盖。
     //    auth.json 必需：源 = authSourceDir（per-user 已登录的 codex home 或回退 shared）；
     //    源缺失则抛错（由调用方保证 authSourceDir 已含 auth.json 或回退含 auth 的 shared）。
-    await this.copyIfAbsent(
+    await this.syncAuthFile(
       path.join(this.authSourceDir, AUTH_FILE),
       path.join(codexHome, AUTH_FILE),
-      { required: true },
     );
     //    config.toml 可选：源取 sharedCodexHome（共享配置基线），源存在才复制。
     await this.copyIfAbsent(
@@ -530,6 +531,47 @@ export class FsCodexHomeProvisioner implements ICodexHomeProvisioner {
       return; // 可选文件源缺失 → 跳过。
     }
     await copyFile(src, dest);
+  }
+
+  /**
+   * 同步 auth.json。
+   *
+   * 设备码 / access-token 重新登录会更新 authSourceDir/auth.json。旧 per-folder CODEX_HOME
+   * 里已经存在的 auth.json 若仍是旧 token，继续 copy-if-absent 会让会话永远用 revoked
+   * refresh token。这里按 mtime 做单向收敛：
+   * - dest 不存在：复制源；
+   * - src 比 dest 新：复制源，传播重新登录后的凭据；
+   * - dest 等新或更新：保留 dest，避免覆盖 Codex 在该 per-folder 内刚刷新出的 token。
+   */
+  private async syncAuthFile(src: string, dest: string): Promise<void> {
+    const missingAuthError = (): Error =>
+      new Error(
+        `codex 未登录：缺 ${path.basename(src)}（请在设置中登录你的 codex 账号，或启用共享账号回退）`,
+      );
+
+    if (path.resolve(src) === path.resolve(dest)) {
+      if (!(await this.exists(src))) throw missingAuthError();
+      return;
+    }
+
+    let srcStat;
+    try {
+      srcStat = await stat(src);
+    } catch {
+      throw missingAuthError();
+    }
+
+    let destStat;
+    try {
+      destStat = await stat(dest);
+    } catch {
+      await copyFile(src, dest);
+      return;
+    }
+
+    if (srcStat.mtimeMs > destStat.mtimeMs) {
+      await copyFile(src, dest);
+    }
   }
 
   /** 文件/目录是否存在。 */

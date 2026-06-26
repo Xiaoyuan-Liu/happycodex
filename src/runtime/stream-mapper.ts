@@ -10,6 +10,7 @@
 
 import {
   ServerNotif,
+  type ErrorNotification,
   type AgentMessageDeltaNotification,
   type CommandExecutionOutputDeltaNotification,
   type ContextCompactedNotification,
@@ -56,6 +57,35 @@ export class StreamMapper implements IStreamMapper {
             toolUseId: n.itemId,
             turnId: n.turnId,
             threadId: n.threadId,
+          },
+        ];
+      }
+
+      case ServerNotif.error: {
+        const n = p as unknown as Partial<ErrorNotification>;
+        const statusText = formatTurnError(n.error);
+        if (n.willRetry) {
+          return [
+            {
+              eventType: 'status',
+              statusText: statusText ? `retrying:${statusText}` : 'retrying',
+              turnId: n.turnId,
+              threadId: n.threadId,
+              willRetry: true,
+            },
+          ];
+        }
+        // App-server can still send turn/completed after an error notification.
+        // Downstream keeps hadError sticky and clears accumulated text on this
+        // failed result, so a later empty completed event cannot wash it to success.
+        return [
+          {
+            eventType: 'result',
+            subtype: 'failed',
+            statusText: statusText || 'agent failed',
+            turnId: n.turnId,
+            threadId: n.threadId,
+            willRetry: false,
           },
         ];
       }
@@ -234,6 +264,16 @@ export class StreamMapper implements IStreamMapper {
 }
 
 // ───────────────────────── helpers（导出便于单测） ─────────────────────────
+
+export function formatTurnError(error: Partial<ErrorNotification['error']> | null | undefined): string {
+  const message = typeof error?.message === 'string' ? error.message.trim() : '';
+  const additional =
+    typeof error?.additionalDetails === 'string' ? error.additionalDetails.trim() : '';
+  if (message && additional && !message.includes(additional)) {
+    return `${message}\n\n${additional}`;
+  }
+  return message || additional;
+}
 
 export function isToolItem(item: ThreadItem): boolean {
   return TOOL_ITEM_TYPES.has(item.type);

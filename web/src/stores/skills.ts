@@ -70,7 +70,7 @@ export const useSkillsStore = create<SkillsState>((set, get) => ({
   searchDetailLoading: {},
 
   loadSkills: async () => {
-    set({ loading: true });
+    set({ loading: true, error: null });
     try {
       const data = await api.get<{ skills: Skill[] }>('/api/skills');
       set({ skills: data.skills, loading: false, error: null });

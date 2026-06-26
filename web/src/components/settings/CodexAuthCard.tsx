@@ -46,7 +46,7 @@ export function CodexAuthCard({
   onLoginSuccess,
 }: {
   /**
-   * 任一方式登录成功后回调（api-key/access-token 保存成功、device/browser 授权完成）。
+   * 任一方式登录成功后回调（api-key/access-token 保存成功、device 授权完成）。
    * setup 引导页用它在 bootstrap 期刷新 setup 门控（needsSetup）并据此放行。
    */
   onLoginSuccess?: () => void;
@@ -60,7 +60,6 @@ export function CodexAuthCard({
     submitApiKey,
     submitAccessToken,
     startDeviceAuth,
-    startBrowserLogin,
     logout,
     resetDevice,
     subscribeDeviceAuth,
@@ -114,7 +113,7 @@ export function CodexAuthCard({
     return () => unsub();
   }, [subscribeDeviceAuth]);
 
-  // device/browser 授权完成 → 通知外层（setup 引导页据此刷新门控并放行）。
+  // device 授权完成 → 通知外层（setup 引导页据此刷新门控并放行）。
   // device.phase 仅在转为 authorized 时触发一次；checkAuth 幂等，重触发无害。
   useEffect(() => {
     if (device.phase === 'authorized') onLoginSuccess?.();
@@ -131,18 +130,6 @@ export function CodexAuthCard({
       setStartingDevice(false);
     }
   }, [startDeviceAuth]);
-
-  const handleStartBrowser = useCallback(async () => {
-    setStartingDevice(true);
-    try {
-      await startBrowserLogin();
-      toast.info('已发起浏览器登录，浏览器应会自动打开授权页…');
-    } catch (err) {
-      toast.error(getErrorMessage(err, '发起浏览器登录失败'));
-    } finally {
-      setStartingDevice(false);
-    }
-  }, [startBrowserLogin]);
 
   const handleRetryDevice = useCallback(async () => {
     resetDevice();
@@ -382,11 +369,11 @@ export function CodexAuthCard({
             <TabsTrigger value="access_token">Access Token</TabsTrigger>
           </TabsList>
 
-          {/* ─── ChatGPT 登录（浏览器 / 设备码）─── */}
+          {/* ─── ChatGPT 登录（设备码）─── */}
           <TabsContent value="chatgpt" className="pt-3 space-y-3">
             <p className="text-xs text-muted-foreground">
-              用你自己的 ChatGPT 账号登录 codex。本机部署推荐「浏览器登录」（自动开浏览器、点一下即可）；
-              远程/无头服务器用「设备码登录」（在任意设备打开链接 + 输验证码）。
+              用你自己的 ChatGPT 账号登录 codex。设备码登录适用于本机、远程和无头服务器：
+              在任意设备打开链接并输入验证码完成授权。
             </p>
 
             {device.phase === 'pending' && (
@@ -453,7 +440,7 @@ export function CodexAuthCard({
                       </div>
                     ) : (
                       <p className="text-xs text-muted-foreground">
-                        浏览器应已自动打开授权页；若没有，点击上方链接登录即可（无需验证码）。
+                        正在等待验证码输出；若长时间没有出现，请重试设备码登录。
                       </p>
                     )}
                     <div className="flex items-center gap-2 text-xs text-muted-foreground">
@@ -498,21 +485,17 @@ export function CodexAuthCard({
 
             {(device.phase === 'idle' || device.phase === 'authorized') && (
               <div className="flex flex-wrap items-center gap-2">
-                <Button onClick={handleStartBrowser} disabled={startingDevice}>
+                <Button
+                  onClick={handleStartDevice}
+                  disabled={startingDevice}
+                  title="在任意设备打开链接并输入验证码完成授权"
+                >
                   {startingDevice ? (
                     <Loader2 className="size-4 animate-spin" />
                   ) : (
                     <ExternalLink className="size-4" />
                   )}
-                  {device.phase === 'authorized' ? '重新用浏览器登录' : '浏览器登录（本机推荐）'}
-                </Button>
-                <Button
-                  variant="outline"
-                  onClick={handleStartDevice}
-                  disabled={startingDevice}
-                  title="远程/无头服务器用；需在 ChatGPT 安全设置启用设备代码授权"
-                >
-                  设备码登录
+                  {device.phase === 'authorized' ? '重新设备码登录' : '设备码登录'}
                 </Button>
               </div>
             )}

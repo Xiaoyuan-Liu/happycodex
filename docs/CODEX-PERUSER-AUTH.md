@@ -9,7 +9,7 @@ happycodex 是 codex-only 引擎，认证 = codex 的 `auth.json`。本功能让
 | 凭据源（per-user） | `data/config/user-im/{userId}/codex/auth.json`（明文 `0o600`，codex 原生形状——codex 必须明文读取，**不加密**，与宿主机 `~/.codex/auth.json` 一致） |
 | 凭据源（共享） | `sharedCodexHomeDir()`（`HAPPYCODEX_SHARED_CODEX_HOME` > `CODEX_HOME` > `~/.codex`），即原"共享单账号" |
 | 选源时机 | 每次会话 provision，按 `group.created_by`（=owner userId）选：有 per-user 用 per-user，否则按回退开关 |
-| 物理隔离 | 仍是 per-folder `CODEX_HOME`（`data/sessions/{folder}/.codex`）；per-user `auth.json` 在 provision 时复制进去 |
+| 物理隔离 | 仍是 per-folder `CODEX_HOME`（`data/sessions/{folder}/.codex`）；per-user `auth.json` 在 provision 时同步进去 |
 
 ## 回退开关
 
@@ -24,13 +24,14 @@ happycodex 是 codex-only 引擎，认证 = codex 的 `auth.json`。本功能让
 3. 无 + fallback 关 → 故意指向不含 auth 的 per-user 目录（→ provision 抛错，不静默用共享，杜绝越权使用他人/共享凭据）
 4. `ownerId` 缺失 → `sharedCodexHomeDir()`
 
-## 三层登录方式（前端统一在「设置 → CodexAuthCard」）
+## 三种登录方式（前端统一在「设置 → CodexAuthCard」）
 
 ### 1. device-auth 一键登录（推荐，本机/远程都行）
 
 `POST /api/config/codex/auth/device/start` → 后端以 `CODEX_HOME=userCodexHomeDir(userId)` spawn `codex login --device-auth` → 解析 stdout 的 verification URL + 短码 → 经 WS `codex_device_auth` 推前端 → 用户在**任意设备/浏览器**打开 URL 输码授权 → codex 进程退出 0 即把 `auth.json` 落该用户目录 → 推 `authorized`。
 
-- 设备码流程**无 localhost 回调**，所以远程部署（服务在远端、浏览器在笔记本）同样可用——这是相对 `codex login` 默认浏览器回调的关键优势。
+- 设备码流程**无 localhost 回调**，所以远程部署（服务在远端、浏览器在笔记本）同样可用。
+- 重新登录会更新 per-user `auth.json`；下一次会话 provision 会把更新后的凭据同步到旧 per-folder `CODEX_HOME`，避免旧会话继续使用 revoked refresh token。
 - 编排见 `src/codex-device-auth.ts`：同一 userId 单 in-flight（重试抢占旧进程）、15min 超时 kill 进程树、`getDeviceAuthState` 供 WS 重连恢复、`shutdownAllDeviceAuth` 优雅退出清理。
 
 ### 2. API key 粘贴

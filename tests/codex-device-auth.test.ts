@@ -100,7 +100,6 @@ vi.mock('../src/logger.js', () => ({
 import fs from 'node:fs';
 import {
   startDeviceAuth,
-  startBrowserLogin,
   getDeviceAuthState,
   cancelDeviceAuth,
   shutdownAllDeviceAuth,
@@ -170,31 +169,6 @@ describe('startDeviceAuth — spawn 参数与安全', () => {
     expect(h.spawned).toHaveLength(0);
   });
 
-  test('startBrowserLogin → spawn `codex login`（无 --device-auth）', () => {
-    startBrowserLogin('alice', () => {});
-    expect(lastChild().args).toEqual(['login']);
-  });
-});
-
-describe('startBrowserLogin — 标准浏览器登录解析', () => {
-  test('解析标准 codex login 输出：完整 oauth authorize URL（含 query），跳过 localhost，无短码', () => {
-    const updates: CodexDeviceAuthState[] = [];
-    startBrowserLogin('alice', (s) => updates.push(s));
-    lastChild().stderr.push(
-      'Starting local login server on http://localhost:1455.\n' +
-        'If your browser did not open, navigate to this URL to authenticate:\n\n' +
-        'https://auth.openai.com/oauth/authorize?response_type=code&client_id=app_X&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback&state=abc123\n',
-    );
-    const pending = updates.find((u) => u.status === 'pending')!;
-    // 完整授权 URL（query 不剥——是用户要打开的地址）。
-    expect(pending.verificationUri).toBe(
-      'https://auth.openai.com/oauth/authorize?response_type=code&client_id=app_X&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback&state=abc123',
-    );
-    // 跳过了 http://localhost:1455 本地回调服务地址。
-    expect(pending.verificationUri).not.toContain('localhost:1455.');
-    // browser 模式无短码。
-    expect(pending.userCode).toBeUndefined();
-  });
 });
 
 describe('stdout/stderr 解析 → pending', () => {
