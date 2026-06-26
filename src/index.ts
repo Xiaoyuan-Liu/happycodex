@@ -169,6 +169,7 @@ import type {
   WhatsAppConnectConfig,
 } from './im-manager.js';
 import { GroupQueue } from './group-queue.js';
+import { createIpcSendDedup } from './ipc-dedup.js';
 import { GENERIC_AGENT_FAILURE_MESSAGE } from './container-output.js';
 import { shutdownAllDeviceAuth } from './codex-device-auth.js';
 import { startSchedulerLoop, triggerTaskNow } from './task-scheduler.js';
@@ -657,44 +658,13 @@ const activeRouteUpdaters = new Map<string, ReplyRouteUpdater>();
 const activeImReplyRoutes = new Map<string, string | null>();
 
 // ── IPC send_message 跨重试去重 ──
-// 错误退避重试会把整个 prompt 从头重跑，agent 在失败前已执行的 send_message
-// 会被原样再执行一遍，经 IPC watcher 即时送达用户（重复刷消息）。
-//
-// 关键：抑制必须严格限定在「重试重放」窗口，否则会误杀合法的重复内容
-// （周期定时任务每次报告相同文案、用户明确要求重发同一句话）。因此始终记录
-// 每条 send 的指纹，但仅当该源 group 当前正处于失败重试轮次（retryCount>0）
-// 时，命中已记录的指纹才抑制——正常首轮永不抑制。
-const IPC_SEND_DEDUP_TTL_MS = 10 * 60_000;
-const IPC_SEND_DEDUP_MAX = 500;
-const recentIpcSends = new Map<string, number>(); // key → expireAt
-function isRetryDuplicateIpcSend(
-  sourceGroup: string,
-  chatJid: string,
-  text: string,
-): boolean {
-  const key = `${sourceGroup}|${chatJid}|${crypto
-    .createHash('md5')
-    .update(text)
-    .digest('hex')}`;
-  const now = Date.now();
-  const exp = recentIpcSends.get(key);
-  // 仅在该 group 处于重试重放时，已见过的指纹才视为重复并抑制。
-  // sourceGroup 是 folder，而 retryCount 以**真实 chatJid** 记账：旧实现用 `web:${folder}`
-  // 与 `folder` 猜键，仅 admin home（folder=jid=web:main）碰巧命中，普通群（web:<uuid>）/
-  // IM 群（feishu:oc_xxx）恒 false → 去重对绝大多数群是 no-op（#F5）。改为取该 folder 的全部
-  // 真实 JID，任一处于重试重放即视为窗口内。对齐上游 happyclaw 修复（getJidsByFolder）。
-  const inRetry = getJidsByFolder(sourceGroup).some(
-    (jid) => queue.getRetryCount(jid) > 0,
-  );
-  const isDup = !!(exp && exp > now) && inRetry;
-  recentIpcSends.set(key, now + IPC_SEND_DEDUP_TTL_MS);
-  // 容量控制：Map 迭代为插入序，先进先出淘汰
-  for (const k of recentIpcSends.keys()) {
-    if (recentIpcSends.size <= IPC_SEND_DEDUP_MAX) break;
-    recentIpcSends.delete(k);
-  }
-  return isDup;
-}
+// 实现与详细注释见 src/ipc-dedup.ts（抽出以便单测——index.ts main() 加载即执行、不可 import）。
+// #F5：sourceGroup 是 folder，retryCount 以真实 chatJid 记账 → 经 getJidsByFolder 反查真实 JID
+// 判断是否处于重试重放窗口（旧实现用 web:${folder}/folder 猜键，对普通群/IM 群恒 no-op）。
+const isRetryDuplicateIpcSend = createIpcSendDedup({
+  getJidsByFolder,
+  getRetryCount: (jid) => queue.getRetryCount(jid),
+});
 
 // Track consecutive IM send failures per JID for auto-unbind
 const imSendFailCounts = new Map<string, number>();

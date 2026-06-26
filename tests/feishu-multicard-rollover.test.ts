@@ -168,4 +168,3 @@ describe('MultiCardManager rollover (v1 degraded mode)', () => {
     expect(cardCreate.mock.calls.length).toBeGreaterThan(2);
   });
 });
-
