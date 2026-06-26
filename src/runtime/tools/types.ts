@@ -26,6 +26,7 @@ import type {
   DynamicToolSpec,
   DynamicToolCallResponse,
 } from '../../appserver/protocol.js';
+import type { InjectContext } from '../../contracts.js';
 
 /**
  * install_skill 的 bridge 侧 poll 上限（对齐上游 mcp-tools.ts：安装可能很慢，120s）。
@@ -131,6 +132,13 @@ export interface ToolBridge {
   discordGetChannelInfo(folder: string): Promise<unknown>;
   /** A4：当前 Discord 服务器（guild）元数据；DM 频道返回 null（请求-响应协议）。 */
   discordGetServerInfo(folder: string): Promise<unknown | null>;
+  /**
+   * #F1r：把「本条注入消息」的 per-turn 上下文（taskId + sourceJid）绑定到它开启的 turn。
+   * 由 CodexRunner 在 onTurnStarted（仅新 turn 触发，steer 不触发）调用，使工具在该 turn 内
+   * 读到稳定的 taskId/chatJid，不被后续消息 / 并发 steer 覆写。可选：仅 IPC 注入场景需实现
+   * （FixedFolderToolBridge / FakeToolBridge 无注入语义，不实现；runner 经 `?.` 调用）。
+   */
+  setTurnContext?(ctx: InjectContext): void;
 }
 
 /** 工具注册表：聚合 ToolDefinition，产出 dynamicTools schema，按名分发调用。 */

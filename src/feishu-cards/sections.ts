@@ -66,16 +66,19 @@ const PANEL_ICON = {
 } as const;
 
 /**
- * Per-panel header tints. Feishu's saturated colour TOKENS (wathet/turquoise/
- * orange) render as DARK fills on a collapsible_panel header, which buried the
- * dark title text (unreadable). Use very light rgba fills instead — near-white
- * Material-50 shades that keep the title legible while still differentiating the
- * panels. (background_color accepts rgba; it rejects hex.)
+ * Per-panel header tints. collapsible_panel header.background_color must be an
+ * ENUM colour token — the API rejects rgba()/rgb()/hex here with
+ * `code=11310 collapsible panel header background color is invalid`, which
+ * silently fails card.create and forces the whole streaming card to degrade
+ * from the L0 typewriter path down to L1 CardKit full-update on every reply.
+ * Use the light `-50` gradient tokens: near-white fills that keep the dark
+ * title legible while still differentiating the panels, and that the API
+ * actually accepts.
  */
 const PANEL_TINT = {
-  thinking: 'rgba(227, 242, 253, 1)', // light blue  (#e3f2fd)
-  tools: 'rgba(224, 247, 250, 1)', // light cyan  (#e0f7fa)
-  ask: 'rgba(255, 243, 224, 1)', // light amber (#fff3e0)
+  thinking: 'blue-50', // light blue
+  tools: 'wathet-50', // light cyan/sky
+  ask: 'orange-50', // light amber
 } as const;
 
 type El = Record<string, unknown>;

@@ -121,6 +121,17 @@ export class GroupQueue {
     return state;
   }
 
+  /** 当前重试轮次（0 = 首次尝试）。供 processMessages 侧识别静默重试轮。 */
+  getRetryCount(groupJid: string): number {
+    return this.groups.get(groupJid)?.retryCount ?? 0;
+  }
+
+  /** 本轮失败后队列是否还会再次重试（决定错误提示发本轮还是等最终失败）。 */
+  willRetryAfterFailure(groupJid: string): boolean {
+    if (this.contextOverflowGroups.has(groupJid)) return false;
+    return (this.groups.get(groupJid)?.retryCount ?? 0) < MAX_RETRIES;
+  }
+
   setProcessMessagesFn(fn: (groupJid: string) => Promise<boolean>): void {
     this.processMessagesFn = fn;
   }
@@ -636,6 +647,7 @@ export class GroupQueue {
     images?: Array<{ data: string; mimeType?: string }>,
     onInjected?: () => void,
     sourceJid?: string,
+    taskId?: string,
   ): SendMessageResult {
     const state = this.resolveActiveState(groupJid);
     if (!state) return 'no_active';
@@ -671,9 +683,13 @@ export class GroupQueue {
       const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 6)}.json`;
       const filepath = path.join(inputDir, filename);
       const tempPath = `${filepath}.tmp`;
+      // Stamp taskId when this injection carries a scheduled-task prompt so the
+      // agent-runner can attribute the resulting send_message output to the task
+      // (drives notify_channels broadcast on the host). Omitted for regular
+      // user messages, matching the cold-start path's messageTaskId handling.
       fs.writeFileSync(
         tempPath,
-        JSON.stringify({ type: 'message', text, images, sourceJid }),
+        JSON.stringify({ type: 'message', text, images, sourceJid, taskId }),
       );
       fs.renameSync(tempPath, filepath);
       state.queryInFlight = true;

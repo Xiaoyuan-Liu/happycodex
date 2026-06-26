@@ -184,14 +184,27 @@ export interface CodexRunnerInput {
 }
 
 /**
+ * 注入消息携带的 per-message 上下文（#F1r）。绑定到该消息**开启的 turn**，而非全局可变字段——
+ * codex 单线程内 turn 串行、steer 并入 active turn，靠 onTurnStarted（仅新 turn 触发）把此上下文
+ * 钉到那个 turn，使其工具在整个 turn 内读到稳定的 taskId/chatJid，不被后续消息/并发 steer 覆写。
+ */
+export interface InjectContext {
+  /** 定时任务身份（上游 7e49a65）：决定该 turn 的 send_message 输出是否归因任务 + 触发 notify。 */
+  taskId?: string;
+  /** 来源聊天标识：per-channel 工具路由（对齐上游 mcpToolsConfig.chatJid 就地更新）。 */
+  sourceJid?: string;
+}
+
+/**
  * agent-runner 等价物：消费初始输入 + IPC 注入源，驱动 ThreadSession，
  * 把 StreamEvent 以 OUTPUT_MARKER 包裹写到 sink（默认 stdout）。
  */
 export interface ICodexRunner {
   run(input: CodexRunnerInput): Promise<void>;
   /** 注入后续用户消息（来自 IPC / 队列）。
-   *  A4 契约扩展：可选 images（IPC input 文件的 images[]）随消息透传到 session turn input。 */
-  inject(text: string, images?: InjectedImage[]): void;
+   *  A4 契约扩展：可选 images（IPC input 文件的 images[]）随消息透传到 session turn input。
+   *  #F1r：可选 ctx（taskId / sourceJid）绑定到该消息开启的 turn（见 InjectContext）。 */
+  inject(text: string, images?: InjectedImage[], ctx?: InjectContext): void;
   /** 请求优雅关闭（对应 HappyClaw 的 _close sentinel）。 */
   shutdown(): void;
 }

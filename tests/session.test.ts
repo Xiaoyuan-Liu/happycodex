@@ -1143,6 +1143,44 @@ describe('CodexRunner + tools（Stage 3 wiring）', () => {
   });
 });
 
+describe('CodexRunner — #F1r per-turn 上下文绑定（taskId/sourceJid 钉到 turn，不被覆写）', () => {
+  it('注入 ctx 在其开启的新 turn（onTurnStarted）绑定到 bridge；后续 steer 不覆写活跃 turn 的上下文', async () => {
+    const client = new FakeAppServerClient();
+    client.responses['thread/start'] = { thread: { id: 'th', sessionId: 's', path: null } };
+    // turn/start 响应不带 turn.id → turn 注册仅由手动 emit('turn/started') 触发，精确控时。
+    const bridge = new FakeToolBridge();
+    const runner = new CodexRunner({
+      client,
+      config: {},
+      sink: () => {},
+      mapper: new FakeMapper(),
+      tools: { registry: new ToolRegistry(), bridge },
+    });
+
+    const runPromise = runner.run({ prompt: 'cold', groupFolder: 'g', session: {} });
+    await vi.waitFor(() => expect(client.methods()).toContain('turn/start'));
+    // 冷 prompt 的 turn/start 已发但未注册（响应无 id、未 emit）→ activeTurnId 仍空。
+
+    // 注入定时任务消息（带 taskId）。activeTurnId 空 → 走 turn/start（开新 turn）。
+    runner.inject('task work', undefined, { taskId: 'T1', sourceJid: 'feishu:oc_a' });
+    await vi.waitFor(() =>
+      expect(client.requests.filter((r) => r.method === 'turn/start').length).toBeGreaterThanOrEqual(2),
+    );
+    // 新 turn 开始 → onTurnStarted 消费 pendingInjectCtx → setTurnContext({T1, feishu:oc_a})。
+    client.emit('turn/started', { threadId: 'th', turn: { id: 'turn_task' } });
+    expect(bridge.turnContexts).toEqual([{ taskId: 'T1', sourceJid: 'feishu:oc_a' }]);
+
+    // turn_task 活跃 → 注入普通消息走 steer（并入活跃 turn，不 fire onTurnStarted）→ 不再 setTurnContext。
+    // 这正是 #F1r 修复点：task turn 的 taskId 不会被后续到达的非任务消息在其消费 send_message 前清掉。
+    runner.inject('user msg', undefined, { taskId: undefined, sourceJid: 'feishu:oc_b' });
+    await vi.waitFor(() => expect(client.methods()).toContain('turn/steer'));
+    expect(bridge.turnContexts).toHaveLength(1); // 未被覆写：仍是 task turn 的上下文
+
+    client.emit('turn/completed', { threadId: 'th', turn: { id: 'turn_task', status: 'completed' } });
+    await runPromise;
+  });
+});
+
 describe('CodexRunner app-server 崩溃自愈（回归 #12）', () => {
   it('start→sendUserMessage 后进程崩溃（turn/completed 永不到）→ run() resolve 且吐出 failed 结果', async () => {
     const client = new FakeAppServerClient();

@@ -104,6 +104,39 @@ describe('IpcToolBridge — sendMessage', () => {
   });
 });
 
+describe('IpcToolBridge — setTurnContext（#F1r：per-turn 上下文绑定）', () => {
+  async function onlyMessage(): Promise<Record<string, unknown>> {
+    const files = (await listChannel('messages')).filter((f) => f.endsWith('.json'));
+    expect(files).toHaveLength(1);
+    return (await readChannelJson('messages', files[0]!)) as Record<string, unknown>;
+  }
+
+  it('setTurnContext({taskId}) → 后续 sendMessage stamp 该 taskId（warm-runner 定时任务归因 + notify）', async () => {
+    bridge.setTurnContext({ taskId: 'task-T1' });
+    await bridge.sendMessage(FOLDER, 'task output');
+    expect((await onlyMessage()).taskId).toBe('task-T1');
+  });
+
+  it('task turn 后接普通消息：setTurnContext({}) 无条件清零 taskId（防输出被错误归因 / 串台广播）', async () => {
+    bridge.setTurnContext({ taskId: 'task-T1' }); // 上一 turn 是定时任务
+    bridge.setTurnContext({}); // 本 turn 是普通消息（无 taskId）→ 必须清零
+    await bridge.sendMessage(FOLDER, 'user reply');
+    expect('taskId' in (await onlyMessage())).toBe(false);
+  });
+
+  it('setTurnContext 不带 sourceJid → 保留既有 chatJid 绑定（持久路由，only-on-truthy）', async () => {
+    bridge.setTurnContext({ taskId: 't' });
+    await bridge.sendMessage(FOLDER, 'a');
+    expect((await onlyMessage()).chatJid).toBe(CHAT_JID);
+  });
+
+  it('setTurnContext({sourceJid}) → 切换 chatJid（per-channel 路由，对齐上游 sourceJid 变更）', async () => {
+    bridge.setTurnContext({ sourceJid: 'feishu:oc_new' });
+    await bridge.sendMessage(FOLDER, 'b');
+    expect((await onlyMessage()).chatJid).toBe('feishu:oc_new');
+  });
+});
+
 describe('IpcToolBridge — scheduleTask / list / lifecycle', () => {
   const input: ScheduleTaskInput = {
     name: 'nightly',

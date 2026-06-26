@@ -21,6 +21,7 @@
 import type {
   IAppServerClient,
   ICodexRunner,
+  InjectContext,
   InjectedImage,
   IStreamMapper,
   CodexRunnerInput,
@@ -88,6 +89,13 @@ export class CodexRunner implements ICodexRunner {
   private queuedInjections = 0;
   /** 在飞 turn 的 id 集合（由 session.onTurnStarted/onTurnCompleted 驱动）。 */
   private readonly inFlightTurns = new Set<string>();
+  /**
+   * #F1r：最近一条注入消息携带、等待绑定到「它即将开启的新 turn」的上下文。inject 在 injectChain
+   * 链节内、调 sendUserMessage 之前置位；onTurnStarted（仅新 turn 触发）消费它写入 bridge，随即清空。
+   * steer（并入 active turn，不 fire onTurnStarted）不消费 → 该 turn 保留自己开启时的上下文。
+   * undefined = 无上下文注入（如测试 inject(text) / cold prompt 经构造函数 seed），onTurnStarted 不改 bridge。
+   */
+  private pendingInjectCtx: InjectContext | undefined = undefined;
   /** 是否已至少开过一轮（避免首条 prompt 之前误判完成）。 */
   private hadAnyTurn = false;
   /** 是否已被 shutdown，避免关闭后继续注入 / 重复关闭。 */
@@ -148,6 +156,12 @@ export class CodexRunner implements ICodexRunner {
       this.inFlightTurns.add(turnId);
       // 新一轮开始：重置终态观测（去重只针对"本轮"）。
       this.mainTerminalSeenThisTurn = false;
+      // #F1r：把开启本 turn 的注入消息的上下文（taskId/sourceJid）钉到 bridge，整个 turn 稳定可读。
+      // 仅新 turn 走到这（steer 不 fire onTurnStarted），故并发到达的下一条消息无法覆写本 turn 上下文。
+      if (this.pendingInjectCtx !== undefined) {
+        this.tools?.bridge.setTurnContext?.(this.pendingInjectCtx);
+        this.pendingInjectCtx = undefined;
+      }
     });
 
     session.onTurnCompleted(({ turnId, subtype }) => {
@@ -216,7 +230,7 @@ export class CodexRunner implements ICodexRunner {
     await finishPromise;
   }
 
-  inject(text: string, images?: InjectedImage[]): void {
+  inject(text: string, images?: InjectedImage[], ctx?: InjectContext): void {
     if (this.shuttingDown) return;
     const session = this.session;
     if (!session) {
@@ -228,6 +242,10 @@ export class CodexRunner implements ICodexRunner {
     this.injectChain = this.injectChain
       .then(() => {
         if (this.shuttingDown) return;
+        // #F1r：在 sendUserMessage 之前置 pendingInjectCtx，使其开启的新 turn 的 onTurnStarted
+        // （同步在 sendUserMessage 内 registerTurnStart 时触发）消费到本条消息的上下文。injectChain
+        // 串行 → 下一条注入要等本条 sendUserMessage resolve 后才置位，不会抢在本 turn 绑定前覆写。
+        this.pendingInjectCtx = ctx;
         // sendUserMessage 在请求 resolve 时同步注册新 turn（onTurnStarted），
         // 因此该 await 返回前，注入打开的 turn 已进入 inFlightTurns，maybeFinish 不会误判。
         return session.sendUserMessage(text, images);
