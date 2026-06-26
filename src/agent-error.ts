@@ -6,9 +6,6 @@ export function preferAgentError(current: string, incoming: string | undefined):
   if (current !== GENERIC_AGENT_FAILURE_MESSAGE && incoming === GENERIC_AGENT_FAILURE_MESSAGE) {
     return current;
   }
-  if (current === GENERIC_AGENT_FAILURE_MESSAGE && incoming !== GENERIC_AGENT_FAILURE_MESSAGE) {
-    return incoming;
-  }
   return incoming;
 }
 

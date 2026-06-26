@@ -75,6 +75,9 @@ export class StreamMapper implements IStreamMapper {
             },
           ];
         }
+        // App-server can still send turn/completed after an error notification.
+        // Downstream keeps hadError sticky and clears accumulated text on this
+        // failed result, so a later empty completed event cannot wash it to success.
         return [
           {
             eventType: 'result',
