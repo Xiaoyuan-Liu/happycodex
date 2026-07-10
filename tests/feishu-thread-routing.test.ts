@@ -1,5 +1,8 @@
 import { describe, expect, test, vi } from 'vitest';
-import { parseFeishuRouteTarget } from '../src/feishu.js';
+import {
+  parseFeishuRouteTarget,
+  shouldUseFeishuReplyApi,
+} from '../src/feishu.js';
 import { StreamingCardController } from '../src/feishu-streaming-card.js';
 
 describe('parseFeishuRouteTarget', () => {
@@ -21,6 +24,15 @@ describe('parseFeishuRouteTarget', () => {
       rootMessageId: undefined,
       replyInThread: false,
     });
+  });
+
+  test('does not use reply API for bare chat targets', () => {
+    expect(shouldUseFeishuReplyApi(parseFeishuRouteTarget('oc_123'))).toBe(false);
+    expect(
+      shouldUseFeishuReplyApi(
+        parseFeishuRouteTarget('oc_123#thread:omt_thread#root:om_root'),
+      ),
+    ).toBe(true);
   });
 });
 
