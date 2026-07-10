@@ -195,6 +195,10 @@ export function parseFeishuRouteTarget(raw: string): FeishuRouteTarget {
   };
 }
 
+export function shouldUseFeishuReplyApi(target: FeishuRouteTarget): boolean {
+  return !!target.rootMessageId;
+}
+
 function buildFeishuRouteTarget(
   chatId: string,
   threadId?: string,
@@ -859,7 +863,8 @@ export function createFeishuConnection(
 
   /**
    * Low-level send: route to reply (thread-aware) or create, based on target.
-   * Uses rootMessageId for thread routing, falls back to lastMessageIdByChat for reply context.
+   * Only explicit root/thread routes use the reply API; bare group sends create
+   * normal chat messages instead of opening an unintended Feishu topic thread.
    */
   async function sendToFeishu(
     chatId: string,
@@ -871,8 +876,9 @@ export function createFeishuConnection(
     const receiveIdType = target.chatId.startsWith('oc_')
       ? 'chat_id'
       : 'open_id';
-    const replyMsgId =
-      target.rootMessageId || lastMessageIdByChat.get(target.chatId);
+    const replyMsgId = shouldUseFeishuReplyApi(target)
+      ? target.rootMessageId
+      : undefined;
     if (replyMsgId) {
       await client.im.message.reply({
         path: { message_id: replyMsgId },

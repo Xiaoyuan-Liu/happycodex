@@ -302,7 +302,7 @@ export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
       const opts: StreamingCardOptions = {
         client: larkClient,
         chatId: target.chatId,
-        replyToMsgId: inner.getLastMessageId(chatId),
+        replyToMsgId: target.rootMessageId,
         replyInThread: target.replyInThread,
         onCardCreated,
         // 降级可观测性：卡片连续更新失败进入 error 态时记一条 warn。
