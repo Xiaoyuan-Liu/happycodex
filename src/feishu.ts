@@ -172,6 +172,7 @@ export interface FeishuRouteTarget {
   chatId: string;
   threadId?: string;
   rootMessageId?: string;
+  replyMessageId?: string;
   replyInThread: boolean;
 }
 
@@ -179,11 +180,14 @@ export function parseFeishuRouteTarget(raw: string): FeishuRouteTarget {
   const [chatId = '', ...parts] = raw.split('#');
   let threadId: string | undefined;
   let rootMessageId: string | undefined;
+  let replyMessageId: string | undefined;
   for (const part of parts) {
     if (part.startsWith('thread:')) {
       threadId = part.slice('thread:'.length);
     } else if (part.startsWith('root:')) {
       rootMessageId = part.slice('root:'.length);
+    } else if (part.startsWith('reply:')) {
+      replyMessageId = part.slice('reply:'.length);
     }
   }
   return {
@@ -191,23 +195,93 @@ export function parseFeishuRouteTarget(raw: string): FeishuRouteTarget {
     chatId,
     threadId,
     rootMessageId,
-    replyInThread: !!rootMessageId,
+    replyMessageId,
+    // root_id only identifies the root of a normal reply tree. Only an
+    // explicit thread route should request Feishu's topic-style reply mode.
+    replyInThread: !!threadId,
   };
 }
 
-export function shouldUseFeishuReplyApi(target: FeishuRouteTarget): boolean {
-  return !!target.rootMessageId;
+export function resolveFeishuReplyMessageId(
+  target: FeishuRouteTarget,
+): string | undefined {
+  if (target.threadId && target.rootMessageId) return target.rootMessageId;
+  // Routes persisted before replyMessageId was introduced only contain root.
+  // Keep them deliverable while new routes reply to the exact inbound message.
+  return target.replyMessageId || target.rootMessageId;
 }
 
-function buildFeishuRouteTarget(
+export function shouldUseFeishuReplyApi(target: FeishuRouteTarget): boolean {
+  return !!resolveFeishuReplyMessageId(target);
+}
+
+export function buildFeishuRouteTarget(
   chatId: string,
-  threadId?: string,
-  rootMessageId?: string,
+  options: {
+    threadId?: string;
+    rootMessageId?: string;
+    replyMessageId?: string;
+  } = {},
 ): FeishuRouteTarget {
   const parts = [chatId];
+  const { threadId, rootMessageId, replyMessageId } = options;
   if (threadId) parts.push(`thread:${threadId}`);
   if (rootMessageId) parts.push(`root:${rootMessageId}`);
+  if (replyMessageId) parts.push(`reply:${replyMessageId}`);
   return parseFeishuRouteTarget(parts.join('#'));
+}
+
+export function buildFeishuInboundRouteTarget(
+  chatId: string,
+  messageId: string,
+  rootId?: string,
+  threadId?: string,
+): FeishuRouteTarget {
+  // Feishu threads are flat: replies stay attached to the thread root. A
+  // root-only message is instead a normal reply tree, so reply to the exact
+  // inbound message without carrying the root as a delivery target.
+  if (threadId) {
+    return buildFeishuRouteTarget(chatId, {
+      threadId,
+      rootMessageId: rootId || messageId,
+    });
+  }
+  return buildFeishuRouteTarget(chatId, {
+    replyMessageId: rootId ? messageId : undefined,
+  });
+}
+
+export async function sendFeishuMessageToTarget(
+  client: lark.Client,
+  rawTarget: string,
+  msgType: string,
+  content: string,
+): Promise<void> {
+  const target = parseFeishuRouteTarget(rawTarget);
+  const replyMsgId = resolveFeishuReplyMessageId(target);
+  if (replyMsgId) {
+    await client.im.message.reply({
+      path: { message_id: replyMsgId },
+      data: {
+        content,
+        msg_type: msgType,
+        ...(target.replyInThread ? { reply_in_thread: true } : {}),
+      },
+    });
+    return;
+  }
+
+  const receiveIdType = target.chatId.startsWith('oc_')
+    ? 'chat_id'
+    : 'open_id';
+  await client.im.v1.message.create({
+    params: { receive_id_type: receiveIdType },
+    data: {
+      receive_id: target.chatId,
+      msg_type: msgType,
+      content,
+    },
+  });
 }
 
 function feishuRouteToJid(target: FeishuRouteTarget): string {
@@ -862,9 +936,8 @@ export function createFeishuConnection(
   }
 
   /**
-   * Low-level send: route to reply (thread-aware) or create, based on target.
-   * Only explicit root/thread routes use the reply API; bare group sends create
-   * normal chat messages instead of opening an unintended Feishu topic thread.
+   * Low-level send: use an exact reply/thread route when present; bare group
+   * targets create normal chat messages instead of opening a Feishu topic.
    */
   async function sendToFeishu(
     chatId: string,
@@ -872,32 +945,7 @@ export function createFeishuConnection(
     content: string,
   ): Promise<void> {
     if (!client) return;
-    const target = parseFeishuRouteTarget(chatId);
-    const receiveIdType = target.chatId.startsWith('oc_')
-      ? 'chat_id'
-      : 'open_id';
-    const replyMsgId = shouldUseFeishuReplyApi(target)
-      ? target.rootMessageId
-      : undefined;
-    if (replyMsgId) {
-      await client.im.message.reply({
-        path: { message_id: replyMsgId },
-        data: {
-          content,
-          msg_type: msgType,
-          ...(target.replyInThread ? { reply_in_thread: true } : {}),
-        },
-      });
-    } else {
-      await client.im.v1.message.create({
-        params: { receive_id_type: receiveIdType },
-        data: {
-          receive_id: target.chatId,
-          msg_type: msgType,
-          content,
-        },
-      });
-    }
+    await sendFeishuMessageToTarget(client, chatId, msgType, content);
   }
 
   async function sendTextToChat(chatId: string, text: string): Promise<void> {
@@ -1002,11 +1050,11 @@ export function createFeishuConnection(
     }
 
     const chatJid = `feishu:${chatId}`;
-    const rootMessageId = rootId || messageId;
-    const messageRouteTarget = buildFeishuRouteTarget(
+    const messageRouteTarget = buildFeishuInboundRouteTarget(
       chatId,
+      messageId,
+      rootId,
       threadId,
-      threadId ? rootMessageId : rootId,
     );
     const resolvedSenderName = senderName || getSenderName(senderOpenId);
     const resolvedChatName = chatType === 'p2p' ? '飞书私聊' : '飞书群聊';
@@ -1272,14 +1320,14 @@ export function createFeishuConnection(
 
     const agentRouting = resolveEffectiveChatJid?.(chatJid, {
       threadId,
-      rootId: rootMessageId,
+      rootId,
       parentId,
       messageId,
       text,
     });
     const routeSourceJid =
       agentRouting?.sourceJid ??
-      (messageRouteTarget.threadId || messageRouteTarget.rootMessageId
+      (shouldUseFeishuReplyApi(messageRouteTarget) || messageRouteTarget.threadId
         ? feishuRouteToJid(messageRouteTarget)
         : chatJid);
 
@@ -1375,7 +1423,16 @@ export function createFeishuConnection(
       );
       // 仅实时消息提示重发；backfill 回填的旧消息失败不打扰用户。
       if (source === 'ws') {
-        await sendTextToChat(chatId, '⚠️ 消息处理失败，请重发一次');
+        const errorTarget = buildFeishuInboundRouteTarget(
+          chatId,
+          messageId,
+          rootId,
+          threadId,
+        );
+        await sendTextToChat(
+          errorTarget.raw,
+          '⚠️ 消息处理失败，请重发一次',
+        );
       }
     } finally {
       processingLock.release(messageId);
@@ -1976,7 +2033,8 @@ export function createFeishuConnection(
       const target = parseFeishuRouteTarget(chatId);
       const reactionKey = target.raw;
       const lastMsgId =
-        target.rootMessageId || lastMessageIdByChat.get(target.chatId);
+        resolveFeishuReplyMessageId(target) ||
+        lastMessageIdByChat.get(target.chatId);
       if (!lastMsgId) return;
 
       if (isTyping) {
@@ -2066,7 +2124,10 @@ export function createFeishuConnection(
 
     getLastMessageId(chatId: string): string | undefined {
       const target = parseFeishuRouteTarget(chatId);
-      return target.rootMessageId || lastMessageIdByChat.get(target.chatId);
+      return (
+        resolveFeishuReplyMessageId(target) ||
+        lastMessageIdByChat.get(target.chatId)
+      );
     },
   };
 

@@ -7,6 +7,7 @@
 import {
   createFeishuConnection,
   parseFeishuRouteTarget,
+  resolveFeishuReplyMessageId,
   type FeishuConnection,
   type FeishuConnectionConfig,
 } from './feishu.js';
@@ -181,6 +182,63 @@ export function extractChatId(jid: string): string {
   return jid;
 }
 
+/**
+ * Stable source scope used when deciding whether a batch came from one IM
+ * conversation. Feishu's per-message reply anchor must not make two messages
+ * from the same chat look like different sources.
+ */
+export function getImReplyRouteScope(jid: string): string {
+  if (getChannelType(jid) !== 'feishu') return jid;
+  const target = parseFeishuRouteTarget(extractChatId(jid));
+  return target.threadId
+    ? `feishu:${target.chatId}#thread:${target.threadId}`
+    : `feishu:${target.chatId}`;
+}
+
+/** Physical registered-group JID, without per-message/thread delivery data. */
+export function getImRouteBaseJid(jid: string): string {
+  if (getChannelType(jid) !== 'feishu') return jid;
+  const target = parseFeishuRouteTarget(extractChatId(jid));
+  return `feishu:${target.chatId}`;
+}
+
+export function selectBatchImReplyRoute(
+  chatJid: string,
+  sourceJids: Array<string | null | undefined>,
+): string | null {
+  if (sourceJids.length === 0) return null;
+  const routes = sourceJids.map((sourceJid) => sourceJid || chatJid);
+
+  if (getChannelType(chatJid) !== null) {
+    const latestRoute = routes[routes.length - 1] || chatJid;
+    return getChannelType(latestRoute) !== null &&
+      getImRouteBaseJid(latestRoute) === getImRouteBaseJid(chatJid)
+      ? latestRoute
+      : chatJid;
+  }
+
+  const firstRoute = routes[0]!;
+  if (getChannelType(firstRoute) === null) return null;
+  const firstScope = getImReplyRouteScope(firstRoute);
+  if (!routes.every((route) => getImReplyRouteScope(route) === firstScope)) {
+    return null;
+  }
+  return routes[routes.length - 1]!;
+}
+
+export function resolveFeishuStreamingRoute(rawTarget: string): {
+  chatId: string;
+  replyToMsgId?: string;
+  replyInThread: boolean;
+} {
+  const target = parseFeishuRouteTarget(rawTarget);
+  return {
+    chatId: target.chatId,
+    replyToMsgId: resolveFeishuReplyMessageId(target),
+    replyInThread: target.replyInThread,
+  };
+}
+
 // ─── Feishu Adapter ─────────────────────────────────────────────
 
 export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
@@ -298,19 +356,17 @@ export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
       if (!inner) return undefined;
       const larkClient = inner.getLarkClient();
       if (!larkClient) return undefined;
-      const target = parseFeishuRouteTarget(chatId);
+      const route = resolveFeishuStreamingRoute(chatId);
       const opts: StreamingCardOptions = {
         client: larkClient,
-        chatId: target.chatId,
-        replyToMsgId: target.rootMessageId,
-        replyInThread: target.replyInThread,
+        ...route,
         onCardCreated,
         // 降级可观测性：卡片连续更新失败进入 error 态时记一条 warn。
         // 终态收口与静态消息兜底分别由 schedulePatch 的 best-effort patch
         // 和 index.ts 的 result 路径负责，这里只补日志。
         onFallback: () =>
           logger.warn(
-            { chatId: target.chatId },
+            { chatId: route.chatId },
             'Feishu streaming card degraded to static fallback',
           ),
       };

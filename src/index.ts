@@ -97,11 +97,13 @@ import {
   updateAgentContextInfo,
   backfillEmptyAllowlistsForUser,
 } from './db.js';
-// feishu.js deprecated exports are no longer needed; imManager handles all connections
 import { imManager } from './im-manager.js';
+import { buildFeishuInboundRouteTarget } from './feishu.js';
 import {
   getChannelType,
   extractChatId,
+  getImRouteBaseJid,
+  selectBatchImReplyRoute,
   type StreamingSession,
 } from './im-channel.js';
 import {
@@ -712,7 +714,14 @@ function resolveImRoute(opts: {
   }
   const imFromJid = getChannelType(chatJid) !== null ? chatJid : null;
   const imFromGroup = activeImReplyRoutes.get(sourceGroup) ?? null;
-  return isHome ? (imFromGroup ?? imFromJid) : (imFromJid ?? imFromGroup);
+  if (isHome) return imFromGroup ?? imFromJid;
+  const preciseDirectRoute =
+    imFromJid &&
+    imFromGroup &&
+    getImRouteBaseJid(imFromJid) === getImRouteBaseJid(imFromGroup)
+      ? imFromGroup
+      : null;
+  return preciseDirectRoute ?? imFromJid ?? imFromGroup;
 }
 
 /** Unbind an IM group from its conversation agent or main conversation, syncing DB + in-memory cache + failure counters. */
@@ -1076,24 +1085,28 @@ async function sendImWithRetry(
   text: string,
   localImagePaths: string[],
 ): Promise<boolean> {
+  const baseImJid = getImRouteBaseJid(imJid);
   const ok = await retryImOperation('send_message', imJid, () =>
     imManager.sendMessage(imJid, text, localImagePaths),
   );
   if (ok) {
-    imSendFailCounts.delete(imJid);
+    imSendFailCounts.delete(baseImJid);
     return true;
   }
   // All retries exhausted — track cumulative failures
-  const count = (imSendFailCounts.get(imJid) ?? 0) + 1;
-  imSendFailCounts.set(imJid, count);
+  const count = (imSendFailCounts.get(baseImJid) ?? 0) + 1;
+  imSendFailCounts.set(baseImJid, count);
   if (count >= IM_SEND_FAIL_THRESHOLD) {
     try {
       removeImGroupRecord(
-        imJid,
+        baseImJid,
         'Auto-removed IM group after consecutive send failures',
       );
     } catch (unbindErr) {
-      logger.error({ imJid, unbindErr }, 'Failed to auto-remove IM group');
+      logger.error(
+        { imJid, baseImJid, unbindErr },
+        'Failed to auto-remove IM group',
+      );
     }
   }
   return false;
@@ -2799,20 +2812,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // message originated from web, the web user expects replies on web only — do
   // not broadcast to IM (#99).
   const directImReply = getChannelType(chatJid) !== null;
-  let replySourceImJid: string | null = null;
-  if (!directImReply) {
-    // chatJid is a web channel — check if ALL messages share the same IM source
-    const firstSourceJid = missedMessages[0]?.source_jid || chatJid;
-    const allSameImSource =
-      getChannelType(firstSourceJid) !== null &&
-      missedMessages.every((m) => (m.source_jid || chatJid) === firstSourceJid);
-    if (allSameImSource) {
-      replySourceImJid = firstSourceJid;
-    }
-  } else {
-    // chatJid is an IM channel — reply directly
-    replySourceImJid = chatJid;
-  }
+  let replySourceImJid = selectBatchImReplyRoute(
+    chatJid,
+    missedMessages.map((message) => message.source_jid),
+  );
   // Publish the current IM reply route so the IPC watcher can forward
   // send_message outputs to the correct IM channel.
   activeImReplyRoutes.set(effectiveGroup.folder, replySourceImJid);
@@ -3597,8 +3600,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
               // Skip IM send to the original chatJid when:
               // 1. Streaming card already handled the IM delivery, OR
-              // 2. Reply route switched to a different IM channel (the routed IM
-              //    path below will deliver to the correct channel instead), OR
+              // 2. Reply route switched to a more precise/different IM target
+              //    (the routed path below will deliver there instead), OR
               // 3. Reply route was cleared to null (web message injected into an
               //    IM-originated session — replies should go to web only).
               // Any send_message content is delivered independently via IPC watcher.
@@ -3656,7 +3659,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                 if (
                   g.target_main_jid !== webJid ||
                   imJid === chatJid ||
-                  imJid === replySourceImJid
+                  (replySourceImJid !== null &&
+                    getImRouteBaseJid(imJid) ===
+                      getImRouteBaseJid(replySourceImJid))
                 )
                   continue;
                 if (g.reply_policy !== 'mirror') continue;
@@ -4860,10 +4865,24 @@ function startIpcWatcher(): void {
                 const effectiveChatJid = ipcAgentId
                   ? `${data.chatJid}#agent:${ipcAgentId}`
                   : data.chatJid;
+                const ipcImRoute = ipcAgentId
+                  ? undefined
+                  : activeImReplyRoutes.get(sourceGroup);
+                const preciseDirectImRoute =
+                  ipcImRoute &&
+                  getChannelType(data.chatJid) !== null &&
+                  ipcImRoute !== data.chatJid &&
+                  getImRouteBaseJid(ipcImRoute) ===
+                    getImRouteBaseJid(data.chatJid)
+                    ? ipcImRoute
+                    : null;
                 // Feishu card JSON: store extracted markdown for web, send raw JSON to IM
                 const cardText = extractFeishuCardText(data.text);
                 const webText = cardText || data.text;
                 await sendMessage(effectiveChatJid, webText, {
+                  // A direct IM send with a detailed active route is delivered
+                  // below so it can reply to the exact inbound message.
+                  ...(preciseDirectImRoute ? { sendToIM: false } : {}),
                   messageMeta: {
                     sourceKind: 'sdk_send_message',
                   },
@@ -4873,10 +4892,10 @@ function startIpcWatcher(): void {
                 // Conversation agents handle their own IM routing in
                 // processAgentConversation's wrappedOnOutput callback.
                 if (!ipcAgentId) {
-                  const ipcImRoute = activeImReplyRoutes.get(sourceGroup);
                   if (
                     ipcImRoute &&
-                    getChannelType(data.chatJid) === null &&
+                    (getChannelType(data.chatJid) === null ||
+                      preciseDirectImRoute !== null) &&
                     ipcImRoute !== data.chatJid
                   ) {
                     const localImages = extractLocalImImagePaths(
@@ -4907,8 +4926,11 @@ function startIpcWatcher(): void {
                       // Task targets a specific IM group; send there unless
                       // the prior branches already delivered to the same jid.
                       if (
-                        routingDecision.taskChatJid !== data.chatJid &&
-                        routingDecision.taskChatJid !== ipcImRoute
+                        getImRouteBaseJid(routingDecision.taskChatJid) !==
+                          getImRouteBaseJid(data.chatJid) &&
+                        (!ipcImRoute ||
+                          getImRouteBaseJid(routingDecision.taskChatJid) !==
+                            getImRouteBaseJid(ipcImRoute))
                       ) {
                         sendImWithFailTracking(
                           routingDecision.taskChatJid,
@@ -6781,7 +6803,12 @@ async function processAgentConversation(
 
         // Optional mirror mode for linked IM channels
         for (const [imJid, g] of Object.entries(registeredGroups)) {
-          if (g.target_agent_id !== agentId || imJid === replySourceImJid)
+          if (
+            g.target_agent_id !== agentId ||
+            (replySourceImJid !== null &&
+              getImRouteBaseJid(imJid) ===
+                getImRouteBaseJid(replySourceImJid))
+          )
             continue;
           if (g.reply_policy !== 'mirror') continue;
           if (getChannelType(imJid))
@@ -7384,13 +7411,13 @@ async function startMessageLoop(): Promise<void> {
               const directImReply = getChannelType(chatJid) !== null;
               for (const r of replies) {
                 let imRouteJid: string | null = null;
-                if (directImReply) {
-                  imRouteJid = chatJid;
-                } else if (
+                if (
                   r.originalMsg.source_jid &&
                   getChannelType(r.originalMsg.source_jid)
                 ) {
                   imRouteJid = r.originalMsg.source_jid;
+                } else if (directImReply) {
+                  imRouteJid = chatJid;
                 }
                 sendPluginExpanderReply(chatJid, r.text, imRouteJid);
                 advanceReplyCursor(chatJid, {
@@ -8178,12 +8205,17 @@ function resolveWorkspaceJid(targetMainJid: string): string | null {
     : null;
 }
 
-function buildFeishuThreadRouteJid(
+function buildFeishuMessageRouteJid(
   chatJid: string,
-  threadId: string,
-  rootMessageId: string,
+  messageMeta: FeishuMessageMeta & { messageId: string },
 ): string {
-  return `feishu:${extractChatId(chatJid)}#thread:${threadId}#root:${rootMessageId}`;
+  const target = buildFeishuInboundRouteTarget(
+    extractChatId(chatJid),
+    messageMeta.messageId,
+    messageMeta.rootId,
+    messageMeta.threadId,
+  );
+  return `feishu:${target.raw}`;
 }
 
 function summarizeFeishuThreadTitle(text?: string): string {
@@ -8220,14 +8252,14 @@ function resolveOrCreateThreadAgent(
   workspaceJid: string,
   workspace: RegisteredGroup,
   group: RegisteredGroup,
-  messageMeta: FeishuMessageMeta & { threadId: string },
+  messageMeta: FeishuMessageMeta & { messageId: string },
+  contextId: string,
 ): { effectiveJid: string; agentId: string; sourceJid: string } {
   const now = new Date().toISOString();
-  const threadId = messageMeta.threadId;
-  const rootMessageId = messageMeta.rootId || threadId;
-  const routeJid = buildFeishuThreadRouteJid(chatJid, threadId, rootMessageId);
+  const rootMessageId = messageMeta.rootId || messageMeta.messageId;
+  const routeJid = buildFeishuMessageRouteJid(chatJid, messageMeta);
   const nextTitle = summarizeFeishuThreadTitle(messageMeta.text);
-  let binding = getImContextBinding(chatJid, 'thread', threadId);
+  let binding = getImContextBinding(chatJid, 'thread', contextId);
   let agent = binding?.agent_id != null ? getAgent(binding.agent_id) : undefined;
 
   if (!binding || !agent || agent.chat_jid !== workspaceJid) {
@@ -8248,7 +8280,7 @@ function resolveOrCreateThreadAgent(
       last_im_jid: routeJid,
       spawned_from_jid: null,
       source_kind: 'feishu_thread',
-      thread_id: threadId,
+      thread_id: contextId,
       root_message_id: rootMessageId,
       title_source: 'feishu_root',
       last_active_at: now,
@@ -8271,7 +8303,7 @@ function resolveOrCreateThreadAgent(
     binding = {
       source_jid: chatJid,
       context_type: 'thread',
-      context_id: threadId,
+      context_id: contextId,
       workspace_jid: workspaceJid,
       agent_id: agentId,
       root_message_id: rootMessageId,
@@ -8304,7 +8336,7 @@ function resolveOrCreateThreadAgent(
     updateChatName(`${workspaceJid}#agent:${binding.agent_id}`, resolvedTitle);
   } else {
     // Lightweight: only touch activity timestamps
-    touchImContextBindingActivity(chatJid, 'thread', threadId, now);
+    touchImContextBindingActivity(chatJid, 'thread', contextId, now);
     updateAgentContextInfo(binding.agent_id, { last_active_at: now });
   }
   updateAgentLastImJid(binding.agent_id, routeJid);
@@ -8351,7 +8383,7 @@ function buildResolveEffectiveChatJid(): (
       group.target_main_jid &&
       getChannelType(chatJid) === 'feishu' &&
       messageMeta &&
-      (messageMeta?.threadId || messageMeta?.rootId || messageMeta?.messageId)
+      messageMeta.messageId
     ) {
       const threadContextId =
         messageMeta.threadId || messageMeta.rootId || messageMeta.messageId;
@@ -8373,7 +8405,8 @@ function buildResolveEffectiveChatJid(): (
         workspaceJid,
         workspace,
         group,
-        { ...messageMeta, threadId: threadContextId },
+        messageMeta as FeishuMessageMeta & { messageId: string },
+        threadContextId,
       );
     }
 
